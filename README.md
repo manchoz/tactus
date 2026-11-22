@@ -1,0 +1,162 @@
+# Tactus
+
+**Tactus** is a standalone embedded Rust appliance (targeting the Arduino UNO Q) that bidirectionally bridges USB-MIDI / BLE-MIDI (via CME WIDI Uhost in PoC) and **Ableton Link** over a dedicated 5 GHz WiFi Access Point.
+
+## Architectural Highlights
+
+- **Userspace Real-Time Determinism:** Targets stock Debian Linux (and future Yocto QLI `meta-tactus`) without `PREEMPT_RT` or PipeWire — uses a dedicated `SCHED_FIFO` thread, `mlockall`, `CLOCK_MONOTONIC` absolute timers (`TIMER_ABSTIME`), CPU core affinity, and direct ALSA Sequencer (`/dev/snd/seq`) I/O.
+- **Strict RT vs. Async Separation:** The RT sync thread performs zero heap allocations, zero mutexes, zero blocking I/O, and zero `tokio` calls; the `tokio` control plane (`axum` HTTP/WebSocket, config persistence, MCU RPC) communicates exclusively through lock-free SPSC ring buffers (`rtrb`) with strictly `Copy` `TelemetrySnapshot` and `RtCommand` messages.
+- **Official Ableton Link C API:** Wraps `Ableton/link`'s `extensions/abl_link` C99 API (`tactus-link-sys`), avoiding custom Link protocol reimplementations.
+- **Yocto & Read-Only Rootfs Ready:** Offline builds with zero network/`git` activity in `build.rs`, dual prebuilt/vendored `abl_link` resolution, atomic state writes restricted to `/var/lib/tactus/config.toml`, and runtime state on `tmpfs` (`/run/tactus/`).
+
+## Project Status
+
+| Milestone | Scope | Status |
+| :--- | :--- | :--- |
+| **M0** | Cargo workspace & offline-safe `abl_link` FFI build | Complete |
+| **M1** | Pure-Rust `tactus-sync-core` & deterministic simulations | Complete |
+| **M2** | 5 GHz WiFi AP (`hostapd`/`dnsmasq`/`avahi`) & UNO Q provisioning | Planned |
+| **M3** | Headless `tactusd` RT engine, ALSA hotplug & atomic `config.toml` | Planned |
+| **M4** | Embedded mobile Web UI (`axum` + WebSocket + Home Screen PWA) | Planned |
+| **M5** | Optional STM32U585 Zephyr LED matrix bridge (`Arduino_RouterBridge`) | Planned |
+
+## Documentation & Workspace Layout
+
+- [SPEC.md](SPEC.md) — Functional, bidirectional sync algorithm, network, Web UI, and `config.toml` specifications
+- [ARCHITECTURE.md](ARCHITECTURE.md) — Monorepo layout, threading model, protocol contract, and boot sequence
+- [MILESTONES.md](MILESTONES.md) — Phased execution and verification plan
+- [AGENTS.md](AGENTS.md) — Non-negotiable architectural invariants and verification gates
+
+```text
+tactus/
+├── Cargo.toml                  # Workspace root (edition 2021, resolver 2)
+├── crates/
+│   ├── tactus-protocol/        # Shared EngineCommand, Copy RtCommand/TelemetrySnapshot, AppState, TactusConfig
+│   ├── tactus-link-sys/        # Offline-safe build.rs + C99 FFI + safe RAII AblLink/SessionState wrappers
+│   ├── tactus-sync-core/       # Pure-Rust, OS-independent, zero-alloc bidirectional sync engine
+│   └── tactusd/                # Daemon binary (M0 skeleton; RT/ALSA/Web/RPC wired in M3–M5)
+└── vendor/
+    └── ableton-link/           # Pinned Ableton/link submodule (Link-4.1.1 + asio-standalone)
+```
+
+---
+
+## Development Environment Setup
+
+### 1. Prerequisites
+
+- **Rust toolchain** via [`rustup`](https://rustup.rs/) (`rustc`, `cargo`, `rustfmt`, `clippy`)
+- **C++17 compiler** for compiling `abl_link.cpp` from `vendor/ableton-link`:
+  - **macOS:** Xcode Command Line Tools (`xcode-select --install`, provides Apple Clang)
+  - **Debian/Ubuntu:** `sudo apt-get install build-essential git`
+  - *(Note: `cmake` is **not** required for host builds — `tactus-link-sys/build.rs` compiles `extensions/abl_link/src/abl_link.cpp` directly via the `cc` crate.)*
+- **Git** with submodule support
+
+### 2. Clone with Submodules (Offline Vendoring)
+
+`vendor/ableton-link` (`Link-4.1.1`) uses a nested submodule (`modules/asio-standalone`, the cross-platform standalone Asio C++ networking headers required by Link). Initialize submodules recursively:
+
+```bash
+git clone --recurse-submodules https://github.com/manchoz/tactus.git
+cd tactus
+```
+
+If you already cloned without `--recurse-submodules`:
+
+```bash
+git submodule update --init --recursive
+```
+
+### 3. Host Build, Lint, and Test
+
+`tactus-sync-core`, `tactus-protocol`, and `tactus-link-sys` build and pass deterministic tests on the development host (macOS or Linux) without ALSA or Link hardware attached:
+
+```bash
+# Format check
+cargo fmt --check
+
+# Clippy lints (warnings are denied)
+cargo clippy --workspace --all-targets -- -D warnings
+
+# Run all workspace unit, protocol, FFI, and deterministic simulation tests
+cargo test --workspace
+```
+
+Smoke-run the `tactusd` M0 skeleton on the host:
+
+```bash
+cargo run -p tactusd
+```
+
+### 4. Cross-Compiling for Arduino UNO Q (`aarch64-unknown-linux-gnu`)
+
+Install the Rust target once:
+
+```bash
+rustup target add aarch64-unknown-linux-gnu
+```
+
+#### Option A: macOS (or Linux) via `cargo-zigbuild`
+
+Install Zig and `cargo-zigbuild`:
+
+```bash
+# macOS (Homebrew)
+brew install zig
+cargo install cargo-zigbuild
+```
+
+Build the workspace for `aarch64-unknown-linux-gnu` (pinning glibc baseline as needed for the target Debian image, e.g. `2.36`):
+
+```bash
+cargo zigbuild --workspace --target aarch64-unknown-linux-gnu.2.36
+```
+
+Verify the resulting ELF binary:
+
+```bash
+file target/aarch64-unknown-linux-gnu/debug/tactusd
+```
+
+#### Option B: Debian / Ubuntu Linux Native Cross-Toolchain
+
+Install the GNU `aarch64` C/C++ cross-compiler:
+
+```bash
+sudo apt-get install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+```
+
+Build with explicit cross linker and C++ compiler env vars:
+
+```bash
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
+cargo build --workspace --target aarch64-unknown-linux-gnu
+```
+
+*(Note: Once M3 introduces `alsa` / `libasound2-dev`, Linux cross-builds or `cargo-zigbuild` will also require target `aarch64` ALSA headers/sysroot.)*
+
+### 5. Prebuilt `abl_link` Overrides (Yocto / BitBake Offline Builds)
+
+`crates/tactus-link-sys/build.rs` never accesses the network or runs `git`. It resolves `abl_link` in the following priority order:
+
+1. **`ABL_LINK_LIB_DIR` env var:** Links directly against a prebuilt library directory (skipping C++ compilation). Optional overrides:
+   - `ABL_LINK_LIB_NAME` (defaults to `abl_link`)
+   - `ABL_LINK_LINK_KIND` (`static` or `dylib`; auto-detects `lib<name>.a`)
+2. **`pkg-config`:** Probes `abl-link`, then `abl_link`.
+3. **Vendored fallback:** Compiles `vendor/ableton-link/extensions/abl_link/src/abl_link.cpp` offline (override directory via `ABL_LINK_VENDOR_DIR`).
+
+---
+
+## Runtime & Configuration Reference
+
+- **Daemon binary:** `tactusd`
+- **mDNS hostname:** `tactus.local`
+- **Config path:** `/var/lib/tactus/config.toml` (override via `--config` or `TACTUS_CONFIG` once wired in M3; schema defined in [SPEC.md §5](SPEC.md#L62-L87))
+- **Runtime socket / temp path:** `/run/tactus/` (`tmpfs`)
+
+---
+
+## License
+
+`GPL-2.0-or-later` — see [Cargo.toml](Cargo.toml) and [vendor/ableton-link/LICENSE.md](vendor/ableton-link/LICENSE.md).
