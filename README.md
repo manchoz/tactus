@@ -193,4 +193,6 @@ avahi-browse -rt _tactus._tcp
 
 ## License
 
-`GPL-2.0-or-later` — see [Cargo.toml](Cargo.toml) and [vendor/ableton-link/LICENSE.md](vendor/ableton-link/LICENSE.md).
+Tactus original source code is licensed under the **Mozilla Public License 2.0 (`MPL-2.0`)** without Exhibit B incompatibility — see [LICENSE](LICENSE) and [Cargo.toml](Cargo.toml).
+
+Tactus links against official [`Ableton/link`](vendor/ableton-link/LICENSE.md), which is licensed under **`GPL-2.0-or-later`** (with a commercial licensing option from Ableton AG). Under MPL-2.0 §3.3 (*Larger Work*), compiled `tactusd` binaries and appliance images incorporating open-source `Ableton/link` are distributed under **`GPL-2.0-or-later`**, while Tactus's own source files remain available under `MPL-2.0`.
