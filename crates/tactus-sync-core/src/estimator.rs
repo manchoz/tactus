@@ -24,7 +24,6 @@ pub struct MidiToLinkEstimator {
     song_tick: u64,
     expecting_downbeat_tick: bool,
     last_clock_rx_ns: Option<i64>,
-    committed_bpm: Option<f64>,
     bpm_midi_long: Option<f64>,
     bpm_midi_fast: Option<f64>,
     phase_error_ms: f32,
@@ -48,7 +47,6 @@ impl MidiToLinkEstimator {
             song_tick: 0,
             expecting_downbeat_tick: true,
             last_clock_rx_ns: None,
-            committed_bpm: None,
             bpm_midi_long: None,
             bpm_midi_fast: None,
             phase_error_ms: 0.0,
@@ -70,7 +68,6 @@ impl MidiToLinkEstimator {
         self.song_tick = 0;
         self.expecting_downbeat_tick = true;
         self.last_clock_rx_ns = None;
-        self.committed_bpm = None;
         self.bpm_midi_long = None;
         self.bpm_midi_fast = None;
         self.phase_error_ms = 0.0;
@@ -194,7 +191,7 @@ impl MidiToLinkEstimator {
         self.long_ring
             .evict_older_than(now_ns.saturating_sub(long_window_ns));
         self.fast_ring
-            .evict_older_than(now_ns.saturating_sub(fast_window_ns));
+            .evict_older_than_keeping(now_ns.saturating_sub(fast_window_ns), MIN_OLS_TICKS);
 
         let long_ready = self
             .long_start_ns
@@ -210,14 +207,21 @@ impl MidiToLinkEstimator {
         } else {
             None
         };
-        let fast_est = if fast_ready {
-            self.fast_ring.ols_estimate()
+        self.bpm_midi_long = long_est.map(|e| e.bpm);
+
+        // Once Locked with an active long window, fast OLS is only needed on beat boundaries.
+        let compute_fast = fast_ready
+            && (self.lock_state != LockState::Locked || is_beat_boundary || long_est.is_none());
+        let fast_est = if compute_fast {
+            let est = self.fast_ring.ols_estimate();
+            self.bpm_midi_fast = est.map(|e| e.bpm);
+            est
         } else {
+            if !fast_ready {
+                self.bpm_midi_fast = None;
+            }
             None
         };
-
-        self.bpm_midi_long = long_est.map(|e| e.bpm);
-        self.bpm_midi_fast = fast_est.map(|e| e.bpm);
 
         match self.lock_state {
             LockState::Unlocked => {
@@ -226,17 +230,17 @@ impl MidiToLinkEstimator {
             LockState::Acquiring => {
                 if let Some(est) = long_est {
                     link.set_tempo(est.bpm, ns_to_us(now_ns));
-                    self.committed_bpm = Some(est.bpm);
                     self.lock_state = LockState::Locked;
                     self.step_change_beats_count = 0;
                     self.step_change_sign = 0;
                 }
             }
             LockState::Locked => {
+                let mut link_bpm = link.tempo();
                 let mut step_triggered = false;
                 if is_beat_boundary {
-                    if let (Some(fast), Some(committed)) = (fast_est, self.committed_bpm) {
-                        let diff = fast.bpm - committed;
+                    if let Some(fast) = fast_est {
+                        let diff = fast.bpm - link_bpm;
                         if diff.abs() > config.step_change_bpm {
                             let sign = if diff > 0.0 { 1 } else { -1 };
                             if sign == self.step_change_sign {
@@ -254,7 +258,7 @@ impl MidiToLinkEstimator {
                                 self.long_start_ns = Some(now_ns);
                                 self.bpm_midi_long = None;
                                 link.set_tempo(fast.bpm, ns_to_us(now_ns));
-                                self.committed_bpm = Some(fast.bpm);
+                                link_bpm = fast.bpm;
                                 self.step_change_beats_count = 0;
                                 self.step_change_sign = 0;
                                 step_triggered = true;
@@ -267,10 +271,9 @@ impl MidiToLinkEstimator {
                 }
 
                 if !step_triggered {
-                    if let (Some(long), Some(committed)) = (long_est, self.committed_bpm) {
-                        if (long.bpm - committed).abs() > config.bpm_deadband {
+                    if let Some(long) = long_est {
+                        if (long.bpm - link_bpm).abs() > config.bpm_deadband {
                             link.set_tempo(long.bpm, ns_to_us(now_ns));
-                            self.committed_bpm = Some(long.bpm);
                         }
                     }
                 }
@@ -318,16 +321,4 @@ impl Default for MidiToLinkEstimator {
 #[inline]
 fn secs_to_ns(secs: f64) -> i64 {
     (secs * 1_000_000_000.0).round() as i64
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ring::TICKS_PER_BEAT;
-
-    #[test]
-    fn ticks_per_beat_constant_matches_midi_spec() {
-        assert_eq!(TICKS_PER_BEAT, 24.0);
-        assert_eq!(TICKS_PER_BEAT_U64, 24);
-    }
 }

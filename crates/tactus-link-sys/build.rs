@@ -26,14 +26,20 @@ fn main() {
             );
         }
 
-        let lib_name = env::var("ABL_LINK_LIB_NAME").unwrap_or_else(|_| "abl_link".to_string());
-        let link_kind = env::var("ABL_LINK_LINK_KIND").unwrap_or_else(|_| {
-            if lib_dir.join(format!("lib{lib_name}.a")).exists() {
-                "static".to_string()
-            } else {
-                "dylib".to_string()
-            }
-        });
+        let lib_name = env::var("ABL_LINK_LIB_NAME")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "abl_link".to_string());
+        let link_kind = env::var("ABL_LINK_LINK_KIND")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| {
+                if lib_dir.join(format!("lib{lib_name}.a")).exists() {
+                    "static".to_string()
+                } else {
+                    "dylib".to_string()
+                }
+            });
 
         println!("cargo:rustc-link-search=native={}", lib_dir.display());
         println!("cargo:rustc-link-lib={link_kind}={lib_name}");

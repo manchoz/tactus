@@ -104,11 +104,6 @@ impl MidiOutputBatch {
     pub const fn remaining_capacity(&self) -> usize {
         MAX_BATCH_LEN - (self.len as usize)
     }
-
-    /// Iterate over scheduled events in emission order.
-    pub fn iter(&self) -> core::slice::Iter<'_, ScheduledMidiEvent> {
-        self.as_slice().iter()
-    }
 }
 
 impl Default for MidiOutputBatch {

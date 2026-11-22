@@ -82,9 +82,11 @@ impl SyncEngine {
                 }
             }
             RtCommand::SetStartStopSync(enabled) => {
-                self.config.start_stop_sync = enabled;
-                self.scheduler
-                    .on_start_stop_sync_changed(enabled, link.is_playing());
+                if self.config.start_stop_sync != enabled {
+                    self.config.start_stop_sync = enabled;
+                    self.scheduler
+                        .on_start_stop_sync_changed(enabled, link.is_playing());
+                }
             }
             RtCommand::SetOffsetMs(offset_ms) => {
                 if offset_ms.is_finite() {

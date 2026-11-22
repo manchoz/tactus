@@ -4,7 +4,7 @@ use tactus_protocol::SyncConfig;
 
 use crate::link::{ns_to_us, us_to_ns, LinkSession};
 use crate::midi::{MidiEvent, MidiOutputBatch, ScheduledMidiEvent};
-use crate::ring::TICKS_PER_BEAT;
+use crate::ring::{MIN_VALID_BPM, TICKS_PER_BEAT};
 
 const MAX_CATCHUP_NS: i64 = 100_000_000;
 const TICK_SNAP_EPS: f64 = 1e-6;
@@ -121,11 +121,18 @@ impl LinkToMidiScheduler {
 
         let mut target_ns = tick_target_ns(next_tick, config.quantum, offset_ns, link);
 
-        // Guard against large wake-up gaps or Link timeline jumps causing stale 0xF8 bursts.
-        if now_ns.saturating_sub(target_ns) > MAX_CATCHUP_NS {
+        let tempo = link.tempo().max(MIN_VALID_BPM);
+        let tick_period_ns = (60_000_000_000.0 / (TICKS_PER_BEAT * tempo)).round() as i64;
+        let max_ahead_ns = MAX_CATCHUP_NS.max(tick_period_ns.saturating_mul(2));
+
+        // Guard against large wake-up gaps or Link timeline jumps (forward or backward).
+        if now_ns.saturating_sub(target_ns) > MAX_CATCHUP_NS
+            || target_ns.saturating_sub(now_ns) > max_ahead_ns
+        {
             next_tick = tick_ceil_from_beat(beat_now);
             if let MidiTransportState::ArmedForStart { start_tick } = self.transport {
-                if start_tick < next_tick {
+                let quantum_ticks = ((config.quantum * TICKS_PER_BEAT).round() as i64).max(1);
+                if start_tick < next_tick || start_tick.saturating_sub(next_tick) > quantum_ticks {
                     self.transport = MidiTransportState::ArmedForStart {
                         start_tick: next_quantum_tick(next_tick, config.quantum),
                     };

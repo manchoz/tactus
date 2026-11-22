@@ -622,3 +622,150 @@ fn midi_to_link_transport_start_continue_stop_and_bounded_phase_convergence() {
         );
     }
 }
+
+#[test]
+fn link_to_midi_catchup_forward_and_backward_jumps() {
+    let mut engine = SyncEngine::new(SyncConfig::default());
+    let mut link = MockLinkSession::new(120.0); // 1 tick = 20,833.333 us
+
+    // Part A: forward wake-up gap (> 100 ms) resyncs without bursting stale 0xF8 ticks.
+    let res0 = engine.poll(0, &mut link);
+    assert_eq!(res0.midi_out.len(), 1);
+    let res_gap = engine.poll(250_000_000, &mut link);
+    assert_eq!(res_gap.midi_out.len(), 1);
+    assert_eq!(res_gap.midi_out.as_slice()[0].timestamp_ns, 250_000_000);
+    assert_eq!(res_gap.next_deadline_ns, Some(270_833_000));
+
+    // Part B: backward Link timeline jump while playing (beat 100 -> beat 0 at t = 50 s).
+    let _ = engine.poll(50_000_000_000, &mut link);
+    link.force_beat_at_time(0.0, 50_000_000, 4.0);
+    let res_back = engine.poll(50_005_000_000, &mut link);
+    assert!(
+        res_back.next_deadline_ns.unwrap() < 50_050_000_000,
+        "scheduler froze after backward beat jump: next_deadline_ns={:?}",
+        res_back.next_deadline_ns
+    );
+    let res_tick = engine.poll(50_021_000_000, &mut link);
+    assert!(!res_tick.midi_out.is_empty());
+
+    // Part C: backward Link jump while ArmedForStart re-arms Start to new bar 1 (beat 4).
+    let mut armed_engine = SyncEngine::new(SyncConfig::default());
+    let mut armed_link = MockLinkSession::new(120.0);
+    let _ = armed_engine.poll(48_500_000_000, &mut armed_link); // beat 97.0
+    armed_link.set_is_playing(true, 48_500_000);
+    let _ = armed_engine.poll(48_500_000_000, &mut armed_link); // armed for beat 100.0
+    armed_link.force_beat_at_time(0.5, 51_000_000, 4.0); // peer jumps backward to beat 0.5
+    let mut events = Vec::new();
+    let mut t = 51_000_000_000_i64;
+    while t <= 53_000_000_000 {
+        events.extend_from_slice(armed_engine.poll(t, &mut armed_link).midi_out.as_slice());
+        t += 10_000_000;
+    }
+    let start_ts: Vec<i64> = events
+        .iter()
+        .filter(|e| e.event == MidiEvent::Start)
+        .map(|e| e.timestamp_ns)
+        .collect();
+    // 3.5 beats from beat 0.5 at 120 BPM = 1.75 s -> 51.0 s + 1.75 s = 52.75 s.
+    assert_eq!(start_ts, vec![52_750_000_000]);
+}
+
+#[test]
+fn midi_to_link_corrects_external_peer_tempo_override_and_tracks_sub_38_bpm() {
+    let mut engine = SyncEngine::new(midi_to_link_config());
+    let mut link = MockLinkSession::new(120.0);
+
+    let tick_120_ns = 60_000_000_000.0 / (24.0 * 120.0);
+    let mut now_ns = 0_i64;
+    for i in 0..144 {
+        now_ns = ((i as f64) * tick_120_ns).round() as i64;
+        engine.on_midi_event(MidiEvent::Clock, now_ns, &mut link);
+    }
+    assert_eq!(engine.snapshot().lock_state, LockState::Locked);
+
+    // External Link peer drags Link tempo from 120.0 to 125.0; Tactus must restore 120.0.
+    link.set_tempo(125.0, now_ns / 1_000);
+    for j in 1..=24 {
+        now_ns = (((143 + j) as f64) * tick_120_ns).round() as i64;
+        engine.on_midi_event(MidiEvent::Clock, now_ns, &mut link);
+    }
+    assert!(
+        (link.tempo() - 120.0).abs() <= 0.05,
+        "failed to restore tempo after external peer override: got {}",
+        link.tempo()
+    );
+
+    // Step down to 35.0 BPM (< 38.4 BPM, so < 24 ticks fit in 1.5 s fast window).
+    let tick_35_ns = 60_000_000_000.0 / (24.0 * 35.0);
+    let seg_start = now_ns;
+    for k in 1..=420 {
+        let ts = seg_start + ((k as f64) * tick_35_ns).round() as i64;
+        engine.on_midi_event(MidiEvent::Clock, ts, &mut link);
+    }
+    let snap = engine.snapshot();
+    assert_eq!(snap.lock_state, LockState::Locked);
+    assert!(snap.bpm_midi_fast.is_some());
+    assert!(
+        (snap.bpm_link - 35.0).abs() <= 0.05,
+        "failed to track sub-38.4 BPM tempo: got {}",
+        snap.bpm_link
+    );
+}
+
+#[test]
+fn commands_quantum_manual_tempo_resync_and_idempotent_start_stop_sync() {
+    let mut engine = SyncEngine::new(SyncConfig::default());
+    let mut link = MockLinkSession::new(120.0);
+
+    let _ = engine.apply_command(RtCommand::SetQuantum(3.0), 0, &mut link);
+    let _ = engine.apply_command(RtCommand::SetLinkTempoManual(135.0), 0, &mut link);
+    assert_eq!(engine.snapshot().quantum, 3.0);
+    assert!((link.tempo() - 135.0).abs() < 1e-9);
+
+    // Start playing mid-bar at beat 1.125 (500 ms at 135 BPM); quantum=3.0 arms Start at beat 3.0.
+    let _ = engine.poll(0, &mut link);
+    link.set_is_playing(true, 500_000);
+    let _ = engine.poll(500_000_000, &mut link);
+
+    // Re-sending SetStartStopSync(true) while ArmedForStart must NOT drop the pending Start.
+    let _ = engine.apply_command(RtCommand::SetStartStopSync(true), 600_000_000, &mut link);
+
+    let mut start_beats = Vec::new();
+    let mut t = 510_000_000_i64;
+    while t <= 1_600_000_000 {
+        for ev in engine.poll(t, &mut link).midi_out.as_slice() {
+            if ev.event == MidiEvent::Start {
+                start_beats.push(link.beat_at_time(ev.timestamp_ns / 1_000, 3.0));
+            }
+        }
+        t += 10_000_000;
+    }
+    assert_eq!(start_beats.len(), 1);
+    assert!(
+        (start_beats[0] - 3.0).abs() < 1e-3,
+        "expected Start quantized to beat 3.0, got {}",
+        start_beats[0]
+    );
+
+    // Switch to MidiToLink: SetLinkTempoManual is ignored, ResyncDownbeat aligns beat 0.
+    let _ = engine.apply_command(RtCommand::SetDirection(Direction::MidiToLink), t, &mut link);
+    let _ = engine.apply_command(RtCommand::SetLinkTempoManual(150.0), t, &mut link);
+    assert!((link.tempo() - 135.0).abs() < 1e-9);
+
+    let tick_135_ns = 60_000_000_000.0 / (24.0 * 135.0);
+    let mut clk_ns = t;
+    for k in 0..96 {
+        clk_ns = t + ((k as f64) * tick_135_ns).round() as i64;
+        engine.on_midi_event(MidiEvent::Clock, clk_ns, &mut link);
+    }
+    assert_eq!(engine.snapshot().lock_state, LockState::Locked);
+
+    let reqs_before = link.request_beats.len();
+    let _ = engine.apply_command(RtCommand::ResyncDownbeat, clk_ns, &mut link);
+    for k in 96..=125 {
+        let ts = t + ((k as f64) * tick_135_ns).round() as i64;
+        engine.on_midi_event(MidiEvent::Clock, ts, &mut link);
+    }
+    assert_eq!(link.request_beats.len(), reqs_before + 1);
+    assert_eq!(link.request_beats.last().unwrap().0, 0.0);
+}

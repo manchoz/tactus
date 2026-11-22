@@ -111,17 +111,14 @@ impl<const N: usize> SampleRing<N> {
 
     /// Drop samples from the front whose `timestamp_ns < cutoff_ns`.
     pub fn evict_older_than(&mut self, cutoff_ns: i64) {
-        while self.len > 0 && self.buf[self.head].timestamp_ns < cutoff_ns {
-            self.head = (self.head + 1) % N;
-            self.len -= 1;
-        }
+        self.evict_older_than_keeping(cutoff_ns, 0);
     }
 
-    /// Iterate over retained samples from oldest to newest.
-    pub fn iter(&self) -> SampleRingIter<'_, N> {
-        SampleRingIter {
-            ring: self,
-            offset: 0,
+    /// Drop samples older than `cutoff_ns` while keeping at least `min_keep` newest samples.
+    pub fn evict_older_than_keeping(&mut self, cutoff_ns: i64, min_keep: usize) {
+        while self.len > min_keep && self.buf[self.head].timestamp_ns < cutoff_ns {
+            self.head = (self.head + 1) % N;
+            self.len -= 1;
         }
     }
 
@@ -142,7 +139,8 @@ impl<const N: usize> SampleRing<N> {
 
         let mut sum_x = 0.0_f64;
         let mut sum_y = 0.0_f64;
-        for sample in self.iter() {
+        for offset in 0..self.len {
+            let sample = self.buf[(self.head + offset) % N];
             let dx = sample.tick_index.saturating_sub(x0) as f64;
             let dy = sample.timestamp_ns.saturating_sub(y0) as f64;
             sum_x += dx;
@@ -155,7 +153,8 @@ impl<const N: usize> SampleRing<N> {
 
         let mut s_xx = 0.0_f64;
         let mut s_xy = 0.0_f64;
-        for sample in self.iter() {
+        for offset in 0..self.len {
+            let sample = self.buf[(self.head + offset) % N];
             let cx = (sample.tick_index.saturating_sub(x0) as f64) - mean_x;
             let cy = (sample.timestamp_ns.saturating_sub(y0) as f64) - mean_y;
             s_xx += cx * cx;
@@ -197,32 +196,6 @@ impl<const N: usize> Default for SampleRing<N> {
     }
 }
 
-/// Zero-allocation iterator over [`SampleRing`] in chronological order.
-pub struct SampleRingIter<'a, const N: usize> {
-    ring: &'a SampleRing<N>,
-    offset: usize,
-}
-
-impl<const N: usize> Iterator for SampleRingIter<'_, N> {
-    type Item = ClockSample;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.offset >= self.ring.len {
-            return None;
-        }
-        let idx = (self.ring.head + self.offset) % N;
-        self.offset += 1;
-        Some(self.ring.buf[idx])
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let rem = self.ring.len - self.offset;
-        (rem, Some(rem))
-    }
-}
-
-impl<const N: usize> ExactSizeIterator for SampleRingIter<'_, N> {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +216,10 @@ mod tests {
         ring.evict_older_than(35_000_000);
         assert_eq!(ring.len(), 2);
         assert_eq!(ring.oldest().map(|s| s.tick_index), Some(4));
+
+        ring.evict_older_than_keeping(99_000_000, 1);
+        assert_eq!(ring.len(), 1);
+        assert_eq!(ring.oldest().map(|s| s.tick_index), Some(5));
     }
 
     #[test]

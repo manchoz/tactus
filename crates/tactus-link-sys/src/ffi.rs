@@ -16,7 +16,6 @@ pub struct abl_link_session_state {
     pub impl_: *mut c_void,
 }
 
-#[allow(dead_code)]
 extern "C" {
     pub fn abl_link_create(bpm: f64) -> abl_link;
     pub fn abl_link_destroy(link: abl_link);
@@ -25,21 +24,6 @@ extern "C" {
     pub fn abl_link_is_start_stop_sync_enabled(link: abl_link) -> bool;
     pub fn abl_link_enable_start_stop_sync(link: abl_link, enabled: bool);
     pub fn abl_link_num_peers(link: abl_link) -> u64;
-    pub fn abl_link_set_num_peers_callback(
-        link: abl_link,
-        callback: unsafe extern "C" fn(num_peers: u64, context: *mut c_void),
-        context: *mut c_void,
-    );
-    pub fn abl_link_set_tempo_callback(
-        link: abl_link,
-        callback: unsafe extern "C" fn(tempo: f64, context: *mut c_void),
-        context: *mut c_void,
-    );
-    pub fn abl_link_set_start_stop_callback(
-        link: abl_link,
-        callback: unsafe extern "C" fn(is_playing: bool, context: *mut c_void),
-        context: *mut c_void,
-    );
     pub fn abl_link_clock_micros(link: abl_link) -> i64;
 
     pub fn abl_link_create_session_state() -> abl_link_session_state;
