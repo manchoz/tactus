@@ -201,12 +201,12 @@ run_adb() {
     exit 1
   fi
 
-  local adb_cmd=(adb)
+  ADB_CMD=(adb)
   if [[ -n "$ADB_SERIAL" ]]; then
-    adb_cmd+=(-s "$ADB_SERIAL")
+    ADB_CMD+=(-s "$ADB_SERIAL")
   fi
 
-  if [[ "$("${adb_cmd[@]}" get-state 2>/dev/null || true)" != "device" ]]; then
+  if [[ "$("${ADB_CMD[@]}" get-state 2>/dev/null || true)" != "device" ]]; then
     echo "error: no UNO Q device connected via adb (connect USB-C and check 'adb devices')" >&2
     exit 1
   fi
@@ -222,7 +222,7 @@ run_adb() {
 
   local need_sudo_pw=0
   local arduino_pw="${TACTUS_ARDUINO_PASSWORD:-}"
-  if ! "${adb_cmd[@]}" shell -T 'sudo -n true 2>/dev/null'; then
+  if ! "${ADB_CMD[@]}" shell -T 'sudo -n true 2>/dev/null'; then
     need_sudo_pw=1
     if [[ -z "$arduino_pw" ]]; then
       read -r -s -p "Enter (or set new) password for board user 'arduino': " arduino_pw
@@ -233,22 +233,22 @@ run_adb() {
       fi
     fi
 
-    if ! printf '%s\n' "$arduino_pw" | "${adb_cmd[@]}" shell -T 'sudo -S -p "" true 2>/dev/null'; then
+    if ! printf '%s\n' "$arduino_pw" | "${ADB_CMD[@]}" shell -T 'sudo -S -p "" true 2>/dev/null'; then
       log "Setting 'arduino' password via factory /usr/local/bin/arduino-passwd..."
-      if ! printf '%s\n' "$arduino_pw" | "${adb_cmd[@]}" shell -T 'sudo -n /usr/local/bin/arduino-passwd'; then
+      if ! printf '%s\n' "$arduino_pw" | "${ADB_CMD[@]}" shell -T 'sudo -n /usr/local/bin/arduino-passwd'; then
         echo "error: sudo password rejected and factory arduino-passwd unavailable" >&2
         exit 1
       fi
-      printf '%s\n' "$arduino_pw" | "${adb_cmd[@]}" shell -T 'sudo -S -p "" true'
+      printf '%s\n' "$arduino_pw" | "${ADB_CMD[@]}" shell -T 'sudo -S -p "" true'
     fi
   fi
 
-  local cleanup_bootstrap=0
+  ADB_CLEANUP_BOOTSTRAP=0
   adb_cleanup() {
-    if [[ "$cleanup_bootstrap" -eq 1 ]]; then
-      "${adb_cmd[@]}" shell -T 'nmcli connection delete tactus-bootstrap-wifi >/dev/null 2>&1 || true' || true
+    if [[ "${ADB_CLEANUP_BOOTSTRAP:-0}" -eq 1 ]]; then
+      "${ADB_CMD[@]}" shell -T 'nmcli connection delete tactus-bootstrap-wifi >/dev/null 2>&1 || true' || true
     fi
-    "${adb_cmd[@]}" shell -T 'rm -rf /tmp/tactus-system /tmp/tactus-debs /tmp/tactus-bin /tmp/.tactus-env' >/dev/null 2>&1 || true
+    "${ADB_CMD[@]}" shell -T 'rm -rf /tmp/tactus-system /tmp/tactus-debs /tmp/tactus-bin /tmp/.tactus-env' >/dev/null 2>&1 || true
   }
   trap adb_cleanup EXIT
 
@@ -256,43 +256,43 @@ run_adb() {
     local pubkey_b64
     pubkey_b64="$(base64 < "$PUBKEY_PATH" | tr -d '\r\n')"
     log "Installing SSH public key (${PUBKEY_PATH})..."
-    "${adb_cmd[@]}" shell -T "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && key=\$(printf '%s' '${pubkey_b64}' | base64 -d) && { grep -Fxq \"\$key\" ~/.ssh/authorized_keys || printf '%s\n' \"\$key\" >> ~/.ssh/authorized_keys; }"
+    "${ADB_CMD[@]}" shell -T "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && key=\$(printf '%s' '${pubkey_b64}' | base64 -d) && { grep -Fxq \"\$key\" ~/.ssh/authorized_keys || printf '%s\n' \"\$key\" >> ~/.ssh/authorized_keys; }"
   fi
 
   log "Pushing system/ files to UNO Q over ADB..."
-  "${adb_cmd[@]}" shell -T 'rm -rf /tmp/tactus-system /tmp/tactus-debs /tmp/tactus-bin'
-  "${adb_cmd[@]}" push "${SYSTEM_DIR}" /tmp/tactus-system >/dev/null
-  "${adb_cmd[@]}" shell -T 'chmod +x /tmp/tactus-system/scripts/*.sh'
+  "${ADB_CMD[@]}" shell -T 'rm -rf /tmp/tactus-system /tmp/tactus-debs /tmp/tactus-bin'
+  "${ADB_CMD[@]}" push "${SYSTEM_DIR}" /tmp/tactus-system >/dev/null
+  "${ADB_CMD[@]}" shell -T 'chmod +x /tmp/tactus-system/scripts/*.sh'
 
   if [[ -n "$DEB_DIR" ]]; then
     log "Pushing offline .deb packages..."
-    "${adb_cmd[@]}" push "${DEB_DIR}" /tmp/tactus-debs >/dev/null
+    "${ADB_CMD[@]}" push "${DEB_DIR}" /tmp/tactus-debs >/dev/null
   fi
 
   if [[ -n "$BINARY_PATH" ]]; then
     log "Pushing tactusd binary..."
-    "${adb_cmd[@]}" shell -T 'mkdir -p /tmp/tactus-bin'
-    "${adb_cmd[@]}" push "$BINARY_PATH" /tmp/tactus-bin/tactusd >/dev/null
-    "${adb_cmd[@]}" shell -T 'chmod 0755 /tmp/tactus-bin/tactusd'
+    "${ADB_CMD[@]}" shell -T 'mkdir -p /tmp/tactus-bin'
+    "${ADB_CMD[@]}" push "$BINARY_PATH" /tmp/tactus-bin/tactusd >/dev/null
+    "${ADB_CMD[@]}" shell -T 'chmod 0755 /tmp/tactus-bin/tactusd'
   fi
 
   if [[ -n "$AP_PSK" ]]; then
-    printf 'TACTUS_AP_PSK=%q\n' "$AP_PSK" | "${adb_cmd[@]}" shell -T 'umask 077 && cat > /tmp/.tactus-env'
+    printf 'TACTUS_AP_PSK=%q\n' "$AP_PSK" | "${ADB_CMD[@]}" shell -T 'umask 077 && cat > /tmp/.tactus-env'
   fi
 
   # Over USB-C ADB, check if hostapd/dnsmasq/iw need internet to install.
   if [[ "$ROLLBACK_AP" -eq 0 && "$STAGE_ONLY" -eq 0 && -z "$DEB_DIR" ]]; then
     local missing_pkgs
-    missing_pkgs="$("${adb_cmd[@]}" shell -T 'for p in hostapd dnsmasq iw; do dpkg -s "$p" >/dev/null 2>&1 || echo "$p"; done' | tr -d '\r')"
+    missing_pkgs="$("${ADB_CMD[@]}" shell -T 'for p in hostapd dnsmasq iw; do dpkg -s "$p" >/dev/null 2>&1 || echo "$p"; done' | tr '\r\n' ' ' | xargs)"
     local has_route
-    has_route="$("${adb_cmd[@]}" shell -T 'ip -4 route show default | grep -q "^default" && echo yes || echo no' | tr -d '\r')"
+    has_route="$("${ADB_CMD[@]}" shell -T 'ip -4 route show default | grep -q "^default" && echo yes || echo no' | tr -d '\r')"
 
     if [[ -n "$missing_pkgs" && "$has_route" != "yes" ]]; then
       if [[ -n "$WIFI_SSID" ]]; then
         log "Board is offline and needs packages ($missing_pkgs); connecting wlan0 temporarily to '${WIFI_SSID}'..."
-        cleanup_bootstrap=1
-        "${adb_cmd[@]}" shell -T 'nmcli connection delete tactus-bootstrap-wifi >/dev/null 2>&1 || true'
-        "${adb_cmd[@]}" shell -T 'nmcli radio wifi on >/dev/null 2>&1 || true; nmcli dev wifi rescan ifname wlan0 >/dev/null 2>&1 || true'
+        ADB_CLEANUP_BOOTSTRAP=1
+        "${ADB_CMD[@]}" shell -T 'nmcli connection delete tactus-bootstrap-wifi >/dev/null 2>&1 || true'
+        "${ADB_CMD[@]}" shell -T 'nmcli radio wifi on >/dev/null 2>&1 || true; nmcli dev wifi rescan ifname wlan0 >/dev/null 2>&1 || true'
         local wifi_connect_cmd
         if [[ -n "$WIFI_PSK" ]]; then
           wifi_connect_cmd="nmcli dev wifi connect $(printf '%q' "$WIFI_SSID") password $(printf '%q' "$WIFI_PSK") ifname wlan0 name tactus-bootstrap-wifi"
@@ -301,13 +301,13 @@ run_adb() {
         fi
         local wifi_connected=0 attempt
         for attempt in 1 2 3; do
-          if "${adb_cmd[@]}" shell -T "$wifi_connect_cmd"; then
+          if "${ADB_CMD[@]}" shell -T "$wifi_connect_cmd"; then
             wifi_connected=1
             break
           fi
           if [[ "$attempt" -lt 3 ]]; then
             log "WiFi scan/connect attempt ${attempt}/3 did not complete; rescanning..."
-            "${adb_cmd[@]}" shell -T 'nmcli dev wifi rescan ifname wlan0 >/dev/null 2>&1 || true'
+            "${ADB_CMD[@]}" shell -T 'nmcli dev wifi rescan ifname wlan0 >/dev/null 2>&1 || true'
             sleep 4
           fi
         done
@@ -317,7 +317,7 @@ run_adb() {
         fi
         local i
         for i in $(seq 1 15); do
-          if [[ "$("${adb_cmd[@]}" shell -T 'ip -4 route show default | grep -q "^default" && echo yes || echo no' | tr -d '\r')" == "yes" ]]; then
+          if [[ "$("${ADB_CMD[@]}" shell -T 'ip -4 route show default | grep -q "^default" && echo yes || echo no' | tr -d '\r')" == "yes" ]]; then
             break
           fi
           sleep 1
@@ -342,9 +342,9 @@ run_adb() {
 
   log "Executing on-board provisioning script via ADB..."
   if [[ "$need_sudo_pw" -eq 0 ]]; then
-    "${adb_cmd[@]}" shell -T "sudo -n bash -c $(printf '%q' "$remote_cmd")"
+    "${ADB_CMD[@]}" shell -T "sudo -n bash -c $(printf '%q' "$remote_cmd")"
   else
-    printf '%s\n' "$arduino_pw" | "${adb_cmd[@]}" shell -T "sudo -S -p '' bash -c $(printf '%q' "$remote_cmd")"
+    printf '%s\n' "$arduino_pw" | "${ADB_CMD[@]}" shell -T "sudo -S -p '' bash -c $(printf '%q' "$remote_cmd")"
   fi
 
   log "Done. Board reachable over SSH via 'ssh -4 arduino@${TARGET_HOSTNAME}.local' (Ethernet) or 'ssh -4 arduino@10.42.0.1' (Tactus AP)."
