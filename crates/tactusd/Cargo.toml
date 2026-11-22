@@ -1,0 +1,10 @@
+[package]
+name = "tactusd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tactus-link-sys = { path = "../tactus-link-sys" }
+tactus-protocol = { path = "../tactus-protocol" }
+tactus-sync-core = { path = "../tactus-sync-core" }

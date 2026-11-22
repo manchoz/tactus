@@ -1,0 +1,10 @@
+[package]
+name = "tactus-link-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+links = "abl_link"
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"

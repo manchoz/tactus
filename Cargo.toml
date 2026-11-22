@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tactus-protocol",
+    "crates/tactus-link-sys",
+    "crates/tactus-sync-core",
+    "crates/tactusd",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
