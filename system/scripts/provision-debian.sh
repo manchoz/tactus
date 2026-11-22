@@ -297,7 +297,30 @@ install_system_files() {
   fi
 
   install -m 0644 "${SYSTEM_DIR}/dnsmasq/tactus-ap.conf" /etc/dnsmasq.d/tactus-ap.conf
-  install -m 0644 "${SYSTEM_DIR}/avahi/tactus.service" /etc/avahi/services/tactus.service
+
+  local tmp_avahi board_serial=""
+  tmp_avahi="$(mktemp)"
+  if [[ -r /sys/devices/soc0/serial_number ]]; then
+    board_serial="$(tr -cd 'A-Za-z0-9._-' </sys/devices/soc0/serial_number)"
+  fi
+  if [[ -n "$board_serial" ]]; then
+    awk -v serial="$board_serial" '
+      /<type>_tactus\._tcp<\/type>/ { in_tactus = 1 }
+      in_tactus && /<\/service>/ {
+        print "    <txt-record>serial_number=" serial "</txt-record>"
+        in_tactus = 0
+      }
+      { print }
+    ' "${SYSTEM_DIR}/avahi/tactus.service" >"$tmp_avahi"
+  else
+    cp "${SYSTEM_DIR}/avahi/tactus.service" "$tmp_avahi"
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1])' "$tmp_avahi"
+  fi
+  install -m 0644 "$tmp_avahi" /etc/avahi/services/tactus.service
+  rm -f "$tmp_avahi"
+
   install -m 0644 "${SYSTEM_DIR}/systemd/tactus-ap.service" /etc/systemd/system/tactus-ap.service
   install -m 0644 "${SYSTEM_DIR}/systemd/tactusd.service" /etc/systemd/system/tactusd.service
 
@@ -311,6 +334,7 @@ install_system_files() {
   dnsmasq --test --conf-file=/etc/dnsmasq.d/tactus-ap.conf
   systemctl daemon-reload
   systemctl enable --now avahi-daemon.service
+  systemctl reload-or-restart avahi-daemon.service
 }
 
 enable_ssh() {
@@ -384,6 +408,11 @@ trim_services() {
     fi
   fi
   pkill -x 'pipewire|pipewire-pulse|wireplumber|filter-chain' 2>/dev/null || true
+
+  if [[ -f /etc/avahi/services/arduino.service ]]; then
+    mv -f /etc/avahi/services/arduino.service /etc/avahi/services/arduino.service.disabled
+    systemctl reload-or-restart avahi-daemon.service 2>/dev/null || true
+  fi
 }
 
 configure_hostname() {
@@ -497,6 +526,52 @@ verify_board() {
     fi
   fi
 
+  local avahi_svc="/etc/avahi/services/tactus.service"
+  local avahi_xml_ok=1
+  if [[ ! -f "$avahi_svc" ]]; then
+    avahi_xml_ok=0
+  elif command -v python3 >/dev/null 2>&1 &&
+       ! python3 -c 'import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1])' "$avahi_svc" >/dev/null 2>&1; then
+    avahi_xml_ok=0
+  elif ! grep -q '<type>_tactus\._tcp</type>' "$avahi_svc" ||
+       ! grep -q '<type>_http\._tcp</type>' "$avahi_svc"; then
+    avahi_xml_ok=0
+  fi
+
+  if [[ "$avahi_xml_ok" -eq 1 && -r /sys/devices/soc0/serial_number ]]; then
+    local expected_serial
+    expected_serial="$(tr -cd 'A-Za-z0-9._-' </sys/devices/soc0/serial_number)"
+    if [[ -n "$expected_serial" ]] && ! grep -Fq "<txt-record>serial_number=${expected_serial}</txt-record>" "$avahi_svc"; then
+      avahi_xml_ok=0
+    fi
+  fi
+
+  if [[ "$avahi_xml_ok" -eq 1 ]]; then
+    echo "  [PASS] /etc/avahi/services/tactus.service declares _tactus._tcp + _http._tcp with serial"
+  else
+    echo "  [FAIL] /etc/avahi/services/tactus.service missing, invalid XML, or missing _tactus._tcp/serial" >&2
+    failures=$((failures + 1))
+  fi
+
+  local avahi_pid avahi_established=0 avahi_wait
+  avahi_pid="$(systemctl show -p MainPID --value avahi-daemon.service 2>/dev/null || true)"
+  if [[ -n "$avahi_pid" && "$avahi_pid" != "0" ]]; then
+    for avahi_wait in 1 2 3 4 5 6; do
+      if journalctl -u avahi-daemon.service _PID="$avahi_pid" --no-pager 2>/dev/null |
+         grep -Fq '(/services/tactus.service) successfully established'; then
+        avahi_established=1
+        break
+      fi
+      sleep 0.5
+    done
+  fi
+  if [[ "$avahi_established" -eq 1 ]]; then
+    echo "  [PASS] avahi-daemon established _tactus._tcp (/services/tactus.service)"
+  else
+    echo "  [FAIL] avahi-daemon did not report /services/tactus.service established" >&2
+    failures=$((failures + 1))
+  fi
+
   if [[ "$TRIM_SERVICES" -eq 1 ]]; then
     if [[ "$(systemctl get-default)" == "multi-user.target" ]]; then
       echo "  [PASS] default target is multi-user.target"
@@ -509,6 +584,13 @@ verify_board() {
       echo "  [PASS] zero PipeWire processes running"
     else
       echo "  [FAIL] PipeWire processes still running" >&2
+      failures=$((failures + 1))
+    fi
+
+    if [[ ! -f /etc/avahi/services/arduino.service ]]; then
+      echo "  [PASS] stock arduino.service (_arduino._tcp) disabled"
+    else
+      echo "  [FAIL] stock /etc/avahi/services/arduino.service still active" >&2
       failures=$((failures + 1))
     fi
   fi

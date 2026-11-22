@@ -52,7 +52,7 @@ Designed for setups where MIDI tempo changes rarely and rock-solid Link BPM stab
 
 ## 4. Network & Mobile Web UI Specification
 - **WiFi AP:** 5 GHz only, non-DFS channel (default `36`, selectable `36/40/44/48`), `country_code=IT`, `multicast_to_unicast=1`, `dtim_period=1` *(Debian PoC note: onboard UNO Q `ath10k_snoc` / WCN3990 EEPROM `0x406c` enforces `NO-IR` on 5 GHz without `CONFIG_ATH_USER_REGD`, so PoC falls back to 2.4 GHz channel `11` [20 MHz, clear of BLE advertising channels], while 5 GHz ch `36–48` remains the target for external 5 GHz USB WiFi or Yocto `meta-tactus`)*.
-- **DHCP/mDNS:** Subnet `10.42.0.1/24`. `dnsmasq` MUST omit default router (`dhcp-option=3`) and DNS (`dhcp-option=6`) to prevent iOS/Android Captive Portal prompts and keep cellular data usable. Avahi announces `tactus.local`.
+- **DHCP/mDNS & Zeroconf Discovery:** Subnet `10.42.0.1/24`. `dnsmasq` MUST omit default router (`dhcp-option=3`) and DNS (`dhcp-option=6`) to prevent iOS/Android Captive Portal prompts and keep cellular data usable. Avahi announces `tactus.local` along with `_tactus._tcp` (port `80`, TXT keys `app`, `version`, `board`, `serial_number`, `path`, `ws`, `ap_ssid`, `ssh`) and `_http._tcp` (port `80`, `path=/`) on all active IP interfaces (`wlan0` AP and Ethernet), while stock `_arduino._tcp` (`arduino.service`) is disabled when trimmed.
 - **Web UI:** Single embedded vanilla HTML/CSS/JS bundle served over HTTP on port `80`.
   - Meta tags for iOS fullscreen Home Screen app (`apple-mobile-web-app-capable`, `apple-mobile-web-app-status-bar-style`, SVG/PNG touch icon).
   - WebSocket `/ws` pushing telemetry snapshots at `10–15 Hz` (plus immediate push on state/downbeat change).

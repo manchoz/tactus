@@ -15,7 +15,7 @@
 | :--- | :--- | :--- |
 | **M0** | Cargo workspace & offline-safe `abl_link` FFI build | Complete |
 | **M1** | Pure-Rust `tactus-sync-core` & deterministic simulations | Complete |
-| **M2** | 5 GHz WiFi AP (`hostapd`/`dnsmasq`/`avahi`) & UNO Q provisioning | Planned |
+| **M2** | WiFi AP (`hostapd`/`dnsmasq`/`avahi`), Zeroconf & UNO Q provisioning | Complete |
 | **M3** | Headless `tactusd` RT engine, ALSA hotplug & atomic `config.toml` | Planned |
 | **M4** | Embedded mobile Web UI (`axum` + WebSocket + Home Screen PWA) | Planned |
 | **M5** | Optional STM32U585 Zephyr LED matrix bridge (`Arduino_RouterBridge`) | Planned |
@@ -166,6 +166,19 @@ A fresh UNO Q image boots with SSH masked and only USB-C `adb` active (Arduino A
 ```
 
 Run `./system/scripts/provision-factory-unoq.sh --help` for offline `--deb-dir`, custom `--psk`, `--stage-only`, and `--rollback-ap` options.
+
+### Network Discovery (Bonjour / Zeroconf)
+
+Provisioned boards announce `_tactus._tcp` (with `app`, `version`, `board`, `serial_number`, `path`, `ws`, `ap_ssid`, and `ssh` TXT records) and `_http._tcp` on port `80` across all active interfaces (`wlan0` AP and Ethernet LAN):
+
+```bash
+# macOS (when connected to the 'Tactus' WiFi AP or same Ethernet LAN)
+dns-sd -B _tactus._tcp local.
+dns-sd -L tactus _tactus._tcp local.
+
+# Linux (Avahi)
+avahi-browse -rt _tactus._tcp
+```
 
 ---
 
