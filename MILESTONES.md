@@ -24,12 +24,19 @@
   - `NetworkManager` ignores `wlan0` while keeping USB-Ethernet operational for SSH/deploy.
   - iPhone/iPad joins `Tactus` 5 GHz SSID (non-DFS ch 36–48) with no Captive Portal popup, resolves `tactus.local`, and holds a stable Ableton Link session between two mobile peers.
 
-## M3 — Headless `tactusd` RT Engine, ALSA Hotplug & Atomic Config
+## M3 — Headless `tactusd` RT Engine, RawMIDI Hotplug & Atomic Config
 - **Deliverables:**
-  - `tactusd` RT thread (`std::thread`, `SCHED_FIFO` prio 75, `mlockall`, core pinning) bridged via `rtrb` with `Copy` / zero-alloc `TelemetrySnapshot`.
-  - Direct ALSA Sequencer (`alsa` crate, no PipeWire) for MIDI Clock I/O; port enumeration and USB hotplug (`SND_SEQ_EVENT_PORT_START` / `PORT_EXIT`) handled outside the RT hot path.
-  - Atomic `config.toml` persistence (`/var/lib/tactus/config.toml` via temp file + `fsync` + `rename`) with CLI/env override.
-- **Verification:** Live hardware test on UNO Q with CME WIDI Uhost + Ableton Link peers in both `Link → MIDI` and `MIDI → Link` modes; unplug/replug WIDI Uhost recovers automatically without restarting `tactusd`.
+  - `tactusd` RT thread (`std::thread`, `SCHED_FIFO` prio 75, `mlockall`, pinned to Core 3) running a unified zero-spin `poll([midi_in_fd, timerfd(CLOCK_MONOTONIC, TFD_TIMER_ABSTIME), cmd_eventfd])` loop, bridged with the `tokio` control plane via lock-free `rtrb` rings (`Copy` `RtCommand`, `TelemetrySnapshot`, and `RawFd` handoff/return rings so `open()`/`close()` never touch the RT thread).
+  - Explicit clock-domain bridge between `abl_link`'s Linux `CLOCK_MONOTONIC_RAW` domain and `CLOCK_MONOTONIC` (`timerfd` `TFD_TIMER_ABSTIME`).
+  - Direct Kernel ALSA RawMIDI backend via `libc` UAPI ioctls (replacing `/dev/snd/seq` and requiring zero `libasound2-dev` sysroot for macOS `cargo zigbuild`, since stock UNO Q kernel `7.2.11-arduino1+` lacks `CONFIG_SND_SEQUENCER` and kernel headers while providing `CONFIG_SND_RAWMIDI=m` and `CONFIG_SND_USB_AUDIO=m`):
+    - Port enumeration and selection via `/dev/snd/controlC*` (`SNDRV_CTL_IOCTL_CARD_INFO`, `SNDRV_CTL_IOCTL_RAWMIDI_NEXT_DEVICE`, `SNDRV_CTL_IOCTL_RAWMIDI_INFO`, `SNDRV_CTL_IOCTL_RAWMIDI_PREFER_SUBDEVICE`) on the `tokio` control plane, behind a clean backend boundary so `snd_seq` could be added later on Yocto `meta-tactus` if desired.
+    - RawMIDI `/dev/snd/midiC*D*` edge-case handling: single `O_RDWR | O_NONBLOCK | O_CLOEXEC` FD when IN and OUT target the same subdevice (separate `O_RDONLY` / `O_WRONLY` FDs otherwise), separate INPUT/OUTPUT substream capability probing, `O(1)` MIDI 1.0 System Real-Time byte filtering (`MidiEvent::from_byte`), and graceful `POLLERR`/`POLLHUP`/`ENODEV` detach back to async on unplug.
+    - USB hotplug on the `tokio` async plane via `NETLINK_KOBJECT_UEVENT` (`SUBSYSTEM=sound`, pure `libc` socket without `libudev`) plus a low-rate fallback rescan; generalize `MidiPortInfo` (`id` e.g. `"hw:1,0,0"`, `card_name`, `port_name`, `can_read`, `can_write`) while preserving `config.toml` substring matching (`input_port_match` / `output_port_match`).
+  - Atomic `config.toml` persistence (`/var/lib/tactus/config.toml` via temp file + `fsync` + `rename`) with `--config` / `TACTUS_CONFIG` override.
+- **Verification:**
+  - Host unit/mock tests covering RawMIDI port matching, `MidiPortInfo` serialization, `CLOCK_MONOTONIC` ↔ `CLOCK_MONOTONIC_RAW` bridge math, atomic `config.toml` write/recovery, and deterministic pipe/mock RT loop tests (`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`).
+  - macOS cross-compile via `cargo zigbuild --workspace --release --target aarch64-unknown-linux-gnu.2.36` with no external `libasound` sysroot.
+  - Live hardware test on UNO Q (deployed via `./system/scripts/provision-factory-unoq.sh --ssh ... --binary ...`) with CME WIDI Uhost + Ableton Link peers in both `Link → MIDI` and `MIDI → Link` modes, verifying `SCHED_FIFO`/core pinning and unplug/replug recovery without restarting `tactusd`.
 
 ## M4 — Embedded Mobile Web UI ("Add to Home Screen")
 - **Deliverables:**
