@@ -1,0 +1,23 @@
+[sync]
+direction = "link_to_midi"
+start_stop_sync = true
+quantum = 4.0
+midi_offset_ms = 0.0
+ols_window_secs = 10.0
+fast_window_secs = 1.5
+bpm_deadband = 0.05
+step_change_bpm = 1.5
+step_change_beats = 3
+phase_deadband_ms = 4.0
+max_phase_nudge_ms = 1.0
+
+[midi]
+input_port_match = "WIDI"
+output_port_match = "WIDI"
+
+[web]
+listen_addr = "0.0.0.0:80"
+
+[mcu_bridge]
+enabled = false
+socket_path = "/var/run/arduino-router.sock"

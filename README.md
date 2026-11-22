@@ -148,6 +148,27 @@ cargo build --workspace --target aarch64-unknown-linux-gnu
 
 ---
 
+## Provisioning a Factory Arduino UNO Q
+
+A fresh UNO Q image boots with SSH masked and only USB-C `adb` active (Arduino App Lab is **not** required). From the host:
+
+```bash
+# Factory board over USB-C ADB (temporarily connects WiFi to fetch hostapd/dnsmasq/iw,
+# then deletes the temporary WiFi profile, enables SSH + key auth, configures Tactus AP,
+# trims GUI/PipeWire/extra Arduino services, sets volatile journald, and verifies):
+./system/scripts/provision-factory-unoq.sh --adb \
+  --pubkey ~/.ssh/id_ed25519.pub \
+  --wifi-ssid "<YourWiFi>" --wifi-psk "<WiFiPassword>" \
+  --nopasswd-sudo
+
+# Existing / Ethernet-connected UNO Q over SSH (idempotent):
+./system/scripts/provision-factory-unoq.sh --ssh arduino@tactus.local --nopasswd-sudo
+```
+
+Run `./system/scripts/provision-factory-unoq.sh --help` for offline `--deb-dir`, custom `--psk`, `--stage-only`, and `--rollback-ap` options.
+
+---
+
 ## Runtime & Configuration Reference
 
 - **Daemon binary:** `tactusd`
