@@ -7,6 +7,9 @@
   const DRAG_SETTLE_MS = 250;
   const OFFSET_THROTTLE_MS = 50;
 
+  const localUiHash =
+    document.querySelector('meta[name="tactus-ui-hash"]')?.getAttribute("content") || "";
+
   const els = {
     connPill: document.getElementById("conn-pill"),
     peersPill: document.getElementById("peers-pill"),
@@ -111,6 +114,38 @@
     }
   }
 
+  async function checkUiVersion() {
+    if (!localUiHash) {
+      return;
+    }
+    try {
+      const resp = await fetch("/healthz", { cache: "no-store" });
+      if (!resp.ok) {
+        return;
+      }
+      const data = await resp.json();
+      const remoteHash = typeof data?.ui_hash === "string" ? data.ui_hash : "";
+      if (!remoteHash || remoteHash === localUiHash) {
+        return;
+      }
+      const reloadKey = `tactus-reloaded-${remoteHash}`;
+      let alreadyTried = false;
+      try {
+        alreadyTried = window.sessionStorage.getItem(reloadKey) === "1";
+        if (!alreadyTried) {
+          window.sessionStorage.setItem(reloadKey, "1");
+        }
+      } catch (_err) {
+        // Ignore storage restrictions and reload once.
+      }
+      if (!alreadyTried) {
+        window.location.reload();
+      }
+    } catch (_err) {
+      // Ignore transient network errors during reconnect.
+    }
+  }
+
   function connectWebSocket() {
     if (paused || document.hidden) {
       return;
@@ -135,6 +170,7 @@
       reconnectAttempt = 0;
       lastMessageAt = Date.now();
       setConnectionStatus("live");
+      void checkUiVersion();
     };
 
     socket.onmessage = (event) => {

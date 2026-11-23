@@ -1,7 +1,7 @@
 //! Embedded mobile Web UI HTTP & WebSocket server (`axum` on `tokio`).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -65,6 +65,58 @@ fn try_acquire_ws_slot(counter: &Arc<AtomicUsize>) -> Option<WsClientGuard> {
     None
 }
 
+fn ui_asset_hash() -> &'static str {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| {
+        const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0100_0000_01b3;
+        let mut h = FNV_OFFSET_BASIS;
+        for chunk in [
+            INDEX_HTML.as_bytes(),
+            STYLE_CSS.as_bytes(),
+            APP_JS.as_bytes(),
+            MANIFEST_JSON.as_bytes(),
+        ] {
+            for &b in chunk {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(FNV_PRIME);
+            }
+            h ^= 0xff;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        format!("{h:016x}")
+    })
+}
+
+fn rendered_index_html() -> &'static [u8] {
+    static RENDERED: OnceLock<Vec<u8>> = OnceLock::new();
+    RENDERED.get_or_init(|| {
+        let hash = ui_asset_hash();
+        let meta = format!("  <meta name=\"tactus-ui-hash\" content=\"{hash}\">\n</head>");
+        INDEX_HTML
+            .replace(
+                "href=\"/style.css\"",
+                &format!("href=\"/style.css?v={hash}\""),
+            )
+            .replace("src=\"/app.js\"", &format!("src=\"/app.js?v={hash}\""))
+            .replacen("</head>", &meta, 1)
+            .into_bytes()
+    })
+}
+
+fn no_store_asset(content_type: &'static str, body: &'static [u8]) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+            (header::PRAGMA, "no-cache"),
+            (header::EXPIRES, "0"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 fn static_asset(
     content_type: &'static str,
     cache_control: &'static str,
@@ -91,36 +143,23 @@ pub fn build_router(control: ControlHandle, shutdown_rx: watch::Receiver<bool>) 
     Router::new()
         .route(
             "/",
-            get(|| async {
-                static_asset(
-                    "text/html; charset=utf-8",
-                    "no-cache",
-                    INDEX_HTML.as_bytes(),
-                )
-            }),
+            get(|| async { no_store_asset("text/html; charset=utf-8", rendered_index_html()) }),
         )
         .route(
             "/style.css",
-            get(|| async {
-                static_asset("text/css; charset=utf-8", "no-cache", STYLE_CSS.as_bytes())
-            }),
+            get(|| async { no_store_asset("text/css; charset=utf-8", STYLE_CSS.as_bytes()) }),
         )
         .route(
             "/app.js",
             get(|| async {
-                static_asset(
-                    "application/javascript; charset=utf-8",
-                    "no-cache",
-                    APP_JS.as_bytes(),
-                )
+                no_store_asset("application/javascript; charset=utf-8", APP_JS.as_bytes())
             }),
         )
         .route(
             "/manifest.webmanifest",
             get(|| async {
-                static_asset(
+                no_store_asset(
                     "application/manifest+json; charset=utf-8",
-                    "no-cache",
                     MANIFEST_JSON.as_bytes(),
                 )
             }),
@@ -193,6 +232,7 @@ async fn healthz() -> Response {
         Json(serde_json::json!({
             "status": "ok",
             "version": env!("CARGO_PKG_VERSION"),
+            "ui_hash": ui_asset_hash(),
         })),
     )
         .into_response()
@@ -516,26 +556,48 @@ mod tests {
     async fn serves_embedded_mobile_assets_and_rest_endpoints() {
         let srv = spawn_test_server().await;
 
+        let (hz_hdr, hz_body) = http_get(&srv, "/healthz").await;
+        assert!(hz_hdr.starts_with("HTTP/1.1 200"));
+        let hz_json: serde_json::Value =
+            serde_json::from_slice(&hz_body).expect("utf8 healthz json");
+        assert_eq!(hz_json["status"], "ok");
+        let ui_hash = hz_json["ui_hash"]
+            .as_str()
+            .expect("ui_hash string in /healthz");
+        assert_eq!(ui_hash.len(), 16);
+        assert!(ui_hash.chars().all(|c| c.is_ascii_hexdigit()));
+
         let (hdr, body) = http_get(&srv, "/").await;
         assert!(hdr.starts_with("HTTP/1.1 200"));
+        let hdr_lower = hdr.to_ascii_lowercase();
+        assert!(hdr_lower.contains("no-store"));
+        assert!(hdr_lower.contains("pragma: no-cache"));
         let html = String::from_utf8(body).expect("utf8 index");
         assert!(html.contains("apple-mobile-web-app-capable"));
         assert!(html.contains("/apple-touch-icon.png"));
         assert!(html.contains("clock-thru-toggle"));
         assert!(html.contains("midi-out-list"));
+        assert!(html.contains(&format!(
+            r#"<meta name="tactus-ui-hash" content="{ui_hash}">"#
+        )));
+        assert!(html.contains(&format!("/style.css?v={ui_hash}")));
+        assert!(html.contains(&format!("/app.js?v={ui_hash}")));
 
-        for (path, ctype_sub) in [
-            ("/style.css", "text/css"),
-            ("/app.js", "application/javascript"),
-            ("/manifest.webmanifest", "application/manifest+json"),
-            ("/icon.svg", "image/svg+xml"),
+        let css_versioned = format!("/style.css?v={ui_hash}");
+        let js_versioned = format!("/app.js?v={ui_hash}");
+        for (path, ctype_sub, expect_no_store) in [
+            (css_versioned.as_str(), "text/css", true),
+            (js_versioned.as_str(), "application/javascript", true),
+            ("/manifest.webmanifest", "application/manifest+json", true),
+            ("/icon.svg", "image/svg+xml", false),
         ] {
             let (h, b) = http_get(&srv, path).await;
             assert!(h.starts_with("HTTP/1.1 200"), "{path} status: {h}");
-            assert!(
-                h.to_ascii_lowercase().contains(ctype_sub),
-                "{path} type: {h}"
-            );
+            let h_lower = h.to_ascii_lowercase();
+            assert!(h_lower.contains(ctype_sub), "{path} type: {h}");
+            if expect_no_store {
+                assert!(h_lower.contains("no-store"), "{path} cache: {h}");
+            }
             assert!(!b.is_empty(), "{path} empty");
         }
 
@@ -548,11 +610,6 @@ mod tests {
         let parsed_state: AppState = serde_json::from_slice(&state_body).expect("api state json");
         assert_eq!(parsed_state.telemetry.bpm_link, 124.0);
         assert_eq!(parsed_state.midi_input_match, "WIDI");
-
-        let (hz_hdr, hz_body) = http_get(&srv, "/healthz").await;
-        assert!(hz_hdr.starts_with("HTTP/1.1 200"));
-        let hz_str = String::from_utf8(hz_body).expect("utf8 healthz");
-        assert!(hz_str.contains(r#""status":"ok""#));
 
         let _ = srv.shutdown_tx.send(true);
         srv.handle.await.expect("server shutdown join");
