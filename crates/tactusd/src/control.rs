@@ -739,6 +739,7 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::sync::Mutex;
 
     use rtrb::RingBuffer;
@@ -749,7 +750,7 @@ mod tests {
 
     struct ExclusiveFakeMidiBackend {
         ports: Mutex<Vec<MidiPortInfo>>,
-        open_leases: Mutex<Vec<(String, RawFd)>>,
+        open_leases: Mutex<Vec<(String, OwnedFd)>>,
         failing_port_ids: Mutex<Vec<String>>,
     }
 
@@ -770,17 +771,23 @@ mod tests {
             *self.failing_port_ids.lock().expect("lock failing port ids") = ids;
         }
 
-        fn alloc_open_fd() -> RawFd {
+        fn alloc_open_fd() -> (RawFd, OwnedFd) {
             let mut fds = [-1 as RawFd; 2];
             assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-            unsafe {
-                libc::close(fds[1]);
-            }
-            fds[0]
+            let write_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+            (fds[0], write_end)
         }
 
-        fn prune_closed(leases: &mut Vec<(String, RawFd)>) {
-            leases.retain(|(_, fd)| unsafe { libc::fcntl(*fd, libc::F_GETFD) } != -1);
+        fn prune_closed(leases: &mut Vec<(String, OwnedFd)>) {
+            leases.retain(|(_, write_fd)| {
+                let mut pfd = libc::pollfd {
+                    fd: write_fd.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+                ret >= 0 && (pfd.revents & (libc::POLLERR | libc::POLLHUP)) == 0
+            });
         }
     }
 
@@ -828,10 +835,10 @@ mod tests {
 
             if let Some(in_port) = input {
                 if !failing.contains(&in_port.id) {
-                    let fd = Self::alloc_open_fd();
+                    let (fd, write_fd) = Self::alloc_open_fd();
                     fds.in_fd = fd;
                     attached_input_id = Some(in_port.id.clone());
-                    leases.push((in_port.id.clone(), fd));
+                    leases.push((in_port.id.clone(), write_fd));
                     if outputs.iter().any(|o| o.id == in_port.id) {
                         shared_id_fd = Some((in_port.id.clone(), fd));
                     }
@@ -854,10 +861,10 @@ mod tests {
                         continue;
                     }
                 }
-                let fd = Self::alloc_open_fd();
+                let (fd, write_fd) = Self::alloc_open_fd();
                 if fds.push_output(fd) {
                     attached_output_ids.push(out_port.id.clone());
-                    leases.push((out_port.id.clone(), fd));
+                    leases.push((out_port.id.clone(), write_fd));
                 } else {
                     unsafe {
                         libc::close(fd);
