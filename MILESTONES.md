@@ -16,19 +16,19 @@
   - 24 PPQN scheduler with `TIMER_ABSTIME` grid, signed latency offset (`±50 ms`), and `start_stop_sync` handling (`0xFA`/`0xFB`/`0xFC`).
 - **Verification:** Deterministic unit/simulation tests covering: ±5 ms BLE jitter, 40 ppm quartz drift over 10+ minutes, 110→128 BPM step change, clock dropout/recovery, and direction switching while playing.
 
-## M2 — Network Stack (5 GHz AP) & System Provisioning on UNO Q
+## M2 — Network Stack (Dedicated WiFi AP) & Debian SBC Provisioning
 - **Deliverables:**
   - Portable `system/` files (`99-tactus-unmanaged.conf`, `hostapd/tactus-ap.conf`, `dnsmasq/tactus-ap.conf`, `avahi/tactus.service`, `systemd/tactus-ap.service`, `systemd/tactusd.service`).
   - Idempotent provisioning script for Debian PoC.
 - **Verification:**
   - `NetworkManager` ignores `wlan0` while keeping USB-Ethernet operational for SSH/deploy.
-  - iPhone/iPad joins `Tactus` 5 GHz SSID (non-DFS ch 36–48) with no Captive Portal popup, resolves `tactus.local`, and holds a stable Ableton Link session between two mobile peers.
+  - iPhone/iPad joins the `Tactus` SSID with no Captive Portal popup, resolves `tactus.local`, and holds a stable Ableton Link session between two mobile peers.
 
 ## M3 — Headless `tactusd` RT Engine, RawMIDI Hotplug & Atomic Config
 - **Deliverables:**
   - `tactusd` RT thread (`std::thread`, `SCHED_FIFO` prio 75, `mlockall`, pinned to Core 3) running a unified zero-spin `poll([midi_in_fd, timerfd(CLOCK_MONOTONIC, TFD_TIMER_ABSTIME), cmd_eventfd])` loop, bridged with the `tokio` control plane via lock-free `rtrb` rings (`Copy` `RtCommand`, `TelemetrySnapshot`, and `RawFd` handoff/return rings so `open()`/`close()` never touch the RT thread).
   - Explicit clock-domain bridge between `abl_link`'s Linux `CLOCK_MONOTONIC_RAW` domain and `CLOCK_MONOTONIC` (`timerfd` `TFD_TIMER_ABSTIME`).
-  - Direct Kernel ALSA RawMIDI backend via `libc` UAPI ioctls (replacing `/dev/snd/seq` and requiring zero `libasound2-dev` sysroot for macOS `cargo zigbuild`, since stock UNO Q kernel `7.2.11-arduino1+` lacks `CONFIG_SND_SEQUENCER` and kernel headers while providing `CONFIG_SND_RAWMIDI=m` and `CONFIG_SND_USB_AUDIO=m`):
+  - Direct Kernel ALSA RawMIDI backend via `libc` UAPI ioctls (replacing `/dev/snd/seq` and requiring zero `libasound2-dev` sysroot for macOS `cargo zigbuild`, since stock Linux SBC kernels such as UNO Q `7.2.11-arduino1+` may omit `CONFIG_SND_SEQUENCER` and kernel headers while providing `CONFIG_SND_RAWMIDI=m` and `CONFIG_SND_USB_AUDIO=m`):
     - Port enumeration and selection via `/dev/snd/controlC*` (`SNDRV_CTL_IOCTL_CARD_INFO`, `SNDRV_CTL_IOCTL_RAWMIDI_NEXT_DEVICE`, `SNDRV_CTL_IOCTL_RAWMIDI_INFO`, `SNDRV_CTL_IOCTL_RAWMIDI_PREFER_SUBDEVICE`) on the `tokio` control plane, behind a clean backend boundary so `snd_seq` could be added later on Yocto `meta-tactus` if desired.
     - RawMIDI `/dev/snd/midiC*D*` edge-case handling: single `O_RDWR | O_NONBLOCK | O_CLOEXEC` FD when IN and OUT target the same subdevice (separate `O_RDONLY` / `O_WRONLY` FDs otherwise), separate INPUT/OUTPUT substream capability probing, `O(1)` MIDI 1.0 System Real-Time byte filtering (`MidiEvent::from_byte`), and graceful `POLLERR`/`POLLHUP`/`ENODEV` detach back to async on unplug.
     - USB hotplug on the `tokio` async plane via `NETLINK_KOBJECT_UEVENT` (`SUBSYSTEM=sound`, pure `libc` socket without `libudev`) plus a low-rate fallback rescan; generalize `MidiPortInfo` (`id` e.g. `"hw:1,0,0"`, `card_name`, `port_name`, `can_read`, `can_write`) while preserving `config.toml` substring matching (`input_port_match` / `output_port_match`).
@@ -36,7 +36,7 @@
 - **Verification:**
   - Host unit/mock tests covering RawMIDI port matching, `MidiPortInfo` serialization, `CLOCK_MONOTONIC` ↔ `CLOCK_MONOTONIC_RAW` bridge math, atomic `config.toml` write/recovery, and deterministic pipe/mock RT loop tests (`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`).
   - macOS cross-compile via `cargo zigbuild --workspace --release --target aarch64-unknown-linux-gnu.2.36` with no external `libasound` sysroot.
-  - Live hardware test on UNO Q (deployed via `./system/scripts/provision-factory-unoq.sh --ssh ... --binary ...`) with CME WIDI Uhost + Ableton Link peers in both `Link → MIDI` and `MIDI → Link` modes, verifying `SCHED_FIFO`/core pinning and unplug/replug recovery without restarting `tactusd`.
+  - Live hardware test on Linux SBC (reference UNO Q, deployed via `./system/scripts/provision-factory-unoq.sh --ssh ... --binary ...`) with CME WIDI Uhost + Ableton Link peers in both `Link → MIDI` and `MIDI → Link` modes, verifying `SCHED_FIFO`/core pinning and unplug/replug recovery without restarting `tactusd`.
 
 ## M4 — Embedded Mobile Web UI ("Add to Home Screen")
 - **Deliverables:**

@@ -1,7 +1,7 @@
 # SPEC.md — Tactus Technical Specification
 
 ## 1. Scope & Roadmap Phases
-- **v1 (PoC — Current Target):** Debian stock on UNO Q, CME WIDI Uhost on USB-C Host hub, 5 GHz WiFi AP, Rust `tactusd` bidirectional sync engine, mobile-first Web UI ("Add to Home Screen" on iOS/Android), optional 8×13 LED matrix heartbeat via `arduino-router`.
+- **v1 (PoC — Current Target):** Stock Debian on a Linux SBC (reference board: Arduino UNO Q), class-compliant USB-MIDI / BLE-MIDI (e.g., CME WIDI Uhost) over USB Host, dedicated WiFi AP, Rust `tactusd` bidirectional sync engine, mobile-first Web UI ("Add to Home Screen" on iOS/Android), optional MCU LED matrix heartbeat via `arduino-router`.
 - **v2 (Field Hardware):** Qwiic OLED + rotary encoder + physical Direction/Resync switches on STM32U585 (Zephyr), optional hardware UART MIDI TRS/DIN, `overlayfs` rootfs protection.
 - **v3 (Production Appliance):** Custom Yocto QLI image (`meta-tactus`), `read-only-rootfs`, dedicated `/data` partition, fast boot.
 
@@ -52,7 +52,7 @@ Designed for setups where MIDI tempo changes rarely and rock-solid Link BPM stab
 - Automatically handle USB hotplug (`NETLINK_KOBJECT_UEVENT` + 5 s fallback rescan) and per-output fault isolation without restarting `tactusd`.
 
 ## 4. Network & Mobile Web UI Specification
-- **WiFi AP:** 5 GHz only, non-DFS channel (default `36`, selectable `36/40/44/48`), `country_code=IT`, `multicast_to_unicast=1`, `dtim_period=1` *(Debian PoC note: onboard UNO Q `ath10k_snoc` / WCN3990 EEPROM `0x406c` enforces `NO-IR` on 5 GHz without `CONFIG_ATH_USER_REGD`, so PoC falls back to 2.4 GHz channel `11` [20 MHz, clear of BLE advertising channels], while 5 GHz ch `36–48` remains the target for external 5 GHz USB WiFi or Yocto `meta-tactus`)*.
+- **WiFi AP:** Dedicated local AP (`hostapd`) tuned for low-latency Ableton Link UDP multicast (`country_code=IT`, `multicast_to_unicast=1`, `dtim_period=1`, `ap_isolate=0`), defaulting to 2.4 GHz channel `11` (`2462 MHz`, `20 MHz`, clear of BLE advertising channels `2402`/`2426`/`2480 MHz`), with optional 5 GHz non-DFS channels (`36`/`40`/`44`/`48`) on SBC radios that permit 5 GHz AP mode.
 - **DHCP/mDNS & Zeroconf Discovery:** Subnet `10.42.0.1/24`. `dnsmasq` MUST omit default router (`dhcp-option=3`) and DNS (`dhcp-option=6`) to prevent iOS/Android Captive Portal prompts and keep cellular data usable. Avahi announces `tactus.local` along with `_tactus._tcp` (port `80`, TXT keys `app`, `version`, `board`, `serial_number`, `path`, `ws`, `ap_ssid`, `ssh`) and `_http._tcp` (port `80`, `path=/`) on all active IP interfaces (`wlan0` AP and Ethernet), while stock `_arduino._tcp` (`arduino.service`) is disabled when trimmed.
 - **Web UI:** Single embedded vanilla HTML/CSS/JS bundle served over HTTP on port `80`.
   - Meta tags for iOS fullscreen Home Screen app (`apple-mobile-web-app-capable`, `apple-mobile-web-app-status-bar-style`, SVG/PNG touch icon).

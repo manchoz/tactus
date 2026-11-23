@@ -22,7 +22,7 @@ usage() {
   cat <<'EOF'
 Usage: provision-debian.sh [OPTIONS]
 
-Idempotent Debian provisioning script for Tactus (Arduino UNO Q).
+Idempotent Debian provisioning script for Tactus (Linux SBC / Arduino UNO Q).
 
 Options:
   --factory           Full factory appliance preset:

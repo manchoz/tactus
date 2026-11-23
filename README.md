@@ -1,6 +1,6 @@
 # Tactus
 
-**Tactus** is a standalone embedded Rust appliance (targeting the Arduino UNO Q) that bidirectionally bridges USB-MIDI / BLE-MIDI (via CME WIDI Uhost in PoC) and **Ableton Link** over a dedicated 5 GHz WiFi Access Point.
+**Tactus** is a standalone embedded Rust appliance (running on a Linux SBC) that bidirectionally bridges USB-MIDI / BLE-MIDI (e.g., CME WIDI Uhost) and **Ableton Link** over a dedicated WiFi Access Point.
 
 ## Architectural Highlights
 
@@ -15,10 +15,10 @@
 | :--- | :--- | :--- |
 | **M0** | Cargo workspace & offline-safe `abl_link` FFI build | Complete |
 | **M1** | Pure-Rust `tactus-sync-core` & deterministic simulations | Complete |
-| **M2** | WiFi AP (`hostapd`/`dnsmasq`/`avahi`), Zeroconf & UNO Q provisioning | Complete |
+| **M2** | WiFi AP (`hostapd`/`dnsmasq`/`avahi`), Zeroconf & Debian SBC provisioning | Complete |
 | **M3** | Headless `tactusd` RT engine, ALSA RawMIDI hotplug & atomic `config.toml` | Complete |
 | **M4** | Embedded mobile Web UI (`axum` + WebSocket + Home Screen PWA) | Complete |
-| **M5** | Optional STM32U585 Zephyr LED matrix bridge (`Arduino_RouterBridge`) | Planned |
+| **M5** | Optional MCU LED matrix bridge (`Arduino_RouterBridge`, e.g., UNO Q STM32U585) | Planned |
 
 ## Documentation & Workspace Layout
 
@@ -88,7 +88,7 @@ Run `tactusd` locally on the host (uses defaults if `/var/lib/tactus/config.toml
 cargo run -p tactusd
 ```
 
-### 4. Cross-Compiling for Arduino UNO Q (`aarch64-unknown-linux-gnu`)
+### 4. Cross-Compiling for ARM64 Linux SBCs (`aarch64-unknown-linux-gnu`)
 
 Install the Rust target once:
 
@@ -148,7 +148,7 @@ cargo build --workspace --target aarch64-unknown-linux-gnu
 
 ---
 
-## Provisioning a Factory Arduino UNO Q
+## Provisioning a Debian Linux SBC (Reference Board: Arduino UNO Q)
 
 A fresh UNO Q image boots with SSH masked and only USB-C `adb` active (Arduino App Lab is **not** required). From the host:
 

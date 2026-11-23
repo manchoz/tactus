@@ -34,7 +34,7 @@ tactus/
 
 ## 2. Threading & Concurrency Model (`tactusd`)
 1. **RT Thread (`rt-sync`, `std::thread`):**
-   - Pinned to dedicated CPU core (e.g., Core 3 on QRB2210).
+   - Pinned to dedicated CPU core (e.g., Core 3 on a quad-core Linux SBC).
    - `SCHED_FIFO` priority 75 + `mlockall(MCL_CURRENT | MCL_FUTURE)`.
    - Owns ALSA Sequencer handle, `abl_link` session handle, and `SyncEngine` from `tactus-sync-core`.
    - Polls incoming commands from `rtrb::Consumer<EngineCommand>` (non-blocking).
@@ -75,6 +75,6 @@ Both WebSocket (JSON) and `arduino-router` (MessagePack-RPC) share the exact sam
 
 ## 5. System & Network Boot Sequence
 1. `NetworkManager` starts and ignores `wlan0` (`99-tactus-unmanaged.conf`), while managing USB-Ethernet for SSH/dev.
-2. `tactus-ap.service` brings up `wlan0`, assigns `10.42.0.1/24` via `ip addr replace`, sets regdomain (`iw reg set IT`), and starts `hostapd` (5 GHz) + `dnsmasq` (DHCP no-GW).
+2. `tactus-ap.service` brings up `wlan0`, assigns `10.42.0.1/24` via `ip addr replace`, sets regdomain (`iw reg set IT`), and starts `hostapd` + `dnsmasq` (DHCP no-GW).
 3. `avahi-daemon` publishes `tactus.local`.
 4. `tactusd.service` starts after `tactus-ap.service` and `sound.target`, with `CapabilityBoundingSet=CAP_SYS_NICE CAP_IPC_LOCK CAP_NET_BIND_SERVICE`.
