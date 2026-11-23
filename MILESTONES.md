@@ -45,8 +45,10 @@
   - Controls for Direction, Start/Stop Sync, Latency Offset (`±50 ms`), MIDI port selection, Resync, plus live BPM/Lock/Peers/Downbeat readout.
 - **Verification:** Saved to iOS/Android Home Screen over `http://tactus.local`, controls update `tactusd` and persist across reboot, UI recovers cleanly after phone screen lock/app switch with zero measurable jitter impact on MIDI Clock.
 
-## M5 — Zephyr Heartbeat (`Arduino_RouterBridge`) — Optional PoC Bonus
+## M5 — Zephyr Heartbeat (`Arduino_RouterBridge`) — Complete
 - **Deliverables:**
-  - Minimal `mcu/tactus-zephyr` sketch driving the onboard 8×13 LED matrix (downbeat pulse + direction arrow).
-  - `tokio` MessagePack-RPC client in `tactusd` connected to `/var/run/arduino-router.sock` using `Bridge.notify()` (low-rate events only, zero 24 PPQN traffic).
-- **Verification:** LED matrix pulses in sync with Link/MIDI downbeat while RT MIDI timing remains unaffected.
+  - Minimal `mcu/tactus-zephyr/tactus-zephyr.ino` sketch (`Arduino_RouterBridge` + 3-bit grayscale 8×13 `Arduino_LED_Matrix`) rendering downbeat pulse (`140 ms` smooth decay), sync direction arrow (`Link → MIDI` / `MIDI → Link`), lock status, and play/stop state, plus debounced optional v2 buttons (`#ifdef TACTUS_ENABLE_BUTTONS`) and build/flash instructions in `mcu/tactus-zephyr/README.md`.
+  - Optional `tokio` MessagePack-RPC Unix-socket client (`crates/tactusd/src/mcu.rs`, enabled via `[mcu_bridge] enabled = true`) connecting to `/var/run/arduino-router.sock` with exponential backoff (`250 ms` → `5 s`), registering incoming `tactus/cmd/*` methods (`$/register`) with `50 ms` debounce, and emitting `Bridge.notify()` (`tactus/state` & `tactus/downbeat`) strictly on downbeat wraps and discrete state/`>= 0.1 BPM` transitions (zero 24 PPQN traffic).
+- **Verification:**
+  - Host `UnixStream::pair()` unit/integration tests covering MessagePack-RPC framing, `$/register` handshake, Invariant #6 rate filtering (24 sub-beat ticks emit zero frames; downbeat wrap + discrete transitions emit once), command translation/debounce, and backoff/EOF shutdown (`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `cargo zigbuild --workspace --release --target aarch64-unknown-linux-gnu.2.36` pass with zero warnings).
+  - Live UNO Q hardware verification: compiled and flashed `tactus-zephyr.ino` onto the STM32U585 via on-board `arduino-cli` + `linuxgpiod` OpenOCD (`flash_sketch.cfg` at `0x08100000`), deployed `tactusd` (`SCHED_FIFO` 75 isolated on Core `3`) with `[mcu_bridge] enabled = true`, and verified live `arduino-router` socket connection (`tactus/state` RPC round-trip returning `[1, msgid, nil, nil]`).

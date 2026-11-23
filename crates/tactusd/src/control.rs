@@ -17,6 +17,7 @@ use tokio::time::{self, Instant, MissedTickBehavior};
 
 use crate::config_store::ConfigPersister;
 use crate::log::{log_error, log_info, log_warn};
+use crate::mcu;
 use crate::midi::hotplug::UeventMonitor;
 use crate::midi::{close_fd_set, match_output_ports, match_port, MidiBackend, MidiFdSet};
 use crate::rt::{FdReturn, RtMessage, WakeSender};
@@ -531,8 +532,13 @@ pub async fn run_control_plane(args: ControlPlaneArgs) {
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<EngineCommand>(64);
     let control_handle = ControlHandle { state_rx, cmd_tx };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let web_handle =
-        web::spawn_web_server(&args.config.web.listen_addr, control_handle, shutdown_rx).await;
+    let web_handle = web::spawn_web_server(
+        &args.config.web.listen_addr,
+        control_handle.clone(),
+        shutdown_rx.clone(),
+    )
+    .await;
+    let mcu_handle = mcu::spawn_mcu_bridge(&args.config.mcu_bridge, control_handle, shutdown_rx);
 
     let uevent = match UeventMonitor::new() {
         Ok(mon) => Some(mon),
@@ -634,17 +640,33 @@ pub async fn run_control_plane(args: ControlPlaneArgs) {
     }
 
     let _ = shutdown_tx.send(true);
-    if let Some(handle) = web_handle {
-        if tokio::time::timeout(WEB_SHUTDOWN_TIMEOUT, handle)
-            .await
-            .is_err()
-        {
-            log_warn!(
-                "web UI server did not stop within {:?}; continuing shutdown",
-                WEB_SHUTDOWN_TIMEOUT
-            );
+    let stop_web = async {
+        if let Some(handle) = web_handle {
+            if tokio::time::timeout(WEB_SHUTDOWN_TIMEOUT, handle)
+                .await
+                .is_err()
+            {
+                log_warn!(
+                    "web UI server did not stop within {:?}; continuing shutdown",
+                    WEB_SHUTDOWN_TIMEOUT
+                );
+            }
         }
-    }
+    };
+    let stop_mcu = async {
+        if let Some(handle) = mcu_handle {
+            if tokio::time::timeout(WEB_SHUTDOWN_TIMEOUT, handle)
+                .await
+                .is_err()
+            {
+                log_warn!(
+                    "MCU bridge task did not stop within {:?}; continuing shutdown",
+                    WEB_SHUTDOWN_TIMEOUT
+                );
+            }
+        }
+    };
+    tokio::join!(stop_web, stop_mcu);
 
     hub.persister.shutdown().await;
 

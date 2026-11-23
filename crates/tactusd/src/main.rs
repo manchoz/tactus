@@ -4,6 +4,7 @@ mod clock;
 mod config_store;
 mod control;
 mod log;
+mod mcu;
 mod midi;
 mod rt;
 mod rt_os;

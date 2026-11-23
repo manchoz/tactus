@@ -27,6 +27,9 @@ tactus/
     │   └── tactus-ap.conf
     ├── avahi/
     │   └── tactus.service
+    ├── openocd/
+    │   ├── unoq-gpiod.cfg            # linuxgpiod SWD config for UNO Q STM32U585
+    │   └── unoq-flash-sketch.cfg     # Idempotent OpenOCD verify/write at 0x08100000
     └── systemd/
         ├── tactus-ap.service         # Sets IP on wlan0 and supervises hostapd
         ├── tactus-dhcp.service       # Supervises foreground dnsmasq DHCP server (BindsTo=tactus-ap)

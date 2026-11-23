@@ -18,7 +18,7 @@
 | **M2** | WiFi AP (`hostapd`/`dnsmasq`/`avahi`), Zeroconf & Debian SBC provisioning | Complete |
 | **M3** | Headless `tactusd` RT engine, ALSA RawMIDI hotplug & atomic `config.toml` | Complete |
 | **M4** | Embedded mobile Web UI (`axum` + WebSocket + Home Screen PWA) | Complete |
-| **M5** | Optional MCU LED matrix bridge (`Arduino_RouterBridge`, e.g., UNO Q STM32U585) | Planned |
+| **M5** | Optional MCU LED matrix bridge (`Arduino_RouterBridge`, e.g., UNO Q STM32U585) | Complete |
 
 ## Documentation & Workspace Layout
 
@@ -34,7 +34,9 @@ tactus/
 │   ├── tactus-protocol/        # Shared EngineCommand, Copy RtCommand/TelemetrySnapshot, AppState, TactusConfig
 │   ├── tactus-link-sys/        # Offline-safe build.rs + C99 FFI + safe RAII AblLink/SessionState wrappers
 │   ├── tactus-sync-core/       # Pure-Rust, OS-independent, zero-alloc bidirectional sync engine
-│   └── tactusd/                # Appliance daemon (RT sync engine, ALSA RawMIDI hotplug, atomic config, embedded Web UI; MCU RPC in M5)
+│   └── tactusd/                # Appliance daemon (RT sync engine, ALSA RawMIDI hotplug, atomic config, embedded Web UI, optional MCU RPC)
+├── mcu/
+│   └── tactus-zephyr/          # Optional UNO Q STM32U585 Zephyr sketch (Arduino_RouterBridge + 8x13 LED matrix)
 └── vendor/
     └── ableton-link/           # Pinned Ableton/link submodule (Link-4.1.1 + asio-standalone)
 ```

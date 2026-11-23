@@ -12,5 +12,5 @@ serde_json.workspace = true
 tactus-link-sys = { path = "../tactus-link-sys" }
 tactus-protocol = { path = "../tactus-protocol" }
 tactus-sync-core = { path = "../tactus-sync-core" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
 toml.workspace = true
