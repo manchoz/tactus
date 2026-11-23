@@ -532,12 +532,30 @@ trim_services() {
     ModemManager.service
     bluetooth.service
     accounts-daemon.service
-    udisks2.service
+    fwupd-refresh.timer
+    apt-daily.timer
+    apt-daily-upgrade.timer
+    man-db.timer
+    dpkg-db-backup.timer
+    e2scrub_all.timer
   )
   local unit
   for unit in "${units[@]}"; do
     if systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep -q "$unit"; then
       systemctl disable --now "$unit" 2>/dev/null || true
+    fi
+  done
+
+  # Stop and mask D-Bus-activated desktop daemons so USB-MIDI hotplug cannot respawn them.
+  local masked_units=(
+    fwupd.service
+    udisks2.service
+    upower.service
+  )
+  for unit in "${masked_units[@]}"; do
+    if systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep -q "$unit"; then
+      systemctl disable --now "$unit" 2>/dev/null || true
+      systemctl mask "$unit" 2>/dev/null || true
     fi
   done
 

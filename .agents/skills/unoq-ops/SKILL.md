@@ -2,9 +2,10 @@
 name: unoq-ops
 description: >-
   Operational runbook for connecting to, factory-provisioning (USB-C ADB or Ethernet SSH),
-  verifying Bonjour/Zeroconf discovery, and deploying tactusd to the Arduino UNO Q hardware.
+  verifying Bonjour/Zeroconf discovery, trimming background services, deploying tactusd,
+  and flashing the STM32U585 MCU sketch/bootloader to the Arduino UNO Q hardware.
   Use when interacting with the physical UNO Q board, troubleshooting SSH/ADB/WiFi AP,
-  or cross-compiling and deploying binaries.
+  trimming Debian services, cross-compiling/deploying binaries, or flashing mcu/tactus-zephyr.
 ---
 
 # Arduino UNO Q Operations Runbook
@@ -49,12 +50,18 @@ Use `system/scripts/provision-factory-unoq.sh` (idempotent):
   ```
 
 ## 4. Cross-Compile & Deploy `tactusd`
-```bash
-cargo zigbuild --workspace --release --target aarch64-unknown-linux-gnu.2.36
-./system/scripts/provision-factory-unoq.sh --ssh arduino@tactus.local \
-  -i ~/.ssh/id_ed25519 \
-  --binary target/aarch64-unknown-linux-gnu/release/tactusd
-```
+- **Fast binary-only deploy** (when `system/` files haven't changed):
+  ```bash
+  ./system/scripts/deploy-tactusd.sh --ssh tactus
+  ```
+  (Builds `aarch64-unknown-linux-gnu.2.36` release, installs `/usr/local/bin/tactusd`, restarts `tactusd.service`, and verifies SHA256 + `rt-sync` Core `3` isolation; pass `--skip-build` or `--binary <path>` to reuse an existing binary.)
+- **Full `system/` + binary deploy** (when `systemd`, `hostapd`, `dnsmasq`, or `avahi` files changed):
+  ```bash
+  cargo zigbuild --workspace --release --target aarch64-unknown-linux-gnu.2.36
+  ./system/scripts/provision-factory-unoq.sh --ssh arduino@tactus.local \
+    -i ~/.ssh/id_ed25519 \
+    --binary target/aarch64-unknown-linux-gnu/release/tactusd
+  ```
 - **Post-deploy live verification (from macOS):**
   ```bash
   shasum -a 256 target/aarch64-unknown-linux-gnu/release/tactusd
@@ -64,7 +71,20 @@ cargo zigbuild --workspace --release --target aarch64-unknown-linux-gnu.2.36
   ```
   Confirm matching binary SHA256, `rt-sync` **alone** on Core `3` (`PSR=3`, `FF 75`, `mlockall=locked`) with `tactus-async` and `asio` confined to `PSR=0..2`, `tactus-dhcp.service` auto-restarting after `SIGKILL`, IPv4 resolution without `-4`, `ui_hash` + `no-store` headers on `/` + versioned icon URLs in `/manifest.webmanifest`, and zero `Device or resource busy` (`EBUSY`) lines in `journalctl`.
 
-## 5. UNO Q Hardware Quick Reference
+## 5. Compile & Flash MCU Sketch (`tactus-zephyr`)
+Provisioned boards keep `_arduino._tcp` disabled, so `arduino-cli upload -l network` will not auto-discover `tactus.local`. Compile locally on macOS (`arduino-cli compile -e`) and flash over key-based SSH via the board's `linuxgpiod` OpenOCD path:
+```bash
+./system/scripts/flash-mcu-unoq.sh --ssh tactus --enable-bridge
+```
+- Uses portable `system/openocd/{unoq-gpiod.cfg,unoq-flash-sketch.cfg}` with zero board-side `arduino-cli` or `.arduino15` dependency (Yocto-aligned), and pushes the host `zephyr-arduino_uno_q_stm32u585xx.elf` (`filename0`) so Zephyr bootloader updates apply automatically on core upgrades.
+- Pass `--skip-compile` (or `--binary <path>.elf-zsk.bin`) to re-flash an exported build, `--loader <ELF>` / `--sketch-only` to override or skip `filename0`, `--enable-buttons` for v2 `D2`/`D3` switches, and `-i ~/.ssh/id_ed25519` if targeting `arduino@tactus.local` directly.
+- **Avoid:** on-board `arduino-cli upload` (fails with `remoteocd` or non-`gpiod` OpenOCD) and legacy `/usr/local/bin/arduino-flash` (writes `0x80F0000` instead of UNO Q's `0x08100000` `user_sketch` partition). See `mcu/tactus-zephyr/README.md` if temporarily re-enabling `_arduino._tcp` for App Lab.
+
+## 6. Service Trimming Guardrails (`provision-debian.sh`)
+- **Masked / disabled:** desktop/USB-probing daemons (`fwupd.service`, `udisks2.service`, `upower.service`) and background timers (`fwupd-refresh.timer`, `apt-daily*.timer`, `man-db.timer`, `dpkg-db-backup.timer`, `e2scrub_all.timer`).
+- **Keep intact:** `arduino-burn-bootloader-unoq.service` (flag-guarded no-op after first boot; preserves manual `arduino-cli burn-bootloader`), `arduino-router.service`, `/opt/openocd`, `NetworkManager.service`, and Qualcomm SoC daemons (`rmtfs`, `tqftpserv`, `thermald`, `urm`).
+
+## 7. UNO Q Hardware Quick Reference
 - **OS / Kernel:** Debian 13 (`trixie`), `7.2.11-arduino1+`, `aarch64` (4 cores, QRB2210), glibc `2.41`.
 - **MIDI:** `# CONFIG_SND_SEQUENCER is not set` (no `/dev/snd/seq`); `snd-rawmidi` + `snd-usb-audio` available (`/dev/snd/midiC*D*`).
 - **WiFi:** Qualcomm WCN3990 (`ath10k_snoc`, EEPROM `0x406c`) enforces 5 GHz `NO-IR` without `CONFIG_ATH_USER_REGD` → Debian PoC uses 2.4 GHz ch `11` (`2462 MHz`, `20 MHz`).

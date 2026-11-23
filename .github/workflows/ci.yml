@@ -40,7 +40,7 @@ jobs:
 
       - name: Check provisioning script syntax and lint
         run: |
-          bash -n system/scripts/provision-debian.sh system/scripts/provision-factory-unoq.sh
+          bash -n system/scripts/provision-debian.sh system/scripts/provision-factory-unoq.sh system/scripts/flash-mcu-unoq.sh system/scripts/deploy-tactusd.sh
           shellcheck system/scripts/*.sh
 
   cross-aarch64:
