@@ -78,6 +78,15 @@ impl SyncEngine {
                             .scheduler
                             .stop_if_playing(now_ns, self.config.start_stop_sync);
                     } else {
+                        if self.config.clock_thru
+                            && self.midi_thru_playing
+                            && self.config.start_stop_sync
+                        {
+                            let _ = midi_out.push(ScheduledMidiEvent {
+                                event: MidiEvent::Stop,
+                                timestamp_ns: now_ns,
+                            });
+                        }
                         self.scheduler.reset();
                     }
                     self.estimator.reset();

@@ -434,7 +434,9 @@ fn run_rt_loop_with_timer<D: RtLinkDriver>(
                         if let RtCommand::SetStartStopSync(enabled) = cmd {
                             pending_start_stop_sync = Some(enabled);
                         }
-                        let exclude_input = matches!(cmd, RtCommand::SetClockThru(_));
+                        let exclude_input = matches!(cmd, RtCommand::SetClockThru(_))
+                            || (matches!(cmd, RtCommand::SetDirection(Direction::LinkToMidi))
+                                && engine.config().direction == Direction::MidiToLink);
                         let batch = engine.apply_command(cmd, now_raw_ns, session);
                         write_midi_batch(&mut active_fds, &batch, exclude_input, &mut ch.fd_ret_tx);
                     }
@@ -1286,6 +1288,48 @@ mod tests {
         assert!(
             echoed_back.is_empty(),
             "clock thru must never echo back to input port: {echoed_back:02X?}"
+        );
+
+        // Restart relayed playback, then switch direction to LinkToMidi: secondary output must
+        // receive Stop (0xFC) while the duplex input port still receives zero Stop echo.
+        relayed.clear();
+        assert_eq!(
+            unsafe { libc::write(duplex_peer, [0xFAu8].as_ptr().cast(), 1) },
+            1
+        );
+        let restart_deadline = Instant::now() + Duration::from_millis(400);
+        while Instant::now() < restart_deadline && !relayed.contains(&0xFA) {
+            drain_pipe_bytes(other_r, &mut relayed);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(relayed, vec![0xFA]);
+        drain_pipe_bytes(duplex_peer, &mut echoed_back);
+        assert!(
+            echoed_back.is_empty(),
+            "clock thru must never echo Start back to input port: {echoed_back:02X?}"
+        );
+
+        relayed.clear();
+        cmd_tx
+            .push(RtMessage::Command(RtCommand::SetDirection(
+                Direction::LinkToMidi,
+            )))
+            .unwrap();
+        wake_tx.wake();
+
+        let switch_deadline = Instant::now() + Duration::from_millis(400);
+        while Instant::now() < switch_deadline && !relayed.contains(&0xFC) {
+            drain_pipe_bytes(other_r, &mut relayed);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            relayed.contains(&0xFC),
+            "expected Stop (0xFC) on relayed output when leaving MidiToLink: {relayed:02X?}"
+        );
+        drain_pipe_bytes(duplex_peer, &mut echoed_back);
+        assert!(
+            !echoed_back.contains(&0xFC),
+            "direction-switch Stop must never echo back to input port: {echoed_back:02X?}"
         );
 
         cmd_tx.push(RtMessage::Shutdown).unwrap();

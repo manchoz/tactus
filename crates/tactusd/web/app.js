@@ -217,6 +217,20 @@
     }
   }
 
+  function sendMidiPorts(input, outputs) {
+    const sent = sendCommand({
+      select_midi_ports: {
+        input,
+        outputs,
+      },
+    });
+    if (sent && latestState) {
+      latestState.midi_input_match = input;
+      latestState.midi_output_matches = outputs.slice();
+    }
+    return sent;
+  }
+
   function formatSignedMs(value) {
     const rounded = Math.round(value * 2) / 2;
     const prefix = rounded > 0 ? "+" : "";
@@ -280,15 +294,6 @@
     return eligiblePorts.find((p) => matchesRule(p, trimmed)) || null;
   }
 
-  function formatPortLabel(port) {
-    const card = port.card_name.trim();
-    const name = port.port_name.trim();
-    if (!card || name.toLowerCase().startsWith(card.toLowerCase())) {
-      return `${name || port.id} (${port.id})`;
-    }
-    return `${card} — ${name} (${port.id})`;
-  }
-
   function formatPortTitle(port) {
     const card = port.card_name.trim();
     const name = port.port_name.trim();
@@ -296,6 +301,10 @@
       return name || port.id;
     }
     return `${card} — ${name}`;
+  }
+
+  function formatPortLabel(port) {
+    return `${formatPortTitle(port)} (${port.id})`;
   }
 
   function rebuildBeatStrip(beatCount) {
@@ -485,22 +494,25 @@
 
       row.addEventListener("click", () => {
         const input = latestState ? latestState.midi_input_match || "" : "";
+        const currentRules = latestState ? latestState.midi_output_matches || [] : matchRules;
+        const currentEligible = (
+          latestState ? latestState.available_midi_ports || eligible : eligible
+        ).filter((p) => p.can_write);
+        const alreadySelected = currentRules.some((rule) => {
+          const matched = findMatchedPort(currentEligible, rule);
+          return matched && matched.id === port.id;
+        });
         let nextOutputs;
-        if (isSelected) {
-          nextOutputs = matchRules.filter((_rule, idx) => {
-            const matched = matchedByRule[idx];
+        if (alreadySelected) {
+          nextOutputs = currentRules.filter((rule) => {
+            const matched = findMatchedPort(currentEligible, rule);
             return !matched || matched.id !== port.id;
           });
         } else {
-          const val = persistentMatchValue(port, eligible);
-          nextOutputs = [...matchRules, val];
+          const val = persistentMatchValue(port, currentEligible);
+          nextOutputs = [...currentRules, val];
         }
-        sendCommand({
-          select_midi_ports: {
-            input,
-            outputs: nextOutputs,
-          },
-        });
+        sendMidiPorts(input, nextOutputs);
       });
 
       els.midiOutList.appendChild(row);
@@ -538,13 +550,9 @@
       removeBtn.textContent = "Remove";
       removeBtn.addEventListener("click", () => {
         const input = latestState ? latestState.midi_input_match || "" : "";
-        const nextOutputs = matchRules.filter((_r, idx) => idx !== item.idx);
-        sendCommand({
-          select_midi_ports: {
-            input,
-            outputs: nextOutputs,
-          },
-        });
+        const currentRules = latestState ? latestState.midi_output_matches || [] : matchRules;
+        const nextOutputs = currentRules.filter((rule) => rule !== item.rule);
+        sendMidiPorts(input, nextOutputs);
       });
       meta.appendChild(removeBtn);
 
@@ -797,12 +805,7 @@
 
   els.midiInSelect.addEventListener("change", () => {
     const outputs = latestState ? latestState.midi_output_matches || [] : [];
-    sendCommand({
-      select_midi_ports: {
-        input: els.midiInSelect.value,
-        outputs,
-      },
-    });
+    sendMidiPorts(els.midiInSelect.value, outputs);
   });
 
   // Page Visibility / iOS Lock-Unlock / Network Resume silent recovery

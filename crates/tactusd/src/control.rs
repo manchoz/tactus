@@ -60,6 +60,7 @@ struct StateHub {
     attached_input: Option<(String, RawFd)>,
     attached_outputs: Vec<(String, RawFd)>,
     fd_generation: u64,
+    last_open_attempt: Option<(Option<String>, Vec<String>)>,
     last_logged_snap: Option<TelemetrySnapshot>,
     last_ports: Vec<MidiPortInfo>,
     ports_logged_once: bool,
@@ -100,6 +101,20 @@ impl StateHub {
         });
     }
 
+    fn handle_replaced(&mut self, fds: MidiFdSet) -> bool {
+        let gen_id = fds.generation;
+        close_fd_set(fds);
+        if gen_id == self.fd_generation
+            && (self.attached_input.is_some() || !self.attached_outputs.is_empty())
+        {
+            self.attached_input = None;
+            self.attached_outputs.clear();
+            self.last_open_attempt = None;
+            return true;
+        }
+        false
+    }
+
     async fn detach_active_midi_and_close(&mut self) -> bool {
         if self.attached_input.is_none() && self.attached_outputs.is_empty() {
             return true;
@@ -120,10 +135,9 @@ impl StateHub {
             while let Ok(ret) = self.fd_ret_rx.pop() {
                 match ret {
                     FdReturn::Replaced(fds) => {
-                        close_fd_set(fds);
-                        if fds.generation == prev_gen {
-                            self.attached_input = None;
-                            self.attached_outputs.clear();
+                        let gen_id = fds.generation;
+                        let _ = self.handle_replaced(fds);
+                        if gen_id == prev_gen {
                             return true;
                         }
                     }
@@ -144,7 +158,7 @@ impl StateHub {
         false
     }
 
-    async fn reconcile_midi(&mut self, force_reopen: bool) {
+    async fn reconcile_midi(&mut self) {
         let _ = self.drain_rt_returns();
         let backend = Arc::clone(&self.backend);
         let ports = match tokio::task::spawn_blocking(move || backend.enumerate_ports()).await {
@@ -179,6 +193,7 @@ impl StateHub {
             }
             self.last_ports.clone_from(&ports);
             self.ports_logged_once = true;
+            self.last_open_attempt = None;
         }
 
         let matched_in =
@@ -194,9 +209,16 @@ impl StateHub {
             .map(|(id, _)| id.clone())
             .collect();
 
-        let selection_changed =
-            force_reopen || new_in_id != cur_in_id || new_out_ids != cur_out_ids;
+        let selection_changed = new_in_id != cur_in_id || new_out_ids != cur_out_ids;
         if !selection_changed {
+            self.last_open_attempt = None;
+            self.publish_midi_state(Some(ports));
+            return;
+        }
+
+        let desired = (new_in_id.clone(), new_out_ids.clone());
+        let has_active_ports = self.attached_input.is_some() || !self.attached_outputs.is_empty();
+        if has_active_ports && self.last_open_attempt.as_ref() == Some(&desired) {
             self.publish_midi_state(Some(ports));
             return;
         }
@@ -207,6 +229,7 @@ impl StateHub {
         }
 
         if matched_in.is_none() && matched_outs.is_empty() {
+            self.last_open_attempt = None;
             self.publish_midi_state(Some(ports));
             log_info!(
                 "MIDI endpoints detached (match input={:?}, outputs={:?})",
@@ -215,6 +238,8 @@ impl StateHub {
             );
             return;
         }
+
+        self.last_open_attempt = Some(desired);
 
         let next_gen = self.fd_generation.wrapping_add(1);
         let backend = Arc::clone(&self.backend);
@@ -293,9 +318,10 @@ impl StateHub {
             EngineCommand::SelectMidiPorts { input, outputs } => {
                 self.config.midi.input_port_match = input.trim().to_string();
                 self.config.midi.output_port_matches = normalize_output_matches(outputs);
+                self.last_open_attempt = None;
                 self.publish_midi_state(None);
                 self.persister.schedule_save(self.config.clone());
-                self.reconcile_midi(true).await;
+                self.reconcile_midi().await;
             }
             other => {
                 let Ok(rt_cmd) = RtCommand::try_from(&other) else {
@@ -384,6 +410,9 @@ impl StateHub {
                     changed = true;
                 }
             }
+            if changed {
+                self.last_open_attempt = None;
+            }
         }
 
         let os_err = std::io::Error::from_raw_os_error(errno);
@@ -399,7 +428,9 @@ impl StateHub {
         while let Ok(ret) = self.fd_ret_rx.pop() {
             match ret {
                 FdReturn::Replaced(fds) => {
-                    close_fd_set(fds);
+                    if self.handle_replaced(fds) {
+                        needs_reconcile = true;
+                    }
                 }
                 FdReturn::DetachedOnError { fds, errno } => {
                     if self.handle_detached_on_error(fds, errno) {
@@ -505,12 +536,13 @@ pub async fn run_control_plane(args: ControlPlaneArgs) {
         attached_input: None,
         attached_outputs: Vec::new(),
         fd_generation: 0,
+        last_open_attempt: None,
         last_logged_snap: None,
         last_ports: Vec::new(),
         ports_logged_once: false,
     };
 
-    hub.reconcile_midi(false).await;
+    hub.reconcile_midi().await;
 
     let mut telemetry_tick = time::interval(TELEMETRY_POLL_INTERVAL);
     telemetry_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -548,10 +580,10 @@ pub async fn run_control_plane(args: ControlPlaneArgs) {
                 }
             } => {
                 hotplug_deadline = None;
-                hub.reconcile_midi(false).await;
+                hub.reconcile_midi().await;
             }
             _ = rescan_tick.tick() => {
-                hub.reconcile_midi(false).await;
+                hub.reconcile_midi().await;
             }
             _ = telemetry_tick.tick() => {
                 if hub.drain_rt_returns() {
@@ -648,6 +680,7 @@ mod tests {
     struct ExclusiveFakeMidiBackend {
         ports: Mutex<Vec<MidiPortInfo>>,
         open_leases: Mutex<Vec<(String, RawFd)>>,
+        failing_port_ids: Mutex<Vec<String>>,
     }
 
     impl ExclusiveFakeMidiBackend {
@@ -655,11 +688,16 @@ mod tests {
             Self {
                 ports: Mutex::new(ports),
                 open_leases: Mutex::new(Vec::new()),
+                failing_port_ids: Mutex::new(Vec::new()),
             }
         }
 
         fn set_ports(&self, ports: Vec<MidiPortInfo>) {
             *self.ports.lock().expect("lock fake ports") = ports;
+        }
+
+        fn set_failing_port_ids(&self, ids: Vec<String>) {
+            *self.failing_port_ids.lock().expect("lock failing port ids") = ids;
         }
 
         fn alloc_open_fd() -> RawFd {
@@ -689,15 +727,23 @@ mod tests {
         ) -> std::io::Result<OpenedMidiPorts> {
             let mut leases = self.open_leases.lock().expect("lock leases");
             Self::prune_closed(&mut leases);
+            let failing = self
+                .failing_port_ids
+                .lock()
+                .expect("lock failing port ids")
+                .clone();
 
             // Simulate ALSA RawMIDI EBUSY if a requested device is still held open by RT.
             if let Some(in_port) = input {
-                if leases.iter().any(|(id, _)| id == &in_port.id) {
+                if !failing.contains(&in_port.id) && leases.iter().any(|(id, _)| id == &in_port.id)
+                {
                     return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
                 }
             }
             for out_port in outputs {
-                if leases.iter().any(|(id, _)| id == &out_port.id) {
+                if !failing.contains(&out_port.id)
+                    && leases.iter().any(|(id, _)| id == &out_port.id)
+                {
                     return Err(std::io::Error::from_raw_os_error(libc::EBUSY));
                 }
             }
@@ -711,16 +757,25 @@ mod tests {
             let mut shared_id_fd: Option<(String, RawFd)> = None;
 
             if let Some(in_port) = input {
-                let fd = Self::alloc_open_fd();
-                fds.in_fd = fd;
-                attached_input_id = Some(in_port.id.clone());
-                leases.push((in_port.id.clone(), fd));
-                if outputs.iter().any(|o| o.id == in_port.id) {
-                    shared_id_fd = Some((in_port.id.clone(), fd));
+                if !failing.contains(&in_port.id) {
+                    let fd = Self::alloc_open_fd();
+                    fds.in_fd = fd;
+                    attached_input_id = Some(in_port.id.clone());
+                    leases.push((in_port.id.clone(), fd));
+                    if outputs.iter().any(|o| o.id == in_port.id) {
+                        shared_id_fd = Some((in_port.id.clone(), fd));
+                    }
                 }
             }
 
             for out_port in outputs {
+                if failing.contains(&out_port.id) {
+                    continue;
+                }
+                if input.is_some_and(|in_port| in_port.id == out_port.id) && shared_id_fd.is_none()
+                {
+                    continue;
+                }
                 if let Some((ref shared_id, shared_fd)) = shared_id_fd {
                     if *shared_id == out_port.id {
                         if fds.push_output(shared_fd) {
@@ -748,101 +803,147 @@ mod tests {
         }
     }
 
+    fn sample_port(id: &str, card_name: &str, port_name: &str) -> MidiPortInfo {
+        MidiPortInfo {
+            id: id.to_string(),
+            card_name: card_name.to_string(),
+            port_name: port_name.to_string(),
+            can_read: true,
+            can_write: true,
+        }
+    }
+
+    struct ControlTestRig {
+        temp_dir: PathBuf,
+        backend: Arc<ExclusiveFakeMidiBackend>,
+        state_rx: watch::Receiver<AppState>,
+        sim_unplug_tx: std::sync::mpsc::Sender<RawFd>,
+        hub: StateHub,
+        wake_rx: Option<crate::rt_os::WakeReceiver>,
+        rt_sim: Option<JoinHandle<()>>,
+    }
+
+    impl ControlTestRig {
+        fn spawn(name: &str, config: TactusConfig, initial_ports: Vec<MidiPortInfo>) -> Self {
+            let temp_dir = std::env::temp_dir()
+                .join(format!("tactus-control-test-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            std::fs::create_dir_all(&temp_dir).expect("create temp test dir");
+            let cfg_path = temp_dir.join("config.toml");
+
+            let initial_state = AppState {
+                midi_input_match: config.midi.input_port_match.clone(),
+                midi_output_matches: config.midi.output_port_matches.clone(),
+                ..AppState::default()
+            };
+
+            let backend = Arc::new(ExclusiveFakeMidiBackend::new(initial_ports));
+            let (state_tx, state_rx) = watch::channel(initial_state);
+            let (rt_cmd_tx, mut rt_cmd_rx) = RingBuffer::new(32);
+            let (_tel_tx, tel_rx) = RingBuffer::new(16);
+            let (mut fd_ret_tx, fd_ret_rx) = RingBuffer::new(32);
+            let (wake_tx, wake_rx) = create_rt_wake_pair().expect("wake pair");
+
+            let (sim_unplug_tx, sim_unplug_rx) = std::sync::mpsc::channel::<RawFd>();
+            let rt_sim = std::thread::spawn(move || {
+                let mut active = MidiFdSet::EMPTY;
+                loop {
+                    while let Ok(msg) = rt_cmd_rx.pop() {
+                        match msg {
+                            RtMessage::AttachMidi(new_fds) => {
+                                if !active.is_empty() {
+                                    let _ = fd_ret_tx.push(FdReturn::Replaced(active));
+                                }
+                                active = new_fds;
+                            }
+                            RtMessage::Shutdown => {
+                                if !active.is_empty() {
+                                    let _ = fd_ret_tx.push(FdReturn::Replaced(active));
+                                }
+                                return;
+                            }
+                            RtMessage::Command(_) => {}
+                        }
+                    }
+                    while let Ok(unplug_fd) = sim_unplug_rx.try_recv() {
+                        let mut detached = MidiFdSet {
+                            generation: active.generation,
+                            ..MidiFdSet::EMPTY
+                        };
+                        if active.in_fd == unplug_fd {
+                            active.in_fd = -1;
+                            detached.in_fd = unplug_fd;
+                        }
+                        let mut i = 0;
+                        while i < active.out_count as usize {
+                            if active.out_fds[i] == unplug_fd {
+                                let _ = active.remove_output_at(i);
+                                detached.push_output(unplug_fd);
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        if !detached.is_empty() {
+                            let _ = fd_ret_tx.push(FdReturn::DetachedOnError {
+                                fds: detached,
+                                errno: libc::ENODEV,
+                            });
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+
+            let hub = StateHub {
+                config,
+                persister: ConfigPersister::spawn(cfg_path),
+                backend: Arc::clone(&backend) as Arc<dyn MidiBackend>,
+                rt_cmd_tx,
+                tel_rx,
+                fd_ret_rx,
+                wake_tx,
+                state_tx,
+                attached_input: None,
+                attached_outputs: Vec::new(),
+                fd_generation: 0,
+                last_open_attempt: None,
+                last_logged_snap: None,
+                last_ports: Vec::new(),
+                ports_logged_once: false,
+            };
+
+            Self {
+                temp_dir,
+                backend,
+                state_rx,
+                sim_unplug_tx,
+                hub,
+                wake_rx: Some(wake_rx),
+                rt_sim: Some(rt_sim),
+            }
+        }
+
+        async fn shutdown(mut self) {
+            let _ = self.hub.rt_cmd_tx.push(RtMessage::Shutdown);
+            self.hub.wake_tx.wake();
+            if let Some(rt_sim) = self.rt_sim.take() {
+                rt_sim.join().expect("mock RT responder joins");
+            }
+            let _ = self.hub.drain_rt_returns();
+            drop(self.wake_rx.take());
+            self.hub.persister.shutdown().await;
+            let _ = std::fs::remove_dir_all(&self.temp_dir);
+        }
+    }
+
     #[tokio::test]
     async fn reconcile_and_select_ports_avoid_ebusy_and_isolate_unplug() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("tactus-control-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        std::fs::create_dir_all(&temp_dir).expect("create temp test dir");
-        let cfg_path = temp_dir.join("config.toml");
-
-        let config = TactusConfig::default();
-        let initial_state = AppState {
-            midi_input_match: config.midi.input_port_match.clone(),
-            midi_output_matches: config.midi.output_port_matches.clone(),
-            ..AppState::default()
-        };
-
-        let backend = Arc::new(ExclusiveFakeMidiBackend::new(Vec::new()));
-        let (state_tx, state_rx) = watch::channel(initial_state);
-        let (rt_cmd_tx, mut rt_cmd_rx) = RingBuffer::new(32);
-        let (_tel_tx, tel_rx) = RingBuffer::new(16);
-        let (mut fd_ret_tx, fd_ret_rx) = RingBuffer::new(32);
-        let (wake_tx, wake_rx) = create_rt_wake_pair().expect("wake pair");
-
-        // Lightweight mock RT responder echoing FdReturn::Replaced on AttachMidi swaps
-        // and FdReturn::DetachedOnError when a simulated unplug event arrives.
-        let (sim_unplug_tx, sim_unplug_rx) = std::sync::mpsc::channel::<RawFd>();
-        let rt_sim = std::thread::spawn(move || {
-            let mut active = MidiFdSet::EMPTY;
-            loop {
-                while let Ok(msg) = rt_cmd_rx.pop() {
-                    match msg {
-                        RtMessage::AttachMidi(new_fds) => {
-                            if !active.is_empty() {
-                                let _ = fd_ret_tx.push(FdReturn::Replaced(active));
-                            }
-                            active = new_fds;
-                        }
-                        RtMessage::Shutdown => {
-                            if !active.is_empty() {
-                                let _ = fd_ret_tx.push(FdReturn::Replaced(active));
-                            }
-                            return;
-                        }
-                        RtMessage::Command(_) => {}
-                    }
-                }
-                while let Ok(unplug_fd) = sim_unplug_rx.try_recv() {
-                    let mut detached = MidiFdSet {
-                        generation: active.generation,
-                        ..MidiFdSet::EMPTY
-                    };
-                    if active.in_fd == unplug_fd {
-                        active.in_fd = -1;
-                        detached.in_fd = unplug_fd;
-                    }
-                    let mut i = 0;
-                    while i < active.out_count as usize {
-                        if active.out_fds[i] == unplug_fd {
-                            let _ = active.remove_output_at(i);
-                            detached.push_output(unplug_fd);
-                        } else {
-                            i += 1;
-                        }
-                    }
-                    if !detached.is_empty() {
-                        let _ = fd_ret_tx.push(FdReturn::DetachedOnError {
-                            fds: detached,
-                            errno: libc::ENODEV,
-                        });
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        });
-
-        let mut hub = StateHub {
-            config,
-            persister: ConfigPersister::spawn(cfg_path),
-            backend: Arc::clone(&backend) as Arc<dyn MidiBackend>,
-            rt_cmd_tx,
-            tel_rx,
-            fd_ret_rx,
-            wake_tx,
-            state_tx,
-            attached_input: None,
-            attached_outputs: Vec::new(),
-            fd_generation: 0,
-            last_logged_snap: None,
-            last_ports: Vec::new(),
-            ports_logged_once: false,
-        };
+        let mut rig = ControlTestRig::spawn("ebusy", TactusConfig::default(), Vec::new());
 
         // 1. Empty device list preserves saved match rules while selected IDs stay empty.
-        hub.reconcile_midi(false).await;
+        rig.hub.reconcile_midi().await;
         {
-            let state = state_rx.borrow();
+            let state = rig.state_rx.borrow();
             assert_eq!(state.midi_input_match, "WIDI");
             assert_eq!(state.midi_output_matches, vec!["WIDI".to_string()]);
             assert_eq!(state.selected_midi_input, None);
@@ -850,37 +951,26 @@ mod tests {
         }
 
         // 2. Plugging in WIDI + OP-XY attaches duplex WIDI initially.
-        let widi = MidiPortInfo {
-            id: "hw:1,0,0".to_string(),
-            card_name: "WIDI Uhost".to_string(),
-            port_name: "WIDI Uhost MIDI 1".to_string(),
-            can_read: true,
-            can_write: true,
-        };
-        let opxy = MidiPortInfo {
-            id: "hw:2,0,0".to_string(),
-            card_name: "OP-XY".to_string(),
-            port_name: "OP-XY MIDI 1".to_string(),
-            can_read: true,
-            can_write: true,
-        };
-        backend.set_ports(vec![widi.clone(), opxy.clone()]);
-        hub.reconcile_midi(false).await;
+        let widi = sample_port("hw:1,0,0", "WIDI Uhost", "WIDI Uhost MIDI 1");
+        let opxy = sample_port("hw:2,0,0", "OP-XY", "OP-XY MIDI 1");
+        rig.backend.set_ports(vec![widi.clone(), opxy.clone()]);
+        rig.hub.reconcile_midi().await;
         {
-            let state = state_rx.borrow();
+            let state = rig.state_rx.borrow();
             assert_eq!(state.selected_midi_input.as_deref(), Some("hw:1,0,0"));
             assert_eq!(state.selected_midi_outputs, vec!["hw:1,0,0".to_string()]);
         }
 
         // 3. Switching from duplex WIDI -> input OP-XY + outputs [WIDI, OP-XY] MUST detach/close
         //    WIDI before reopening so ExclusiveFakeMidiBackend never hits EBUSY.
-        hub.handle_command(EngineCommand::SelectMidiPorts {
-            input: "OP-XY MIDI 1".to_string(),
-            outputs: vec!["WIDI Uhost MIDI 1".to_string(), "OP-XY MIDI 1".to_string()],
-        })
-        .await;
+        rig.hub
+            .handle_command(EngineCommand::SelectMidiPorts {
+                input: "OP-XY MIDI 1".to_string(),
+                outputs: vec!["WIDI Uhost MIDI 1".to_string(), "OP-XY MIDI 1".to_string()],
+            })
+            .await;
         {
-            let state = state_rx.borrow();
+            let state = rig.state_rx.borrow();
             assert_eq!(state.midi_input_match, "OP-XY MIDI 1");
             assert_eq!(
                 state.midi_output_matches,
@@ -894,50 +984,182 @@ mod tests {
         }
 
         // 4. Unplugging OP-XY while keeping WIDI: RT detaches OP-XY only,
-        //    and reconcile_midi(false) preserves WIDI without reopening.
-        let opxy_fd = hub.attached_input.as_ref().expect("OP-XY attached").1;
-        let widi_fd = hub.attached_outputs[0].1;
-        sim_unplug_tx.send(opxy_fd).expect("send sim unplug");
+        //    and reconcile_midi() preserves WIDI without reopening.
+        let opxy_fd = rig.hub.attached_input.as_ref().expect("OP-XY attached").1;
+        let widi_fd = rig.hub.attached_outputs[0].1;
+        rig.sim_unplug_tx.send(opxy_fd).expect("send sim unplug");
         let mut saw_detach = false;
         for _ in 0..50 {
-            if hub.drain_rt_returns() {
+            if rig.hub.drain_rt_returns() {
                 saw_detach = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         assert!(saw_detach, "expected OP-XY unplug detach");
-        backend.set_ports(vec![widi]);
-        let gen_before = hub.fd_generation;
-        hub.reconcile_midi(false).await;
-        assert_eq!(hub.fd_generation, gen_before);
+        rig.backend.set_ports(vec![widi]);
+        let gen_before = rig.hub.fd_generation;
+        rig.hub.reconcile_midi().await;
+        assert_eq!(rig.hub.fd_generation, gen_before);
         {
-            let state = state_rx.borrow();
+            let state = rig.state_rx.borrow();
             assert_eq!(state.selected_midi_input, None);
             assert_eq!(state.selected_midi_outputs, vec!["hw:1,0,0".to_string()]);
         }
         assert_ne!(unsafe { libc::fcntl(widi_fd, libc::F_GETFD) }, -1);
 
         // 5. Missing rule preserves configured rules with empty attached IDs.
-        hub.handle_command(EngineCommand::SelectMidiPorts {
-            input: "Rev2".to_string(),
-            outputs: Vec::new(),
-        })
-        .await;
+        rig.hub
+            .handle_command(EngineCommand::SelectMidiPorts {
+                input: "Rev2".to_string(),
+                outputs: Vec::new(),
+            })
+            .await;
         {
-            let state = state_rx.borrow();
+            let state = rig.state_rx.borrow();
             assert_eq!(state.midi_input_match, "Rev2");
             assert!(state.midi_output_matches.is_empty());
             assert_eq!(state.selected_midi_input, None);
             assert!(state.selected_midi_outputs.is_empty());
         }
 
-        let _ = hub.rt_cmd_tx.push(RtMessage::Shutdown);
-        hub.wake_tx.wake();
-        rt_sim.join().expect("mock RT responder joins");
-        let _ = hub.drain_rt_returns();
-        drop(wake_rx);
-        hub.persister.shutdown().await;
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        rig.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn removing_unplugged_output_rule_preserves_attached_ports() {
+        let mut config = TactusConfig::default();
+        config.midi.output_port_matches = vec!["WIDI".to_string(), "Rev2".to_string()];
+
+        let widi = sample_port("hw:1,0,0", "WIDI Uhost", "WIDI Uhost MIDI 1");
+        let mut rig = ControlTestRig::spawn("unplugged-remove", config, vec![widi]);
+
+        rig.hub.reconcile_midi().await;
+        assert_eq!(rig.hub.fd_generation, 1);
+        let widi_fd = rig.hub.attached_outputs[0].1;
+
+        rig.hub
+            .handle_command(EngineCommand::SelectMidiPorts {
+                input: "WIDI".to_string(),
+                outputs: vec!["WIDI".to_string()],
+            })
+            .await;
+
+        assert_eq!(
+            rig.hub.fd_generation, 1,
+            "removing an unplugged rule must not detach/reopen live ports"
+        );
+        assert_ne!(unsafe { libc::fcntl(widi_fd, libc::F_GETFD) }, -1);
+        assert_eq!(
+            rig.state_rx.borrow().midi_output_matches,
+            vec!["WIDI".to_string()]
+        );
+
+        rig.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn partial_open_failure_skips_redundant_reopen_until_retry_or_hotplug() {
+        let mut config = TactusConfig::default();
+        config.midi.output_port_matches = vec!["WIDI".to_string(), "Broken".to_string()];
+
+        let widi = sample_port("hw:1,0,0", "WIDI Uhost", "WIDI Uhost MIDI 1");
+        let broken = sample_port("hw:2,0,0", "Broken Synth", "Broken Synth MIDI 1");
+        let extra = sample_port("hw:3,0,0", "Daisy Seed", "Daisy Seed MIDI 1");
+        let mut rig =
+            ControlTestRig::spawn("partial-open", config, vec![widi.clone(), broken.clone()]);
+
+        rig.backend
+            .set_failing_port_ids(vec!["hw:2,0,0".to_string()]);
+        rig.hub.reconcile_midi().await;
+        assert_eq!(rig.hub.fd_generation, 1);
+        let widi_fd = rig.hub.attached_outputs[0].1;
+        assert_eq!(
+            rig.state_rx.borrow().selected_midi_outputs,
+            vec!["hw:1,0,0".to_string()]
+        );
+
+        // Periodic fallback rescan with unchanged ports must not tear down healthy WIDI.
+        rig.hub.reconcile_midi().await;
+        assert_eq!(rig.hub.fd_generation, 1);
+        assert_ne!(unsafe { libc::fcntl(widi_fd, libc::F_GETFD) }, -1);
+
+        // Hotplug port-list change clears last_open_attempt and retries once Broken recovers.
+        rig.backend.set_failing_port_ids(Vec::new());
+        rig.backend
+            .set_ports(vec![widi.clone(), broken.clone(), extra]);
+        rig.hub.reconcile_midi().await;
+        assert_eq!(rig.hub.fd_generation, 2);
+        assert_eq!(
+            rig.state_rx.borrow().selected_midi_outputs,
+            vec!["hw:1,0,0".to_string(), "hw:2,0,0".to_string()]
+        );
+
+        // Unplug Broken, then replug it while failing: partial open attaches WIDI at gen=4,
+        // periodic rescan skips reopen, and SelectMidiPorts clears last_open_attempt for retry.
+        rig.backend.set_ports(vec![widi.clone()]);
+        rig.hub.reconcile_midi().await;
+        assert_eq!(rig.hub.fd_generation, 3);
+
+        rig.backend.set_ports(vec![widi, broken]);
+        rig.backend
+            .set_failing_port_ids(vec!["hw:2,0,0".to_string()]);
+        rig.hub.reconcile_midi().await;
+        assert_eq!(rig.hub.fd_generation, 4);
+        rig.hub.reconcile_midi().await;
+        assert_eq!(rig.hub.fd_generation, 4);
+
+        rig.backend.set_failing_port_ids(Vec::new());
+        rig.hub
+            .handle_command(EngineCommand::SelectMidiPorts {
+                input: "WIDI".to_string(),
+                outputs: vec!["WIDI".to_string(), "Broken".to_string()],
+            })
+            .await;
+        assert_eq!(rig.hub.fd_generation, 5);
+        assert_eq!(
+            rig.state_rx.borrow().selected_midi_outputs,
+            vec!["hw:1,0,0".to_string(), "hw:2,0,0".to_string()]
+        );
+
+        rig.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn late_replaced_return_clears_attached_state_and_unblocks_reconcile() {
+        let widi = sample_port("hw:1,0,0", "WIDI Uhost", "WIDI Uhost MIDI 1");
+        let mut rig = ControlTestRig::spawn("late-replaced", TactusConfig::default(), vec![widi]);
+
+        rig.hub.reconcile_midi().await;
+        assert_eq!(rig.hub.fd_generation, 1);
+        assert!(rig.hub.attached_input.is_some());
+
+        // Emulate a detach that timed out in StateHub: RT swaps in EMPTY and emits Replaced later.
+        rig.hub
+            .rt_cmd_tx
+            .push(RtMessage::AttachMidi(MidiFdSet::EMPTY))
+            .unwrap();
+        rig.hub.wake_tx.wake();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(rig.hub.attached_input.is_some());
+        assert!(rig.hub.drain_rt_returns());
+        assert!(rig.hub.attached_input.is_none());
+        assert!(rig.hub.attached_outputs.is_empty());
+        {
+            let state = rig.state_rx.borrow();
+            assert_eq!(state.selected_midi_input, None);
+            assert!(state.selected_midi_outputs.is_empty());
+        }
+
+        // Subsequent reconcile immediately attaches at gen=2 instead of deadlocking on detach.
+        rig.hub.reconcile_midi().await;
+        assert_eq!(rig.hub.fd_generation, 2);
+        assert_eq!(
+            rig.state_rx.borrow().selected_midi_input.as_deref(),
+            Some("hw:1,0,0")
+        );
+
+        rig.shutdown().await;
     }
 }

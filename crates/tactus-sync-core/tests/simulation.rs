@@ -863,3 +863,85 @@ fn midi_to_link_clock_thru_relay_and_clean_stop_on_disable() {
         .on_midi_event(MidiEvent::Stop, 180_000_000, &mut link)
         .is_empty());
 }
+
+#[test]
+fn midi_to_link_direction_switch_stops_relayed_outputs_only_when_thru_playing() {
+    // 1. clock_thru = true, start_stop_sync = true, playing -> SetDirection(LinkToMidi) emits Stop.
+    let mut engine = SyncEngine::new(midi_to_link_config());
+    let mut link = MockLinkSession::new(120.0);
+    let r_start = engine.on_midi_event(MidiEvent::Start, 1_000_000, &mut link);
+    assert_eq!(r_start.as_slice()[0].event, MidiEvent::Start);
+
+    let stop_batch = engine.apply_command(
+        RtCommand::SetDirection(Direction::LinkToMidi),
+        20_000_000,
+        &mut link,
+    );
+    assert_eq!(
+        stop_batch.as_slice(),
+        &[ScheduledMidiEvent {
+            event: MidiEvent::Stop,
+            timestamp_ns: 20_000_000,
+        }]
+    );
+
+    // Switching back and leaving again while stopped emits nothing.
+    assert!(engine
+        .apply_command(
+            RtCommand::SetDirection(Direction::MidiToLink),
+            30_000_000,
+            &mut link
+        )
+        .is_empty());
+    assert!(engine
+        .apply_command(
+            RtCommand::SetDirection(Direction::LinkToMidi),
+            40_000_000,
+            &mut link
+        )
+        .is_empty());
+
+    // 2. Receiving Stop before switching leaves midi_thru_playing false -> no duplicate Stop.
+    let mut engine_after_stop = SyncEngine::new(midi_to_link_config());
+    let _ = engine_after_stop.on_midi_event(MidiEvent::Start, 1_000_000, &mut link);
+    let _ = engine_after_stop.on_midi_event(MidiEvent::Stop, 10_000_000, &mut link);
+    assert!(engine_after_stop
+        .apply_command(
+            RtCommand::SetDirection(Direction::LinkToMidi),
+            20_000_000,
+            &mut link
+        )
+        .is_empty());
+
+    // 3. clock_thru = false -> emits nothing on SetDirection(LinkToMidi).
+    let mut no_thru = SyncEngine::new(SyncConfig {
+        clock_thru: false,
+        ..midi_to_link_config()
+    });
+    assert!(no_thru
+        .on_midi_event(MidiEvent::Start, 1_000_000, &mut link)
+        .is_empty());
+    assert!(no_thru
+        .apply_command(
+            RtCommand::SetDirection(Direction::LinkToMidi),
+            20_000_000,
+            &mut link
+        )
+        .is_empty());
+
+    // 4. start_stop_sync = false -> emits nothing on SetDirection(LinkToMidi).
+    let mut no_ss = SyncEngine::new(SyncConfig {
+        start_stop_sync: false,
+        ..midi_to_link_config()
+    });
+    assert!(no_ss
+        .on_midi_event(MidiEvent::Start, 1_000_000, &mut link)
+        .is_empty());
+    assert!(no_ss
+        .apply_command(
+            RtCommand::SetDirection(Direction::LinkToMidi),
+            20_000_000,
+            &mut link
+        )
+        .is_empty());
+}
