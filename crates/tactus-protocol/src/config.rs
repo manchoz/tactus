@@ -4,6 +4,32 @@ use serde::{Deserialize, Serialize};
 
 use crate::Direction;
 
+/// Maximum simultaneous MIDI output endpoints supported across config, control plane, and RT.
+pub const MAX_MIDI_OUTPUTS: usize = 8;
+
+/// Trim, drop empty entries, deduplicate case-insensitively (preserving order), and cap at [`MAX_MIDI_OUTPUTS`].
+#[must_use]
+pub fn normalize_output_matches(patterns: Vec<String>) -> Vec<String> {
+    let mut normalized: Vec<String> = Vec::with_capacity(patterns.len().min(MAX_MIDI_OUTPUTS));
+    for raw in patterns {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if normalized
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(trimmed))
+        {
+            continue;
+        }
+        normalized.push(trimmed.to_string());
+        if normalized.len() >= MAX_MIDI_OUTPUTS {
+            break;
+        }
+    }
+    normalized
+}
+
 /// Error returned when a [`TactusConfig`] fails bounds or invariant validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigError {
@@ -48,6 +74,7 @@ impl TactusConfig {
 pub struct SyncConfig {
     pub direction: Direction,
     pub start_stop_sync: bool,
+    pub clock_thru: bool,
     pub quantum: f64,
     pub midi_offset_ms: f32,
     pub ols_window_secs: f64,
@@ -64,6 +91,7 @@ impl Default for SyncConfig {
         Self {
             direction: Direction::LinkToMidi,
             start_stop_sync: true,
+            clock_thru: true,
             quantum: 4.0,
             midi_offset_ms: 0.0,
             ols_window_secs: 10.0,
@@ -137,17 +165,41 @@ impl SyncConfig {
 
 /// ALSA MIDI (RawMIDI or Sequencer) port matching rules (`[midi]` section).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "RawMidiConfig")]
 pub struct MidiConfig {
     pub input_port_match: String,
-    pub output_port_match: String,
+    pub output_port_matches: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct RawMidiConfig {
+    input_port_match: Option<String>,
+    output_port_matches: Option<Vec<String>>,
+    output_port_match: Option<String>,
+}
+
+impl From<RawMidiConfig> for MidiConfig {
+    fn from(raw: RawMidiConfig) -> Self {
+        let input_port_match = raw.input_port_match.unwrap_or_else(|| "WIDI".to_string());
+        let output_port_matches = if let Some(list) = raw.output_port_matches {
+            normalize_output_matches(list)
+        } else if let Some(single) = raw.output_port_match {
+            normalize_output_matches(vec![single])
+        } else {
+            vec!["WIDI".to_string()]
+        };
+        Self {
+            input_port_match,
+            output_port_matches,
+        }
+    }
 }
 
 impl Default for MidiConfig {
     fn default() -> Self {
         Self {
             input_port_match: "WIDI".to_string(),
-            output_port_match: "WIDI".to_string(),
+            output_port_matches: vec!["WIDI".to_string()],
         }
     }
 }

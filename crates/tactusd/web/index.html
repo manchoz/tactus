@@ -103,6 +103,19 @@
         </button>
       </div>
 
+      <div id="clock-thru-block" class="clock-thru-block hidden">
+        <div class="divider"></div>
+        <div class="switch-row">
+          <div>
+            <div class="control-title">MIDI Clock Thru</div>
+            <div class="control-sub">Relay MIDI In to other outputs</div>
+          </div>
+          <button id="clock-thru-toggle" type="button" class="switch" role="switch" aria-checked="true" aria-label="MIDI Clock Thru">
+            <span class="switch-thumb"></span>
+          </button>
+        </div>
+      </div>
+
       <div class="divider"></div>
 
       <div class="offset-block">
@@ -152,10 +165,10 @@
 
       <div class="port-block">
         <div class="port-header">
-          <label for="midi-out" class="control-title">MIDI Output</label>
+          <span class="control-title">MIDI Outputs</span>
           <span id="midi-out-status" class="port-status port-wait">Waiting</span>
         </div>
-        <select id="midi-out" class="select-input"></select>
+        <div id="midi-out-list" class="port-list" role="group" aria-label="MIDI Output Ports"></div>
       </div>
 
       <p id="midi-empty-hint" class="empty-hint hidden">

@@ -1,7 +1,6 @@
 //! Real-time sync engine thread (`SCHED_FIFO`, `mlockall`, Core 3, zero allocations).
 
 use std::io;
-use std::os::fd::RawFd;
 use std::sync::mpsc as std_mpsc;
 use std::thread::{self, JoinHandle};
 
@@ -289,9 +288,12 @@ fn run_rt_loop_with_timer<D: RtLinkDriver>(
     };
     let init_snap = engine.snapshot();
     driver.commit_if_dirty();
-    if let Some(err_ret) = write_midi_batch(&mut active_fds, &init_poll.midi_out) {
-        let _ = ch.fd_ret_tx.push(err_ret);
-    }
+    write_midi_batch(
+        &mut active_fds,
+        &init_poll.midi_out,
+        false,
+        &mut ch.fd_ret_tx,
+    );
     if ch.tel_tx.push(init_snap).is_ok() {
         prev_snap = init_snap;
         tel_initialized = true;
@@ -401,7 +403,13 @@ fn run_rt_loop_with_timer<D: RtLinkDriver>(
                 if revents != 0 {
                     let mut detach_err = None;
                     if (revents & libc::POLLIN) != 0 {
-                        detach_err = read_midi_input(active_fds.in_fd, now_raw_ns, engine, session);
+                        detach_err = read_midi_input(
+                            &mut active_fds,
+                            now_raw_ns,
+                            engine,
+                            session,
+                            &mut ch.fd_ret_tx,
+                        );
                     }
                     if detach_err.is_none()
                         && (revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
@@ -426,10 +434,9 @@ fn run_rt_loop_with_timer<D: RtLinkDriver>(
                         if let RtCommand::SetStartStopSync(enabled) = cmd {
                             pending_start_stop_sync = Some(enabled);
                         }
+                        let exclude_input = matches!(cmd, RtCommand::SetClockThru(_));
                         let batch = engine.apply_command(cmd, now_raw_ns, session);
-                        if let Some(err_ret) = write_midi_batch(&mut active_fds, &batch) {
-                            let _ = ch.fd_ret_tx.push(err_ret);
-                        }
+                        write_midi_batch(&mut active_fds, &batch, exclude_input, &mut ch.fd_ret_tx);
                     }
                     RtMessage::AttachMidi(new_fds) => {
                         if !active_fds.is_empty() {
@@ -445,9 +452,14 @@ fn run_rt_loop_with_timer<D: RtLinkDriver>(
                                 now_raw_ns,
                                 session,
                             );
-                            if let Some(err_ret) = write_midi_batch(&mut active_fds, &batch) {
-                                let _ = ch.fd_ret_tx.push(err_ret);
-                            }
+                            write_midi_batch(&mut active_fds, &batch, false, &mut ch.fd_ret_tx);
+                        } else if engine.config().clock_thru {
+                            let batch = engine.apply_command(
+                                RtCommand::SetClockThru(false),
+                                now_raw_ns,
+                                session,
+                            );
+                            write_midi_batch(&mut active_fds, &batch, true, &mut ch.fd_ret_tx);
                         }
                         break;
                     }
@@ -458,9 +470,12 @@ fn run_rt_loop_with_timer<D: RtLinkDriver>(
             if !shutdown_requested {
                 let poll_res = engine.poll(now_raw_ns, session);
                 next_engine_deadline = poll_res.next_deadline_ns;
-                if let Some(err_ret) = write_midi_batch(&mut active_fds, &poll_res.midi_out) {
-                    let _ = ch.fd_ret_tx.push(err_ret);
-                }
+                write_midi_batch(
+                    &mut active_fds,
+                    &poll_res.midi_out,
+                    false,
+                    &mut ch.fd_ret_tx,
+                );
             }
         }
 
@@ -500,18 +515,26 @@ fn run_rt_loop_with_timer<D: RtLinkDriver>(
 }
 
 fn read_midi_input<S: LinkSession>(
-    in_fd: RawFd,
+    active_fds: &mut MidiFdSet,
     now_raw_ns: i64,
     engine: &mut SyncEngine,
     session: &mut S,
+    fd_ret_tx: &mut Producer<FdReturn>,
 ) -> Option<i32> {
+    let in_fd = active_fds.in_fd;
+    if in_fd < 0 {
+        return None;
+    }
     let mut buf = [0u8; 64];
     for _ in 0..MAX_READ_CHUNKS_PER_WAKE {
         let n = unsafe { libc::read(in_fd, buf.as_mut_ptr().cast(), buf.len()) };
         if n > 0 {
             for &byte in &buf[..n as usize] {
                 if let Some(ev) = MidiEvent::from_byte(byte) {
-                    engine.on_midi_event(ev, now_raw_ns, session);
+                    let relay = engine.on_midi_event(ev, now_raw_ns, session);
+                    if !relay.is_empty() {
+                        write_midi_batch(active_fds, &relay, true, fd_ret_tx);
+                    }
                 }
             }
             continue;
@@ -531,9 +554,14 @@ fn read_midi_input<S: LinkSession>(
     None
 }
 
-fn write_midi_batch(active_fds: &mut MidiFdSet, batch: &MidiOutputBatch) -> Option<FdReturn> {
-    if batch.is_empty() || active_fds.out_fd < 0 {
-        return None;
+fn write_midi_batch(
+    active_fds: &mut MidiFdSet,
+    batch: &MidiOutputBatch,
+    exclude_input: bool,
+    fd_ret_tx: &mut Producer<FdReturn>,
+) {
+    if batch.is_empty() || active_fds.out_count == 0 {
+        return;
     }
 
     let mut bytes = [0u8; MAX_MIDI_BATCH_BYTES];
@@ -542,71 +570,84 @@ fn write_midi_batch(active_fds: &mut MidiFdSet, batch: &MidiOutputBatch) -> Opti
         *dst = scheduled.event.to_byte();
     }
 
-    let mut offset = 0;
-    while offset < len {
-        let n = unsafe {
-            libc::write(
-                active_fds.out_fd,
-                bytes[offset..len].as_ptr().cast(),
-                len - offset,
-            )
-        };
-        if n > 0 {
-            offset += n as usize;
+    let mut idx = 0usize;
+    while idx < (active_fds.out_count as usize).min(crate::midi::MAX_MIDI_OUTPUTS) {
+        let out_fd = active_fds.out_fds[idx];
+        if out_fd < 0 || (exclude_input && out_fd == active_fds.in_fd) {
+            idx += 1;
             continue;
         }
-        if n == 0 {
-            break;
-        }
-        let err = last_errno();
-        if err == libc::EINTR {
-            continue;
-        }
-        if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
-            break;
-        }
-        return Some(detach_output_fd(active_fds, err));
-    }
 
-    None
+        let mut offset = 0;
+        let mut detached = false;
+        while offset < len {
+            let n =
+                unsafe { libc::write(out_fd, bytes[offset..len].as_ptr().cast(), len - offset) };
+            if n > 0 {
+                offset += n as usize;
+                continue;
+            }
+            if n == 0 {
+                break;
+            }
+            let err = last_errno();
+            if err == libc::EINTR {
+                continue;
+            }
+            if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+                break;
+            }
+            let ret = detach_output_fd_at(active_fds, idx, err);
+            let _ = fd_ret_tx.push(ret);
+            detached = true;
+            break;
+        }
+
+        if !detached {
+            idx += 1;
+        }
+    }
 }
 
 fn detach_input_fd(active_fds: &mut MidiFdSet, errno: i32) -> FdReturn {
-    let shared = active_fds.in_fd >= 0 && active_fds.in_fd == active_fds.out_fd;
-    let detached = if shared {
-        let all = *active_fds;
-        *active_fds = MidiFdSet::EMPTY;
-        all
-    } else {
-        let fds = MidiFdSet {
-            in_fd: active_fds.in_fd,
-            out_fd: -1,
-            generation: active_fds.generation,
-        };
-        active_fds.in_fd = -1;
-        fds
-    };
+    let in_fd = active_fds.in_fd;
+    active_fds.in_fd = -1;
+    let mut detached = MidiFdSet::single_input(in_fd, active_fds.generation);
+
+    // If this descriptor was shared full-duplex with an output slot, detach that output slot too.
+    if in_fd >= 0 {
+        let mut i = 0usize;
+        while i < active_fds.out_count as usize {
+            if active_fds.out_fds[i] == in_fd {
+                let _ = active_fds.remove_output_at(i);
+                detached.push_output(in_fd);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     FdReturn::DetachedOnError {
         fds: detached,
         errno,
     }
 }
 
-fn detach_output_fd(active_fds: &mut MidiFdSet, errno: i32) -> FdReturn {
-    let shared = active_fds.out_fd >= 0 && active_fds.out_fd == active_fds.in_fd;
-    let detached = if shared {
-        let all = *active_fds;
-        *active_fds = MidiFdSet::EMPTY;
-        all
-    } else {
-        let fds = MidiFdSet {
-            in_fd: -1,
-            out_fd: active_fds.out_fd,
-            generation: active_fds.generation,
+fn detach_output_fd_at(active_fds: &mut MidiFdSet, idx: usize, errno: i32) -> FdReturn {
+    let Some(out_fd) = active_fds.remove_output_at(idx) else {
+        return FdReturn::DetachedOnError {
+            fds: MidiFdSet {
+                generation: active_fds.generation,
+                ..MidiFdSet::EMPTY
+            },
+            errno,
         };
-        active_fds.out_fd = -1;
-        fds
     };
+    let mut detached = MidiFdSet::single_output(out_fd, active_fds.generation);
+    if out_fd >= 0 && active_fds.in_fd == out_fd {
+        active_fds.in_fd = -1;
+        detached.in_fd = out_fd;
+    }
     FdReturn::DetachedOnError {
         fds: detached,
         errno,
@@ -625,6 +666,7 @@ fn should_emit_telemetry(
         || curr.direction != prev.direction
         || curr.lock_state != prev.lock_state
         || curr.start_stop_sync != prev.start_stop_sync
+        || curr.clock_thru != prev.clock_thru
         || curr.is_playing != prev.is_playing
         || curr.link_peers != prev.link_peers
         || curr.midi_offset_ms != prev.midi_offset_ms
@@ -663,6 +705,7 @@ pub fn create_rt_wake_pair() -> io::Result<(WakeSender, WakeReceiver)> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::RawFd;
     use std::sync::atomic::{AtomicI64, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -852,11 +895,7 @@ mod tests {
             .expect("rt loop");
         });
 
-        let attached = MidiFdSet {
-            in_fd: -1,
-            out_fd: out_write,
-            generation: 1,
-        };
+        let attached = MidiFdSet::single_output(out_write, 1);
         cmd_tx.push(RtMessage::AttachMidi(attached)).unwrap();
         wake_tx.wake();
 
@@ -951,11 +990,7 @@ mod tests {
             .expect("rt loop");
         });
 
-        let fds_1 = MidiFdSet {
-            in_fd: in_read_1,
-            out_fd: -1,
-            generation: 1,
-        };
+        let fds_1 = MidiFdSet::single_input(in_read_1, 1);
         cmd_tx.push(RtMessage::AttachMidi(fds_1)).unwrap();
         wake_tx.wake();
 
@@ -1029,11 +1064,7 @@ mod tests {
         assert_eq!(detached, Some(fds_1));
 
         // Simulate hotplug replug: attach second pipe and ensure clock ticks lock again.
-        let fds_2 = MidiFdSet {
-            in_fd: in_read_2,
-            out_fd: -1,
-            generation: 2,
-        };
+        let fds_2 = MidiFdSet::single_input(in_read_2, 2);
         cmd_tx.push(RtMessage::AttachMidi(fds_2)).unwrap();
         wake_tx.wake();
 
@@ -1072,6 +1103,205 @@ mod tests {
         }
         unsafe {
             libc::close(in_write_2);
+        }
+    }
+
+    fn make_unix_duplex_pair() -> (RawFd, RawFd) {
+        let mut sv = [-1 as RawFd; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) },
+            0
+        );
+        for fd in sv {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(flags >= 0);
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+                0
+            );
+        }
+        (sv[0], sv[1])
+    }
+
+    #[test]
+    fn link_to_midi_fans_out_to_multiple_outputs_and_isolates_unplug() {
+        let (mut cmd_tx, cmd_rx) = RingBuffer::new(32);
+        let (tel_tx, _tel_rx) = RingBuffer::new(64);
+        let (fd_ret_tx, mut fd_ret_rx) = RingBuffer::new(32);
+        let (wake_tx, wake_rx) = create_rt_wake_pair().expect("wake pair");
+
+        let (out1_r, out1_w) = make_pipe();
+        let (out2_r, out2_w) = make_pipe();
+
+        let mut driver = MockLinkDriver::new_wall(120.0);
+        driver.session.is_playing = true;
+        driver.session.beat_origin = 3.98;
+        driver.session.origin_time_us = 0;
+
+        let mut engine = SyncEngine::new(SyncConfig {
+            direction: Direction::LinkToMidi,
+            start_stop_sync: true,
+            ..SyncConfig::default()
+        });
+
+        let handle = thread::spawn(move || {
+            run_rt_loop(
+                &mut engine,
+                &mut driver,
+                RtLoopChannels {
+                    cmd_rx,
+                    tel_tx,
+                    fd_ret_tx,
+                    wake_rx,
+                },
+            )
+            .expect("rt loop");
+        });
+
+        let attached = MidiFdSet::from_parts(-1, &[out1_w, out2_w], 1);
+        cmd_tx.push(RtMessage::AttachMidi(attached)).unwrap();
+        wake_tx.wake();
+
+        let mut cap1 = Vec::new();
+        let mut cap2 = Vec::new();
+        let deadline = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < deadline && (cap1.len() < 4 || cap2.len() < 4) {
+            drain_pipe_bytes(out1_r, &mut cap1);
+            drain_pipe_bytes(out2_r, &mut cap2);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            cap1.contains(&0xFA) && cap1.contains(&0xF8),
+            "out1={cap1:02X?}"
+        );
+        assert!(
+            cap2.contains(&0xFA) && cap2.contains(&0xF8),
+            "out2={cap2:02X?}"
+        );
+
+        // Unplug output 1 only; output 2 must continue uninterrupted.
+        unsafe {
+            libc::close(out1_r);
+        }
+
+        let mut detached1 = None;
+        let detach_deadline = Instant::now() + Duration::from_millis(400);
+        while Instant::now() < detach_deadline {
+            if let Ok(FdReturn::DetachedOnError { fds, .. }) = fd_ret_rx.pop() {
+                detached1 = Some(fds);
+                close_fd_set(fds);
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(detached1, Some(MidiFdSet::single_output(out1_w, 1)));
+
+        cap2.clear();
+        cmd_tx
+            .push(RtMessage::Command(RtCommand::SetDirection(
+                Direction::MidiToLink,
+            )))
+            .unwrap();
+        wake_tx.wake();
+
+        let stop_deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < stop_deadline && !cap2.contains(&0xFC) {
+            drain_pipe_bytes(out2_r, &mut cap2);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            cap2.contains(&0xFC),
+            "expected healthy output 2 to stay attached and receive Stop (0xFC): {cap2:02X?}"
+        );
+
+        cmd_tx.push(RtMessage::Shutdown).unwrap();
+        wake_tx.wake();
+        handle.join().expect("rt thread joins cleanly");
+
+        while let Ok(ret) = fd_ret_rx.pop() {
+            match ret {
+                FdReturn::Replaced(fds) | FdReturn::DetachedOnError { fds, .. } => {
+                    close_fd_set(fds)
+                }
+            }
+        }
+        unsafe {
+            libc::close(out2_r);
+        }
+    }
+
+    #[test]
+    fn midi_to_link_clock_thru_relays_to_other_outputs_and_blocks_input_loop() {
+        let (mut cmd_tx, cmd_rx) = RingBuffer::new(32);
+        let (tel_tx, _tel_rx) = RingBuffer::new(64);
+        let (fd_ret_tx, mut fd_ret_rx) = RingBuffer::new(32);
+        let (wake_tx, wake_rx) = create_rt_wake_pair().expect("wake pair");
+
+        let (duplex_rt, duplex_peer) = make_unix_duplex_pair();
+        let (other_r, other_w) = make_pipe();
+
+        let mut driver = MockLinkDriver::new_wall(120.0);
+        let mut engine = SyncEngine::new(SyncConfig {
+            direction: Direction::MidiToLink,
+            start_stop_sync: true,
+            clock_thru: true,
+            ..SyncConfig::default()
+        });
+
+        let handle = thread::spawn(move || {
+            run_rt_loop(
+                &mut engine,
+                &mut driver,
+                RtLoopChannels {
+                    cmd_rx,
+                    tel_tx,
+                    fd_ret_tx,
+                    wake_rx,
+                },
+            )
+            .expect("rt loop");
+        });
+
+        // Attach duplex port as BOTH input and output 0, plus secondary output 1.
+        let attached = MidiFdSet::from_parts(duplex_rt, &[duplex_rt, other_w], 1);
+        cmd_tx.push(RtMessage::AttachMidi(attached)).unwrap();
+        wake_tx.wake();
+
+        let seq = [0xFAu8, 0xF8, 0xF8, 0xFC];
+        let written = unsafe { libc::write(duplex_peer, seq.as_ptr().cast(), seq.len()) };
+        assert_eq!(written, seq.len() as isize);
+
+        let mut relayed = Vec::new();
+        let mut echoed_back = Vec::new();
+        let deadline = Instant::now() + Duration::from_millis(400);
+        while Instant::now() < deadline && relayed.len() < seq.len() {
+            drain_pipe_bytes(other_r, &mut relayed);
+            drain_pipe_bytes(duplex_peer, &mut echoed_back);
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // Secondary output receives the exact relayed sequence; input peer receives zero echo.
+        assert_eq!(relayed, seq);
+        drain_pipe_bytes(duplex_peer, &mut echoed_back);
+        assert!(
+            echoed_back.is_empty(),
+            "clock thru must never echo back to input port: {echoed_back:02X?}"
+        );
+
+        cmd_tx.push(RtMessage::Shutdown).unwrap();
+        wake_tx.wake();
+        handle.join().expect("rt thread joins cleanly");
+
+        while let Ok(ret) = fd_ret_rx.pop() {
+            match ret {
+                FdReturn::Replaced(fds) | FdReturn::DetachedOnError { fds, .. } => {
+                    close_fd_set(fds)
+                }
+            }
+        }
+        unsafe {
+            libc::close(duplex_peer);
+            libc::close(other_r);
         }
     }
 }

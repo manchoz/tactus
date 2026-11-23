@@ -17,7 +17,10 @@ use crate::midi::rawmidi_uapi::{
     SNDRV_CTL_IOCTL_RAWMIDI_PREFER_SUBDEVICE, SNDRV_RAWMIDI_INFO_INPUT, SNDRV_RAWMIDI_INFO_OUTPUT,
     SNDRV_RAWMIDI_INFO_STREAM_INACTIVE, SNDRV_RAWMIDI_STREAM_INPUT, SNDRV_RAWMIDI_STREAM_OUTPUT,
 };
-use crate::midi::{compare_port_ids, format_hw_id, parse_hw_id, HwAddr, MidiBackend, MidiFdSet};
+use crate::midi::{
+    compare_port_ids, format_hw_id, parse_hw_id, HwAddr, MidiBackend, MidiFdSet, OpenedMidiPorts,
+    MAX_MIDI_OUTPUTS,
+};
 
 /// Kernel ALSA RawMIDI backend.
 pub struct LinuxRawMidiBackend;
@@ -30,9 +33,9 @@ impl MidiBackend for LinuxRawMidiBackend {
     fn open_ports(
         &self,
         input: Option<&MidiPortInfo>,
-        output: Option<&MidiPortInfo>,
+        outputs: &[MidiPortInfo],
         generation: u64,
-    ) -> io::Result<MidiFdSet> {
+    ) -> io::Result<OpenedMidiPorts> {
         let in_addr = input
             .map(|p| {
                 parse_hw_id(&p.id).ok_or_else(|| {
@@ -43,57 +46,109 @@ impl MidiBackend for LinuxRawMidiBackend {
                 })
             })
             .transpose()?;
-        let out_addr = output
-            .map(|p| {
-                parse_hw_id(&p.id).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("invalid RawMIDI output id `{}`", p.id),
-                    )
-                })
-            })
-            .transpose()?;
 
-        match (in_addr, out_addr) {
-            (None, None) => Ok(MidiFdSet {
-                generation,
-                ..MidiFdSet::EMPTY
-            }),
-            // Same subdevice selected for both IN and OUT: open a single O_RDWR duplex FD.
-            (Some(addr_in), Some(addr_out)) if addr_in == addr_out => {
-                let fd = open_rawmidi_subdevice(addr_in, libc::O_RDWR)?;
-                Ok(MidiFdSet {
-                    in_fd: fd.as_raw_fd(),
-                    out_fd: fd.into_raw_fd(),
-                    generation,
-                })
-            }
-            (Some(addr_in), Some(addr_out)) => {
-                let in_fd = open_rawmidi_subdevice(addr_in, libc::O_RDONLY)?;
-                let out_fd = open_rawmidi_subdevice(addr_out, libc::O_WRONLY)?;
-                Ok(MidiFdSet {
-                    in_fd: in_fd.into_raw_fd(),
-                    out_fd: out_fd.into_raw_fd(),
-                    generation,
-                })
-            }
-            (Some(addr_in), None) => {
-                let in_fd = open_rawmidi_subdevice(addr_in, libc::O_RDONLY)?;
-                Ok(MidiFdSet {
-                    in_fd: in_fd.into_raw_fd(),
-                    out_fd: -1,
-                    generation,
-                })
-            }
-            (None, Some(addr_out)) => {
-                let out_fd = open_rawmidi_subdevice(addr_out, libc::O_WRONLY)?;
-                Ok(MidiFdSet {
-                    in_fd: -1,
-                    out_fd: out_fd.into_raw_fd(),
-                    generation,
-                })
+        let mut out_entries: Vec<(&MidiPortInfo, HwAddr)> =
+            Vec::with_capacity(outputs.len().min(MAX_MIDI_OUTPUTS));
+        for port in outputs.iter().take(MAX_MIDI_OUTPUTS) {
+            let addr = parse_hw_id(&port.id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid RawMIDI output id `{}`", port.id),
+                )
+            })?;
+            if !out_entries.iter().any(|(_, existing)| *existing == addr) {
+                out_entries.push((port, addr));
             }
         }
+
+        let mut fds = MidiFdSet {
+            generation,
+            ..MidiFdSet::EMPTY
+        };
+        let mut owned_fds: Vec<OwnedFd> = Vec::with_capacity(out_entries.len() + 1);
+        let mut attached_input_id: Option<String> = None;
+        let mut attached_output_ids: Vec<String> = Vec::with_capacity(out_entries.len());
+
+        let input_shared_with_output = in_addr
+            .is_some_and(|addr_in| out_entries.iter().any(|(_, addr_out)| *addr_out == addr_in));
+        let mut shared_raw_fd: Option<(HwAddr, RawFd)> = None;
+
+        if let (Some(in_port), Some(addr_in)) = (input, in_addr) {
+            if input_shared_with_output {
+                match open_rawmidi_subdevice(addr_in, libc::O_RDWR) {
+                    Ok(fd) => {
+                        let raw = fd.as_raw_fd();
+                        fds.in_fd = raw;
+                        attached_input_id = Some(in_port.id.clone());
+                        shared_raw_fd = Some((addr_in, raw));
+                        owned_fds.push(fd);
+                    }
+                    Err(err) => {
+                        log_warn!(
+                            "failed to open duplex MIDI port {} ({}): {err}",
+                            in_port.id,
+                            in_port.port_name
+                        );
+                    }
+                }
+            } else {
+                match open_rawmidi_subdevice(addr_in, libc::O_RDONLY) {
+                    Ok(fd) => {
+                        fds.in_fd = fd.as_raw_fd();
+                        attached_input_id = Some(in_port.id.clone());
+                        owned_fds.push(fd);
+                    }
+                    Err(err) => {
+                        log_warn!(
+                            "failed to open MIDI input port {} ({}): {err}",
+                            in_port.id,
+                            in_port.port_name
+                        );
+                    }
+                }
+            }
+        }
+
+        for (out_port, addr_out) in out_entries {
+            if let Some((shared_addr, shared_fd)) = shared_raw_fd {
+                if shared_addr == addr_out {
+                    if fds.push_output(shared_fd) {
+                        attached_output_ids.push(out_port.id.clone());
+                    }
+                    continue;
+                }
+            }
+            if in_addr == Some(addr_out) {
+                // Shared O_RDWR open above failed; do not open O_WRONLY separately.
+                continue;
+            }
+            match open_rawmidi_subdevice(addr_out, libc::O_WRONLY) {
+                Ok(fd) => {
+                    let raw = fd.as_raw_fd();
+                    if fds.push_output(raw) {
+                        attached_output_ids.push(out_port.id.clone());
+                        owned_fds.push(fd);
+                    }
+                }
+                Err(err) => {
+                    log_warn!(
+                        "failed to open MIDI output port {} ({}): {err}",
+                        out_port.id,
+                        out_port.port_name
+                    );
+                }
+            }
+        }
+
+        for fd in owned_fds {
+            let _ = fd.into_raw_fd();
+        }
+
+        Ok(OpenedMidiPorts {
+            fds,
+            attached_input_id,
+            attached_output_ids,
+        })
     }
 }
 

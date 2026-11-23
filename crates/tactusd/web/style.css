@@ -576,3 +576,143 @@ input[type="range"]::-webkit-slider-thumb {
   line-height: 1.4;
   color: var(--muted);
 }
+
+.clock-thru-block {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.port-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.port-row {
+  width: 100%;
+  min-height: 50px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  padding: 9px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  text-align: left;
+  cursor: pointer;
+  user-select: none;
+  font-family: inherit;
+}
+
+.port-row:active {
+  transform: scale(0.99);
+}
+
+.port-row.selected {
+  border-color: rgba(45, 212, 191, 0.65);
+  background: rgba(45, 212, 191, 0.08);
+}
+
+.port-row.unplugged {
+  cursor: default;
+  border-style: dashed;
+  border-color: rgba(245, 158, 11, 0.45);
+}
+
+.port-row.unplugged:active {
+  transform: none;
+}
+
+.port-row-main {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.port-row-name {
+  font-size: 0.9rem;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.port-row-sub {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.port-row-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.port-tag {
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.tag-active {
+  color: var(--green);
+  background: var(--green-dim);
+}
+
+.tag-relay {
+  color: var(--teal);
+  background: var(--teal-dim);
+}
+
+.tag-loop,
+.tag-wait {
+  color: var(--amber);
+  background: var(--amber-dim);
+}
+
+.tag-idle {
+  color: var(--muted);
+  background: var(--bg);
+}
+
+.port-check {
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  border: 1.5px solid var(--border);
+  background: var(--bg);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.8rem;
+  font-weight: 800;
+  color: transparent;
+}
+
+.port-row.selected .port-check {
+  border-color: var(--teal);
+  background: var(--teal);
+  color: var(--bg);
+}
+
+.port-remove-btn {
+  min-height: 34px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 0.74rem;
+  font-weight: 600;
+  cursor: pointer;
+}

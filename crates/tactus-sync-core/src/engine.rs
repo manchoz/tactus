@@ -4,7 +4,7 @@ use tactus_protocol::{Direction, LockState, RtCommand, SyncConfig, TelemetrySnap
 
 use crate::estimator::MidiToLinkEstimator;
 use crate::link::{ns_to_us, LinkSession};
-use crate::midi::{MidiEvent, MidiOutputBatch};
+use crate::midi::{MidiEvent, MidiOutputBatch, ScheduledMidiEvent};
 use crate::ring::{MAX_VALID_BPM, MIN_VALID_BPM};
 use crate::scheduler::LinkToMidiScheduler;
 
@@ -24,6 +24,7 @@ pub struct SyncEngine {
     snapshot: TelemetrySnapshot,
     scheduler: LinkToMidiScheduler,
     estimator: MidiToLinkEstimator,
+    midi_thru_playing: bool,
 }
 
 impl SyncEngine {
@@ -34,6 +35,7 @@ impl SyncEngine {
             direction: config.direction,
             lock_state: LockState::Unlocked,
             start_stop_sync: config.start_stop_sync,
+            clock_thru: config.clock_thru,
             quantum: config.quantum,
             midi_offset_ms: config.midi_offset_ms,
             ..TelemetrySnapshot::default()
@@ -43,6 +45,7 @@ impl SyncEngine {
             snapshot,
             scheduler: LinkToMidiScheduler::new(),
             estimator: MidiToLinkEstimator::new(),
+            midi_thru_playing: false,
         }
     }
 
@@ -78,14 +81,35 @@ impl SyncEngine {
                         self.scheduler.reset();
                     }
                     self.estimator.reset();
+                    self.midi_thru_playing = false;
                     self.config.direction = dir;
                 }
             }
             RtCommand::SetStartStopSync(enabled) => {
                 if self.config.start_stop_sync != enabled {
                     self.config.start_stop_sync = enabled;
+                    if !enabled {
+                        self.midi_thru_playing = false;
+                    }
                     self.scheduler
                         .on_start_stop_sync_changed(enabled, link.is_playing());
+                }
+            }
+            RtCommand::SetClockThru(enabled) => {
+                if self.config.clock_thru
+                    && !enabled
+                    && self.config.direction == Direction::MidiToLink
+                    && self.midi_thru_playing
+                    && self.config.start_stop_sync
+                {
+                    let _ = midi_out.push(ScheduledMidiEvent {
+                        event: MidiEvent::Stop,
+                        timestamp_ns: now_ns,
+                    });
+                }
+                self.config.clock_thru = enabled;
+                if !enabled {
+                    self.midi_thru_playing = false;
                 }
             }
             RtCommand::SetOffsetMs(offset_ms) => {
@@ -122,9 +146,17 @@ impl SyncEngine {
     }
 
     /// Process an incoming MIDI real-time event captured at `now_ns`.
-    pub fn on_midi_event(&mut self, event: MidiEvent, now_ns: i64, link: &mut impl LinkSession) {
+    ///
+    /// In `MidiToLink` mode with `clock_thru = true`, returns events to relay directly to other
+    /// selected MIDI outputs.
+    pub fn on_midi_event(
+        &mut self,
+        event: MidiEvent,
+        now_ns: i64,
+        link: &mut impl LinkSession,
+    ) -> MidiOutputBatch {
         if self.config.direction != Direction::MidiToLink {
-            return;
+            return MidiOutputBatch::new();
         }
 
         match event {
@@ -134,7 +166,38 @@ impl SyncEngine {
             MidiEvent::Stop => self.estimator.on_stop(now_ns, &self.config, link),
         }
 
+        let mut relay = MidiOutputBatch::new();
+        if self.config.clock_thru {
+            match event {
+                MidiEvent::Clock => {
+                    let _ = relay.push(ScheduledMidiEvent {
+                        event: MidiEvent::Clock,
+                        timestamp_ns: now_ns,
+                    });
+                }
+                MidiEvent::Start | MidiEvent::Continue => {
+                    if self.config.start_stop_sync {
+                        let _ = relay.push(ScheduledMidiEvent {
+                            event,
+                            timestamp_ns: now_ns,
+                        });
+                        self.midi_thru_playing = true;
+                    }
+                }
+                MidiEvent::Stop => {
+                    if self.config.start_stop_sync {
+                        let _ = relay.push(ScheduledMidiEvent {
+                            event: MidiEvent::Stop,
+                            timestamp_ns: now_ns,
+                        });
+                        self.midi_thru_playing = false;
+                    }
+                }
+            }
+        }
+
         self.refresh_snapshot(now_ns, link);
+        relay
     }
 
     /// Advance scheduled MIDI clock output (`LinkToMidi`) or timeout watchdog (`MidiToLink`).
@@ -148,7 +211,9 @@ impl SyncEngine {
                 }
             }
             Direction::MidiToLink => {
-                self.estimator.check_timeout(now_ns);
+                if self.estimator.check_timeout(now_ns) {
+                    self.midi_thru_playing = false;
+                }
                 PollResult {
                     midi_out: MidiOutputBatch::new(),
                     next_deadline_ns: self.estimator.next_timeout_deadline_ns(),
@@ -166,6 +231,7 @@ impl SyncEngine {
             direction: self.config.direction,
             lock_state: self.estimator.lock_state(),
             start_stop_sync: self.config.start_stop_sync,
+            clock_thru: self.config.clock_thru,
             bpm_link: link.tempo(),
             bpm_midi_long: self.estimator.bpm_midi_long(),
             bpm_midi_fast: self.estimator.bpm_midi_fast(),

@@ -1,6 +1,7 @@
 [sync]
 direction = "link_to_midi"
 start_stop_sync = true
+clock_thru = true
 quantum = 4.0
 midi_offset_ms = 0.0
 ols_window_secs = 10.0
@@ -13,7 +14,7 @@ max_phase_nudge_ms = 1.0
 
 [midi]
 input_port_match = "WIDI"
-output_port_match = "WIDI"
+output_port_matches = ["WIDI"]
 
 [web]
 listen_addr = "0.0.0.0:80"

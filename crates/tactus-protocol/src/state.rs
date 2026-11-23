@@ -24,14 +24,15 @@ pub struct AppState {
     pub telemetry: TelemetrySnapshot,
     /// Available ALSA MIDI ports enumerated outside the RT hot path.
     pub available_midi_ports: Vec<MidiPortInfo>,
-    /// Currently selected MIDI input port match or identifier.
+    /// Currently selected MIDI input port identifier (when attached).
     pub selected_midi_input: Option<String>,
-    /// Currently selected MIDI output port match or identifier.
-    pub selected_midi_output: Option<String>,
+    /// Currently attached MIDI output port identifiers.
+    #[serde(default)]
+    pub selected_midi_outputs: Vec<String>,
     /// Configured MIDI input match rule persisted in `config.toml` (e.g. `"WIDI"` or port name).
     #[serde(default)]
     pub midi_input_match: String,
-    /// Configured MIDI output match rule persisted in `config.toml` (e.g. `"WIDI"` or port name).
+    /// Configured MIDI output match rules persisted in `config.toml` (e.g. `["WIDI", "OP-XY"]`).
     #[serde(default)]
-    pub midi_output_match: String,
+    pub midi_output_matches: Vec<String>,
 }

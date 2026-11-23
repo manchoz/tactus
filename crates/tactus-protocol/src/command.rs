@@ -19,12 +19,14 @@ pub enum EngineCommand {
     SetDirection(Direction),
     /// Enable or disable transport start/stop synchronization (`0xFA`/`0xFC`).
     SetStartStopSync(bool),
+    /// Enable or disable direct RT MIDI Clock/transport relay (`MidiToLink` mode).
+    SetClockThru(bool),
     /// Set signed MIDI Clock latency compensation in milliseconds (`-50.0..=50.0`).
     SetOffsetMs(f32),
     /// Set Ableton Link bar/phrase quantum in beats.
     SetQuantum(f64),
     /// Select ALSA MIDI input and output ports on the async control plane.
-    SelectMidiPorts { input: String, output: String },
+    SelectMidiPorts { input: String, outputs: Vec<String> },
     /// Quantize/re-align downbeat phase on the active session.
     ResyncDownbeat,
     /// Manually set Link tempo in BPM (used in `LinkToMidi` mode).
@@ -38,6 +40,8 @@ pub enum RtCommand {
     SetDirection(Direction),
     /// Enable or disable transport start/stop synchronization.
     SetStartStopSync(bool),
+    /// Enable or disable direct RT MIDI Clock/transport relay (`MidiToLink` mode).
+    SetClockThru(bool),
     /// Set signed MIDI Clock latency compensation in milliseconds.
     SetOffsetMs(f32),
     /// Set Ableton Link quantum in beats.
@@ -55,9 +59,10 @@ impl TryFrom<&EngineCommand> for RtCommand {
         match *cmd {
             EngineCommand::SetDirection(dir) => Ok(Self::SetDirection(dir)),
             EngineCommand::SetStartStopSync(enabled) => Ok(Self::SetStartStopSync(enabled)),
+            EngineCommand::SetClockThru(enabled) => Ok(Self::SetClockThru(enabled)),
             EngineCommand::SetOffsetMs(offset_ms) => Ok(Self::SetOffsetMs(offset_ms)),
             EngineCommand::SetQuantum(quantum) => Ok(Self::SetQuantum(quantum)),
-            // Async-only command owning heap `String`s; never crosses into the RT ring buffer.
+            // Async-only command owning heap `String`/`Vec`s; never crosses into the RT ring buffer.
             EngineCommand::SelectMidiPorts { .. } => Err(()),
             EngineCommand::ResyncDownbeat => Ok(Self::ResyncDownbeat),
             EngineCommand::SetLinkTempoManual(bpm) => Ok(Self::SetLinkTempoManual(bpm)),

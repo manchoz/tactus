@@ -800,3 +800,66 @@ fn midi_to_link_start_forces_downbeat_with_peers_without_preroll() {
     link.request_beat_at_time(0.0, (start_us - 1_000) + 400, 4.0);
     assert_eq!(link.time_at_beat(0.0, 4.0), start_us);
 }
+
+#[test]
+fn midi_to_link_clock_thru_relay_and_clean_stop_on_disable() {
+    let mut engine = SyncEngine::new(midi_to_link_config());
+    let mut link = MockLinkSession::new(120.0);
+
+    // 1. clock_thru = true, start_stop_sync = true: relays Start, Clock, Continue, Stop.
+    assert!(engine.snapshot().clock_thru);
+    let r_start = engine.on_midi_event(MidiEvent::Start, 1_000_000, &mut link);
+    let r_clock = engine.on_midi_event(MidiEvent::Clock, 21_833_000, &mut link);
+    let r_stop = engine.on_midi_event(MidiEvent::Stop, 40_000_000, &mut link);
+    let r_cont = engine.on_midi_event(MidiEvent::Continue, 60_000_000, &mut link);
+
+    assert_eq!(r_start.as_slice()[0].event, MidiEvent::Start);
+    assert_eq!(r_clock.as_slice()[0].event, MidiEvent::Clock);
+    assert_eq!(r_stop.as_slice()[0].event, MidiEvent::Stop);
+    assert_eq!(r_cont.as_slice()[0].event, MidiEvent::Continue);
+
+    // 2. Disabling clock_thru while playing emits a clean Stop (0xFC) to relayed outputs.
+    let disable_batch = engine.apply_command(RtCommand::SetClockThru(false), 70_000_000, &mut link);
+    assert_eq!(
+        disable_batch.as_slice(),
+        &[ScheduledMidiEvent {
+            event: MidiEvent::Stop,
+            timestamp_ns: 70_000_000,
+        }]
+    );
+    assert!(!engine.snapshot().clock_thru);
+
+    // 3. While clock_thru = false, incoming MIDI events relay nothing.
+    assert!(engine
+        .on_midi_event(MidiEvent::Start, 80_000_000, &mut link)
+        .is_empty());
+    assert!(engine
+        .on_midi_event(MidiEvent::Clock, 100_000_000, &mut link)
+        .is_empty());
+
+    // 4. Re-enable clock_thru with start_stop_sync = false: relays Clock only, suppresses Start/Continue/Stop.
+    assert!(engine
+        .apply_command(RtCommand::SetClockThru(true), 110_000_000, &mut link)
+        .is_empty());
+    assert!(engine
+        .apply_command(RtCommand::SetStartStopSync(false), 110_000_000, &mut link)
+        .is_empty());
+    assert!(engine
+        .on_midi_event(MidiEvent::Start, 120_000_000, &mut link)
+        .is_empty());
+    assert_eq!(
+        engine
+            .on_midi_event(MidiEvent::Clock, 140_000_000, &mut link)
+            .as_slice(),
+        &[ScheduledMidiEvent {
+            event: MidiEvent::Clock,
+            timestamp_ns: 140_000_000,
+        }]
+    );
+    assert!(engine
+        .on_midi_event(MidiEvent::Continue, 160_000_000, &mut link)
+        .is_empty());
+    assert!(engine
+        .on_midi_event(MidiEvent::Stop, 180_000_000, &mut link)
+        .is_empty());
+}

@@ -131,12 +131,13 @@ fn main() -> ExitCode {
     };
 
     log_info!(
-        "starting tactusd v{} (config=`{}` [{}], direction={:?}, start_stop_sync={}, offset_ms={:.1})",
+        "starting tactusd v{} (config=`{}` [{}], direction={:?}, start_stop_sync={}, clock_thru={}, offset_ms={:.1})",
         env!("CARGO_PKG_VERSION"),
         config_path.display(),
         if existed { "loaded" } else { "defaults" },
         config.sync.direction,
         config.sync.start_stop_sync,
+        config.sync.clock_thru,
         config.sync.midi_offset_ms
     );
 

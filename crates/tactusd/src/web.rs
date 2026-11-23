@@ -378,7 +378,7 @@ mod tests {
                 ..TelemetrySnapshot::default()
             },
             midi_input_match: "WIDI".to_string(),
-            midi_output_match: "WIDI".to_string(),
+            midi_output_matches: vec!["WIDI".to_string()],
             ..AppState::default()
         };
         let (state_tx, state_rx) = watch::channel(initial);
@@ -521,6 +521,8 @@ mod tests {
         let html = String::from_utf8(body).expect("utf8 index");
         assert!(html.contains("apple-mobile-web-app-capable"));
         assert!(html.contains("/apple-touch-icon.png"));
+        assert!(html.contains("clock-thru-toggle"));
+        assert!(html.contains("midi-out-list"));
 
         for (path, ctype_sub) in [
             ("/style.css", "text/css"),
@@ -598,6 +600,25 @@ mod tests {
         assert_eq!(
             srv.cmd_rx.recv().await,
             Some(EngineCommand::SetQuantum(3.0))
+        );
+
+        ws_send_client_text(&mut ws, r#"{"set_clock_thru":false}"#).await;
+        assert_eq!(
+            srv.cmd_rx.recv().await,
+            Some(EngineCommand::SetClockThru(false))
+        );
+
+        ws_send_client_text(
+            &mut ws,
+            r#"{"select_midi_ports":{"input":"OP-XY MIDI 1","outputs":["WIDI Uhost MIDI 1","OP-XY MIDI 1"]}}"#,
+        )
+        .await;
+        assert_eq!(
+            srv.cmd_rx.recv().await,
+            Some(EngineCommand::SelectMidiPorts {
+                input: "OP-XY MIDI 1".to_string(),
+                outputs: vec!["WIDI Uhost MIDI 1".to_string(), "OP-XY MIDI 1".to_string()],
+            })
         );
 
         drop(ws);

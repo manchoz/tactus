@@ -10,45 +10,136 @@ use std::os::fd::RawFd;
 use std::sync::Arc;
 
 use tactus_protocol::MidiPortInfo;
+pub use tactus_protocol::MAX_MIDI_OUTPUTS;
 
 /// Strictly `Copy` set of opened non-blocking MIDI file descriptors handed to the RT thread.
 ///
-/// When input and output target the same full-duplex subdevice on ALSA RawMIDI, `in_fd == out_fd`
-/// (opened once with `O_RDWR | O_NONBLOCK | O_CLOEXEC`). Always release via [`close_fd_set`] so
-/// shared descriptors are never double-closed.
+/// When input and output target the same full-duplex subdevice on ALSA RawMIDI, `in_fd` equals one
+/// of `out_fds[..out_count]` (opened once with `O_RDWR | O_NONBLOCK | O_CLOEXEC`). Always release
+/// via [`close_fd_set`] so shared descriptors are never double-closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MidiFdSet {
     pub in_fd: RawFd,
-    pub out_fd: RawFd,
+    pub out_fds: [RawFd; MAX_MIDI_OUTPUTS],
+    pub out_count: u8,
     pub generation: u64,
 }
 
 impl MidiFdSet {
-    /// Empty descriptor set (`in_fd = -1`, `out_fd = -1`).
+    /// Empty descriptor set (`in_fd = -1`, `out_count = 0`).
     pub const EMPTY: Self = Self {
         in_fd: -1,
-        out_fd: -1,
+        out_fds: [-1; MAX_MIDI_OUTPUTS],
+        out_count: 0,
         generation: 0,
     };
 
-    /// Return `true` when neither input nor output file descriptor is active.
+    /// Build a descriptor set from an input FD and slice of output FDs (capped at [`MAX_MIDI_OUTPUTS`]).
+    #[cfg(test)]
+    #[must_use]
+    pub fn from_parts(in_fd: RawFd, outputs: &[RawFd], generation: u64) -> Self {
+        let mut set = Self {
+            in_fd,
+            generation,
+            ..Self::EMPTY
+        };
+        for &fd in outputs {
+            if !set.push_output(fd) {
+                break;
+            }
+        }
+        set
+    }
+
+    /// Construct a descriptor set with a single input FD.
+    #[must_use]
+    pub const fn single_input(in_fd: RawFd, generation: u64) -> Self {
+        Self {
+            in_fd,
+            out_fds: [-1; MAX_MIDI_OUTPUTS],
+            out_count: 0,
+            generation,
+        }
+    }
+
+    /// Construct a descriptor set with a single output FD.
+    #[must_use]
+    pub fn single_output(out_fd: RawFd, generation: u64) -> Self {
+        let mut set = Self {
+            generation,
+            ..Self::EMPTY
+        };
+        let _ = set.push_output(out_fd);
+        set
+    }
+
+    /// Return `true` when neither input nor output file descriptors are active.
     #[must_use]
     pub const fn is_empty(self) -> bool {
-        self.in_fd < 0 && self.out_fd < 0
+        self.in_fd < 0 && self.out_count == 0
+    }
+
+    /// Active output file descriptors slice.
+    #[must_use]
+    pub fn active_outputs(&self) -> &[RawFd] {
+        let len = (self.out_count as usize).min(MAX_MIDI_OUTPUTS);
+        &self.out_fds[..len]
+    }
+
+    /// Append an output FD if non-negative and capacity remains.
+    pub fn push_output(&mut self, fd: RawFd) -> bool {
+        let len = self.out_count as usize;
+        if fd < 0 || len >= MAX_MIDI_OUTPUTS {
+            return false;
+        }
+        self.out_fds[len] = fd;
+        self.out_count = (len + 1) as u8;
+        true
+    }
+
+    /// Remove and return the output FD at `idx`, compacting remaining active slots.
+    pub fn remove_output_at(&mut self, idx: usize) -> Option<RawFd> {
+        let len = (self.out_count as usize).min(MAX_MIDI_OUTPUTS);
+        if idx >= len {
+            return None;
+        }
+        let removed = self.out_fds[idx];
+        for i in idx..(len - 1) {
+            self.out_fds[i] = self.out_fds[i + 1];
+        }
+        self.out_fds[len - 1] = -1;
+        self.out_count = (len - 1) as u8;
+        Some(removed)
     }
 }
 
-/// Safely close any active file descriptors in `fds` outside the RT thread,
-/// deduplicating when `in_fd == out_fd`.
-pub fn close_fd_set(fds: MidiFdSet) {
-    if fds.in_fd >= 0 {
-        unsafe {
-            libc::close(fds.in_fd);
+/// Extract deduplicated non-negative descriptors from `fds` on the stack (`len <= MAX_MIDI_OUTPUTS + 1`).
+fn collect_unique_fds(fds: MidiFdSet) -> ([RawFd; MAX_MIDI_OUTPUTS + 1], usize) {
+    let mut unique = [-1 as RawFd; MAX_MIDI_OUTPUTS + 1];
+    let mut len = 0usize;
+
+    let mut push_unique = |fd: RawFd| {
+        if fd < 0 || unique[..len].contains(&fd) {
+            return;
         }
+        unique[len] = fd;
+        len += 1;
+    };
+
+    push_unique(fds.in_fd);
+    for &fd in fds.active_outputs() {
+        push_unique(fd);
     }
-    if fds.out_fd >= 0 && fds.out_fd != fds.in_fd {
+    (unique, len)
+}
+
+/// Safely close any active file descriptors in `fds` outside the RT thread,
+/// deduplicating shared duplex descriptors so no FD is double-closed.
+pub fn close_fd_set(fds: MidiFdSet) {
+    let (unique, len) = collect_unique_fds(fds);
+    for &fd in &unique[..len] {
         unsafe {
-            libc::close(fds.out_fd);
+            libc::close(fd);
         }
     }
 }
@@ -122,6 +213,33 @@ pub fn match_port<'a>(
         .min_by(|a, b| compare_port_ids(&a.id, &b.id))
 }
 
+/// Match all unique writable MIDI output ports matching `patterns`, preserving rule order
+/// and capping at [`MAX_MIDI_OUTPUTS`].
+#[must_use]
+pub fn match_output_ports(ports: &[MidiPortInfo], patterns: &[String]) -> Vec<MidiPortInfo> {
+    let mut matched: Vec<MidiPortInfo> = Vec::new();
+    for pattern in patterns {
+        if let Some(port) = match_port(ports, pattern, false, true) {
+            if !matched.iter().any(|existing| existing.id == port.id) {
+                matched.push(port.clone());
+                if matched.len() >= MAX_MIDI_OUTPUTS {
+                    break;
+                }
+            }
+        }
+    }
+    matched
+}
+
+/// Result returned by [`MidiBackend::open_ports`], pairing opened descriptors with the exact port IDs
+/// that succeeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedMidiPorts {
+    pub fds: MidiFdSet,
+    pub attached_input_id: Option<String>,
+    pub attached_output_ids: Vec<String>,
+}
+
 /// Compare port IDs numerically by [`HwAddr`] when possible, falling back to string order.
 pub fn compare_port_ids(a: &str, b: &str) -> std::cmp::Ordering {
     match (parse_hw_id(a), parse_hw_id(b)) {
@@ -136,13 +254,13 @@ pub trait MidiBackend: Send + Sync {
     /// Discover currently available MIDI ports.
     fn enumerate_ports(&self) -> io::Result<Vec<MidiPortInfo>>;
 
-    /// Open non-blocking file descriptors for the selected input/output ports.
+    /// Open non-blocking file descriptors for the selected input and output ports.
     fn open_ports(
         &self,
         input: Option<&MidiPortInfo>,
-        output: Option<&MidiPortInfo>,
+        outputs: &[MidiPortInfo],
         generation: u64,
-    ) -> io::Result<MidiFdSet>;
+    ) -> io::Result<OpenedMidiPorts>;
 }
 
 /// Construct the platform MIDI backend (`LinuxRawMidiBackend` on Linux, stub elsewhere).
@@ -170,12 +288,16 @@ impl MidiBackend for NullMidiBackend {
     fn open_ports(
         &self,
         _input: Option<&MidiPortInfo>,
-        _output: Option<&MidiPortInfo>,
+        _outputs: &[MidiPortInfo],
         generation: u64,
-    ) -> io::Result<MidiFdSet> {
-        Ok(MidiFdSet {
-            generation,
-            ..MidiFdSet::EMPTY
+    ) -> io::Result<OpenedMidiPorts> {
+        Ok(OpenedMidiPorts {
+            fds: MidiFdSet {
+                generation,
+                ..MidiFdSet::EMPTY
+            },
+            attached_input_id: None,
+            attached_output_ids: Vec::new(),
         })
     }
 }
@@ -251,28 +373,38 @@ mod tests {
         assert_eq!(match_port(&ports, "Prophet", true, false), None);
         let rev2_out = match_port(&ports, "Prophet", false, true).expect("rev2 out");
         assert_eq!(rev2_out.id, "hw:1,0,0");
+
+        // Multi-output matcher preserves pattern order, skips read-only/missing, and deduplicates.
+        let multi = match_output_ports(
+            &ports,
+            &[
+                "Prophet".to_string(),
+                "widi".to_string(),
+                "hw:10,0,0".to_string(),
+                "nonexistent".to_string(),
+            ],
+        );
+        let ids: Vec<&str> = multi.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["hw:1,0,0", "hw:10,0,0"]);
     }
 
     #[test]
-    fn close_fd_set_handles_shared_duplex_pipe_without_double_close() {
-        let mut fds = [-1 as RawFd; 2];
-        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-        assert_eq!(rc, 0);
+    fn close_fd_set_handles_shared_duplex_and_multi_output_without_double_close() {
+        let mut p1 = [-1 as RawFd; 2];
+        let mut p2 = [-1 as RawFd; 2];
+        assert_eq!(unsafe { libc::pipe(p1.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(p2.as_mut_ptr()) }, 0);
 
-        // Pretend read end is shared between in_fd and out_fd, and close write end normally.
-        close_fd_set(MidiFdSet {
-            in_fd: fds[0],
-            out_fd: fds[0],
-            generation: 1,
-        });
-        close_fd_set(MidiFdSet {
-            in_fd: -1,
-            out_fd: fds[1],
-            generation: 1,
-        });
+        let mut fds = MidiFdSet::from_parts(p1[0], &[p1[0], p2[1]], 1);
+        assert_eq!(fds.active_outputs(), &[p1[0], p2[1]]);
+        assert_eq!(fds.remove_output_at(0), Some(p1[0]));
+        assert_eq!(fds.active_outputs(), &[p2[1]]);
+        assert!(fds.push_output(p1[0]));
 
-        // Verify fds[0] is now closed (EBADF on fcntl).
-        let check = unsafe { libc::fcntl(fds[0], libc::F_GETFD) };
-        assert_eq!(check, -1);
+        let (unique, len) = collect_unique_fds(fds);
+        assert_eq!(&unique[..len], &[p1[0], p2[1]]);
+
+        close_fd_set(fds);
+        close_fd_set(MidiFdSet::from_parts(p1[1], &[p2[0]], 1));
     }
 }

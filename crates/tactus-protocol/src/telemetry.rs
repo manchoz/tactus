@@ -24,6 +24,8 @@ pub struct TelemetrySnapshot {
     pub lock_state: LockState,
     /// Whether start/stop transport sync (`0xFA`/`0xFC`) is enabled.
     pub start_stop_sync: bool,
+    /// Whether direct RT MIDI Clock/transport relay (`MidiToLink` mode) is enabled.
+    pub clock_thru: bool,
     /// Current Ableton Link session tempo in BPM.
     pub bpm_link: f64,
     /// Long-window OLS MIDI BPM estimate, when available.
@@ -50,6 +52,7 @@ impl Default for TelemetrySnapshot {
             direction: Direction::LinkToMidi,
             lock_state: LockState::Unlocked,
             start_stop_sync: true,
+            clock_thru: true,
             bpm_link: 120.0,
             bpm_midi_long: None,
             bpm_midi_fast: None,

@@ -30,13 +30,15 @@
     quantumButtons: Array.from(document.querySelectorAll("[data-quantum]")),
     quantumCustom: document.getElementById("quantum-custom"),
     startStopToggle: document.getElementById("start-stop-toggle"),
+    clockThruBlock: document.getElementById("clock-thru-block"),
+    clockThruToggle: document.getElementById("clock-thru-toggle"),
     offsetReadout: document.getElementById("offset-readout"),
     offsetReset: document.getElementById("offset-reset"),
     offsetMinus: document.getElementById("offset-minus"),
     offsetPlus: document.getElementById("offset-plus"),
     offsetSlider: document.getElementById("offset-slider"),
     midiInSelect: document.getElementById("midi-in"),
-    midiOutSelect: document.getElementById("midi-out"),
+    midiOutList: document.getElementById("midi-out-list"),
     midiInStatus: document.getElementById("midi-in-status"),
     midiOutStatus: document.getElementById("midi-out-status"),
     midiEmptyHint: document.getElementById("midi-empty-hint"),
@@ -230,6 +232,18 @@
     return port.id;
   }
 
+  function findMatchedPort(eligiblePorts, rule) {
+    const trimmed = rule.trim();
+    if (!trimmed) {
+      return null;
+    }
+    const exact = eligiblePorts.find((p) => p.id === trimmed);
+    if (exact) {
+      return exact;
+    }
+    return eligiblePorts.find((p) => matchesRule(p, trimmed)) || null;
+  }
+
   function formatPortLabel(port) {
     const card = port.card_name.trim();
     const name = port.port_name.trim();
@@ -237,6 +251,15 @@
       return `${name || port.id} (${port.id})`;
     }
     return `${card} — ${name} (${port.id})`;
+  }
+
+  function formatPortTitle(port) {
+    const card = port.card_name.trim();
+    const name = port.port_name.trim();
+    if (!card || name.toLowerCase().startsWith(card.toLowerCase())) {
+      return name || port.id;
+    }
+    return `${card} — ${name}`;
   }
 
   function rebuildBeatStrip(beatCount) {
@@ -251,21 +274,21 @@
     lastRenderedBeats = beatCount;
   }
 
-  function renderPortSelect(selectEl, statusEl, isInput, state) {
+  function renderInputPortSelect(state) {
     const allPorts = state.available_midi_ports || [];
-    const eligible = allPorts.filter((p) => (isInput ? p.can_read : p.can_write));
-    const selectedId = isInput ? state.selected_midi_input : state.selected_midi_output;
-    const matchRule = (isInput ? state.midi_input_match : state.midi_output_match) || "";
+    const eligible = allPorts.filter((p) => p.can_read);
+    const selectedId = state.selected_midi_input || null;
+    const matchRule = state.midi_input_match || "";
 
     if (selectedId) {
-      statusEl.textContent = `Attached (${selectedId})`;
-      statusEl.className = "port-status port-ok";
+      els.midiInStatus.textContent = `Attached (${selectedId})`;
+      els.midiInStatus.className = "port-status port-ok";
     } else if (matchRule) {
-      statusEl.textContent = `Waiting for "${matchRule}"`;
-      statusEl.className = "port-status port-wait";
+      els.midiInStatus.textContent = `Waiting for "${matchRule}"`;
+      els.midiInStatus.className = "port-status port-wait";
     } else {
-      statusEl.textContent = "Disabled";
-      statusEl.className = "port-status port-off";
+      els.midiInStatus.textContent = "Disabled";
+      els.midiInStatus.className = "port-status port-off";
     }
 
     const sig = JSON.stringify({
@@ -273,22 +296,17 @@
       selectedId,
       matchRule,
     });
-    const prevSig = isInput ? lastInSignature : lastOutSignature;
-    if (sig === prevSig) {
+    if (sig === lastInSignature) {
       return;
     }
-    if (isInput) {
-      lastInSignature = sig;
-    } else {
-      lastOutSignature = sig;
-    }
+    lastInSignature = sig;
 
-    selectEl.innerHTML = "";
+    els.midiInSelect.innerHTML = "";
 
     const noneOpt = document.createElement("option");
     noneOpt.value = "";
     noneOpt.textContent = "Disabled (None)";
-    selectEl.appendChild(noneOpt);
+    els.midiInSelect.appendChild(noneOpt);
 
     let chosenValue = "";
     let matchedOptionFound = false;
@@ -302,18 +320,202 @@
         chosenValue = val;
         matchedOptionFound = true;
       }
-      selectEl.appendChild(opt);
+      els.midiInSelect.appendChild(opt);
     }
 
     if (!matchedOptionFound && matchRule) {
       const waitOpt = document.createElement("option");
       waitOpt.value = matchRule;
       waitOpt.textContent = `Waiting for "${matchRule}" (unplugged)`;
-      selectEl.appendChild(waitOpt);
+      els.midiInSelect.appendChild(waitOpt);
       chosenValue = matchRule;
     }
 
-    selectEl.value = chosenValue;
+    els.midiInSelect.value = chosenValue;
+  }
+
+  function renderOutputPortList(state) {
+    const allPorts = state.available_midi_ports || [];
+    const eligible = allPorts.filter((p) => p.can_write);
+    const selectedIds = state.selected_midi_outputs || [];
+    const matchRules = state.midi_output_matches || [];
+    const isMidiToLink = state.telemetry?.direction === "midi_to_link";
+    const clockThru = Boolean(state.telemetry?.clock_thru);
+    const selectedInputId = state.selected_midi_input || null;
+
+    const matchedByRule = matchRules.map((rule) => findMatchedPort(eligible, rule));
+    const unmatchedRules = [];
+    matchRules.forEach((rule, idx) => {
+      if (!matchedByRule[idx]) {
+        unmatchedRules.push({ rule, idx });
+      }
+    });
+
+    if (selectedIds.length > 0 && unmatchedRules.length > 0) {
+      els.midiOutStatus.textContent = `${selectedIds.length} attached, ${unmatchedRules.length} waiting`;
+      els.midiOutStatus.className = "port-status port-ok";
+    } else if (selectedIds.length > 0) {
+      els.midiOutStatus.textContent = `${selectedIds.length} attached`;
+      els.midiOutStatus.className = "port-status port-ok";
+    } else if (matchRules.length > 0) {
+      els.midiOutStatus.textContent = `Waiting (${matchRules.length})`;
+      els.midiOutStatus.className = "port-status port-wait";
+    } else {
+      els.midiOutStatus.textContent = "Disabled";
+      els.midiOutStatus.className = "port-status port-off";
+    }
+
+    const sig = JSON.stringify({
+      eligible: eligible.map((p) => [p.id, p.card_name, p.port_name]),
+      selectedIds,
+      matchRules,
+      selectedInputId,
+      isMidiToLink,
+      clockThru,
+    });
+    if (sig === lastOutSignature) {
+      return;
+    }
+    lastOutSignature = sig;
+
+    els.midiOutList.innerHTML = "";
+
+    if (eligible.length === 0 && unmatchedRules.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "control-sub";
+      empty.textContent = "No writable MIDI outputs connected.";
+      els.midiOutList.appendChild(empty);
+      return;
+    }
+
+    for (const port of eligible) {
+      const isAttached = selectedIds.includes(port.id);
+      const isSelected =
+        isAttached || matchedByRule.some((matched) => matched && matched.id === port.id);
+
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = `port-row${isSelected ? " selected" : ""}`;
+      row.setAttribute("aria-pressed", String(isSelected));
+
+      const main = document.createElement("div");
+      main.className = "port-row-main";
+
+      const title = document.createElement("span");
+      title.className = "port-row-name";
+      title.textContent = formatPortTitle(port);
+
+      const sub = document.createElement("span");
+      sub.className = "port-row-sub";
+      sub.textContent = port.id;
+
+      main.appendChild(title);
+      main.appendChild(sub);
+
+      const meta = document.createElement("div");
+      meta.className = "port-row-meta";
+
+      if (isAttached) {
+        const tag = document.createElement("span");
+        if (isMidiToLink && selectedInputId && port.id === selectedInputId) {
+          tag.className = "port-tag tag-loop";
+          tag.textContent = "IN · loop blocked";
+        } else if (isMidiToLink && clockThru) {
+          tag.className = "port-tag tag-relay";
+          tag.textContent = "Relay";
+        } else if (isMidiToLink) {
+          tag.className = "port-tag tag-idle";
+          tag.textContent = "Idle";
+        } else {
+          tag.className = "port-tag tag-active";
+          tag.textContent = "Active";
+        }
+        meta.appendChild(tag);
+      } else if (isSelected) {
+        const tag = document.createElement("span");
+        tag.className = "port-tag tag-wait";
+        tag.textContent = "Attaching";
+        meta.appendChild(tag);
+      }
+
+      const check = document.createElement("span");
+      check.className = "port-check";
+      check.setAttribute("aria-hidden", "true");
+      check.textContent = "✓";
+      meta.appendChild(check);
+
+      row.appendChild(main);
+      row.appendChild(meta);
+
+      row.addEventListener("click", () => {
+        const input = latestState ? latestState.midi_input_match || "" : "";
+        let nextOutputs;
+        if (isSelected) {
+          nextOutputs = matchRules.filter((_rule, idx) => {
+            const matched = matchedByRule[idx];
+            return !matched || matched.id !== port.id;
+          });
+        } else {
+          const val = persistentMatchValue(port, eligible);
+          nextOutputs = [...matchRules, val];
+        }
+        sendCommand({
+          select_midi_ports: {
+            input,
+            outputs: nextOutputs,
+          },
+        });
+      });
+
+      els.midiOutList.appendChild(row);
+    }
+
+    for (const item of unmatchedRules) {
+      const row = document.createElement("div");
+      row.className = "port-row unplugged";
+
+      const main = document.createElement("div");
+      main.className = "port-row-main";
+
+      const title = document.createElement("span");
+      title.className = "port-row-name";
+      title.textContent = item.rule;
+
+      const sub = document.createElement("span");
+      sub.className = "port-row-sub";
+      sub.textContent = "Unplugged — auto-attaches when reconnected";
+
+      main.appendChild(title);
+      main.appendChild(sub);
+
+      const meta = document.createElement("div");
+      meta.className = "port-row-meta";
+
+      const tag = document.createElement("span");
+      tag.className = "port-tag tag-wait";
+      tag.textContent = "Waiting";
+      meta.appendChild(tag);
+
+      const removeBtn = document.createElement("button");
+      removeBtn.type = "button";
+      removeBtn.className = "port-remove-btn";
+      removeBtn.textContent = "Remove";
+      removeBtn.addEventListener("click", () => {
+        const input = latestState ? latestState.midi_input_match || "" : "";
+        const nextOutputs = matchRules.filter((_r, idx) => idx !== item.idx);
+        sendCommand({
+          select_midi_ports: {
+            input,
+            outputs: nextOutputs,
+          },
+        });
+      });
+      meta.appendChild(removeBtn);
+
+      row.appendChild(main);
+      row.appendChild(meta);
+      els.midiOutList.appendChild(row);
+    }
   }
 
   function renderState(state) {
@@ -389,6 +591,8 @@
     }
 
     els.startStopToggle.setAttribute("aria-checked", String(Boolean(t.start_stop_sync)));
+    els.clockThruBlock.classList.toggle("hidden", isLinkToMidi);
+    els.clockThruToggle.setAttribute("aria-checked", String(Boolean(t.clock_thru)));
 
     if (!isDraggingOffset) {
       const snapped = snapHalfMs(t.midi_offset_ms || 0);
@@ -409,8 +613,8 @@
 
     const ports = state.available_midi_ports || [];
     els.midiEmptyHint.classList.toggle("hidden", ports.length > 0);
-    renderPortSelect(els.midiInSelect, els.midiInStatus, true, state);
-    renderPortSelect(els.midiOutSelect, els.midiOutStatus, false, state);
+    renderInputPortSelect(state);
+    renderOutputPortList(state);
   }
 
   function applyOffsetValue(rawValue, forceSend) {
@@ -454,6 +658,13 @@
     const next = !current;
     els.startStopToggle.setAttribute("aria-checked", String(next));
     sendCommand({ set_start_stop_sync: next });
+  });
+
+  els.clockThruToggle.addEventListener("click", () => {
+    const current = els.clockThruToggle.getAttribute("aria-checked") === "true";
+    const next = !current;
+    els.clockThruToggle.setAttribute("aria-checked", String(next));
+    sendCommand({ set_clock_thru: next });
   });
 
   els.resyncBtn.addEventListener("click", () => {
@@ -549,21 +760,11 @@
   }
 
   els.midiInSelect.addEventListener("change", () => {
-    const output = latestState ? latestState.midi_output_match || "" : "";
+    const outputs = latestState ? latestState.midi_output_matches || [] : [];
     sendCommand({
       select_midi_ports: {
         input: els.midiInSelect.value,
-        output,
-      },
-    });
-  });
-
-  els.midiOutSelect.addEventListener("change", () => {
-    const input = latestState ? latestState.midi_input_match || "" : "";
-    sendCommand({
-      select_midi_ports: {
-        input,
-        output: els.midiOutSelect.value,
+        outputs,
       },
     });
   });

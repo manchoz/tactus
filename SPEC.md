@@ -44,11 +44,12 @@ Designed for setups where MIDI tempo changes rarely and rock-solid Link BPM stab
    - Every 24 ticks (quarter note), measure phase error between the MIDI beat timestamp and Link timeline phase.
    - If `|phase_error| > phase_deadband_ms` (default `4.0 ms`), apply a gentle bounded nudge (max `1.0 ms` correction per beat) rather than abrupt jumps, preventing audible pitch artifacts on Link loopers/DAWs.
    - On MIDI clock timeout (no `0xF8` for `> 500 ms`), transition to `Unlocked`, clear estimator buffers, and stop pushing updates to Link.
+   - **RT Clock Thru (`clock_thru = true`):** Forward incoming `0xF8` (plus `0xFA`/`0xFB`/`0xFC` when `start_stop_sync = true`) directly to all other selected MIDI outputs, automatically skipping the active input port descriptor to prevent clock feedback loops. Disabling `clock_thru` while playing emits `Stop (0xFC)` cleanly to relayed outputs.
 
 ## 3. MIDI I/O Specification
-- Direct ALSA Sequencer (`snd_seq`) client named `Tactus` (no PipeWire).
-- Subscribe/publish to selected USB-MIDI ports (including CME WIDI Uhost) matched by persistent client/port name substring in `config.toml`.
-- Automatically handle USB hotplug (`SND_SEQ_EVENT_PORT_START`, `SND_SEQ_EVENT_PORT_EXIT`) without restarting `tactusd`.
+- Direct kernel ALSA RawMIDI (`/dev/snd/midiC*D*`) via UAPI ioctls on stock Debian (optional `snd_seq` in future Yocto `meta-tactus`).
+- Select 1 MIDI input (`input_port_match`) and up to 8 simultaneous MIDI outputs (`output_port_matches`) matched by persistent card/port name substring or `hw:C,D,S` in `config.toml`.
+- Automatically handle USB hotplug (`NETLINK_KOBJECT_UEVENT` + 5 s fallback rescan) and per-output fault isolation without restarting `tactusd`.
 
 ## 4. Network & Mobile Web UI Specification
 - **WiFi AP:** 5 GHz only, non-DFS channel (default `36`, selectable `36/40/44/48`), `country_code=IT`, `multicast_to_unicast=1`, `dtim_period=1` *(Debian PoC note: onboard UNO Q `ath10k_snoc` / WCN3990 EEPROM `0x406c` enforces `NO-IR` on 5 GHz without `CONFIG_ATH_USER_REGD`, so PoC falls back to 2.4 GHz channel `11` [20 MHz, clear of BLE advertising channels], while 5 GHz ch `36–48` remains the target for external 5 GHz USB WiFi or Yocto `meta-tactus`)*.
@@ -64,6 +65,7 @@ Designed for setups where MIDI tempo changes rarely and rock-solid Link BPM stab
 [sync]
 direction = "link_to_midi"        # "link_to_midi" | "midi_to_link"
 start_stop_sync = true
+clock_thru = true                 # Relay incoming MIDI clock/transport to other selected outputs in midi_to_link
 quantum = 4.0
 midi_offset_ms = 0.0
 ols_window_secs = 10.0
@@ -75,8 +77,8 @@ phase_deadband_ms = 4.0
 max_phase_nudge_ms = 1.0
 
 [midi]
-input_port_match = "WIDI"         # Substring match on ALSA port name
-output_port_match = "WIDI"
+input_port_match = "WIDI"         # Substring match on ALSA RawMIDI port name
+output_port_matches = ["WIDI"]    # Up to 8 output port match rules (legacy output_port_match supported)
 
 [web]
 listen_addr = "0.0.0.0:80"
