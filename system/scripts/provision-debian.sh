@@ -550,7 +550,10 @@ verify_board() {
     fi
   fi
 
-  local core_services=(avahi-daemon.service arduino-router.service NetworkManager.service)
+  local core_services=(avahi-daemon.service NetworkManager.service)
+  if systemctl list-unit-files arduino-router.service --no-legend 2>/dev/null | grep -q arduino-router.service; then
+    core_services+=(arduino-router.service)
+  fi
   if [[ "$ENABLE_SSH" -eq 1 ]]; then
     core_services+=(ssh.service)
   fi

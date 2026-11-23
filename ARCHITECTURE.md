@@ -36,8 +36,8 @@ tactus/
 1. **RT Thread (`rt-sync`, `std::thread`):**
    - Pinned to dedicated CPU core (e.g., Core 3 on a quad-core Linux SBC).
    - `SCHED_FIFO` priority 75 + `mlockall(MCL_CURRENT | MCL_FUTURE)`.
-   - Owns ALSA Sequencer handle, `abl_link` session handle, and `SyncEngine` from `tactus-sync-core`.
-   - Polls incoming commands from `rtrb::Consumer<EngineCommand>` (non-blocking).
+   - Owns active ALSA RawMIDI file descriptors (handed off from async), `abl_link` session handle, and `SyncEngine` from `tactus-sync-core`.
+   - Polls incoming `Copy` `RtMessage` items (`RtCommand` + `AttachMidi`/`Shutdown`) from `rtrb::Consumer<RtMessage>` (non-blocking) and returns replaced/detached FDs over `rtrb::Producer<FdReturn>`.
    - Pushes telemetry snapshots to `rtrb::Producer<TelemetrySnapshot>` (drop-oldest on full, never blocks).
 2. **Async Runtime (`tokio`, Cores 0–2, normal priority):**
    - **State Hub Task:** Drains `TelemetrySnapshot` at ~15 Hz (and on discrete state changes), updates `tokio::sync::watch::Sender<AppState>`, and dispatches `EngineCommand` to the RT thread.
@@ -50,23 +50,29 @@ Both WebSocket (JSON) and `arduino-router` (MessagePack-RPC) share the exact sam
 
 - **`EngineCommand`:**
   - `SetDirection(Direction)`
+  - `SetStartStopSync(bool)`
+  - `SetClockThru(bool)`
   - `SetOffsetMs(f32)`
   - `SetQuantum(f64)`
-  - `SelectMidiPorts { input: String, output: String }`
+  - `SelectMidiPorts { input: String, outputs: Vec<String> }`
   - `ResyncDownbeat`
   - `SetLinkTempoManual(f64)` (when in `LinkToMidi` mode)
-- **`TelemetrySnapshot`:**
+- **`TelemetrySnapshot` (strictly `Copy`, zero-alloc):**
   - `direction: Direction`
   - `lock_state: LockState` (`Unlocked` | `Acquiring` | `Locked`)
+  - `start_stop_sync: bool`
+  - `clock_thru: bool`
   - `bpm_link: f64`
   - `bpm_midi_long: Option<f64>`
   - `bpm_midi_fast: Option<f64>`
   - `phase_error_ms: f32`
-  - `beat_phase: f64` (0.0..quantum)
+  - `beat_phase: f64` (`0.0..quantum`)
+  - `quantum: f64`
   - `link_peers: usize`
   - `is_playing: bool`
   - `midi_offset_ms: f32`
-  - `available_midi_ports: Vec<MidiPortInfo>`
+- **`AppState` (async control plane `watch::Sender<AppState>`):**
+  - Wraps `telemetry: TelemetrySnapshot` alongside `available_midi_ports: Vec<MidiPortInfo>`, `selected_midi_input: Option<String>`, `selected_midi_outputs: Vec<String>`, `midi_input_match: String`, and `midi_output_matches: Vec<String>`.
 
 ## 4. `tactus-link-sys` Dual Build Strategy (Debian + Yocto)
 `build.rs` checks in order:

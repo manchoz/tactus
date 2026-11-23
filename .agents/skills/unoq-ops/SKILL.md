@@ -58,7 +58,7 @@ cargo zigbuild --workspace --release --target aarch64-unknown-linux-gnu.2.36
 - **Post-deploy live verification (from macOS over IPv4):**
   ```bash
   shasum -a 256 target/aarch64-unknown-linux-gnu/release/tactusd
-  ssh tactus 'sha256sum /usr/local/bin/tactusd && ps -eLo pid,tid,psr,cls,rtprio,comm | grep -E "tactusd|rt-sync" && journalctl -u tactusd.service -n 20 --no-pager'
+  ssh tactus 'sha256sum /usr/local/bin/tactusd && ps -eLo pid,tid,psr,cls,rtprio,comm | grep -E "tactusd|rt-sync"; journalctl -u tactusd.service -n 20 --no-pager'
   curl -4 -sS http://tactus.local/healthz && curl -4 -sSI http://tactus.local/
   ```
   Confirm matching binary SHA256, `rt-sync` on Core `3` (`FF 75`, `mlockall=locked`), `ui_hash` + `no-store` headers on `/`, and zero `Device or resource busy` (`EBUSY`) lines in `journalctl`.

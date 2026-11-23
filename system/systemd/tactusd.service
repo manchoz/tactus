@@ -6,7 +6,7 @@ Wants=tactus-ap.service
 [Service]
 Type=simple
 User=tactus
-SupplementaryGroups=audio arduino-router
+SupplementaryGroups=audio
 StateDirectory=tactus
 StateDirectoryMode=0750
 RuntimeDirectory=tactus
