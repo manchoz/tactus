@@ -9,29 +9,33 @@ description: >-
 
 # Arduino UNO Q Operations Runbook
 
-## 1. SSH Access from macOS
-- **Always force IPv4 (`-4`)**: UNO Q advertises an unroutable IPv6 ULA on mDNS before IPv4, causing plain `ssh tactus.local` to fail with `No route to host`.
-- **Ethernet LAN:** `ssh -4 -i ~/.ssh/id_ed25519 arduino@tactus.local`
-- **Tactus WiFi AP (`10.42.0.1/24`):** `ssh -4 -i ~/.ssh/id_ed25519 arduino@10.42.0.1`
+## 1. SSH & Serial Console Access from macOS
+- **SSH shortcut (`~/.ssh/config`):**
+  - `ssh tactus` (Ethernet LAN `tactus.local`, forces IPv4 `AddressFamily inet` because UNO Q advertises an unroutable IPv6 ULA on mDNS before IPv4).
+  - `ssh tactus-ap` (`10.42.0.1` when joined to the `Tactus` WiFi AP).
+  - Or explicitly: `ssh -4 -i ~/.ssh/id_ed25519 arduino@tactus.local` / `arduino@10.42.0.1`.
+- **Serial Linux console (UART):** `/dev/cu.usbserial-*` at `115200 8N1`. Log in as **`arduino`** (`tactus` is a locked `nologin` daemon user).
 - Provisioned boards have `NOPASSWD` sudo for `arduino` (`/etc/sudoers.d/99-arduino-nopasswd`).
 
 ## 2. Factory Provisioning (USB-C ADB or SSH)
 Use `system/scripts/provision-factory-unoq.sh` (idempotent):
 - **Fresh factory flash (USB-C ADB — no App Lab needed):**
-  - Factory image boots with `ssh.service`/`ssh.socket` disabled, `adbd` running as UID `1000` (`arduino`), and passwordless sudo for `/usr/local/bin/arduino-passwd` (reads password once on stdin).
+  - Factory image boots with **no login password set** for `arduino`, `ssh.service`/`ssh.socket` disabled, `adbd` running as UID `1000` (`arduino`), and passwordless sudo for `/usr/local/bin/arduino-passwd` (reads password once on stdin).
   - Always use `adb shell -T` for non-interactive/piped commands (`sudo -S`, `arduino-passwd`, stdin redirection) to avoid PTY echo and `\r\n` mangling.
-  - Factory boards have no RTC battery (`RTC=1970-01-01`, stale image date); the launcher syncs the board's UTC clock from the host before `apt-get update` so Debian `InRelease`/TLS checks succeed.
-  - Run:
+  - Factory boards have no RTC battery (`RTC=1970-01-01`, stale image date); the launcher syncs the board's UTC clock from the host before `apt-get update` and `ensure_arduino_password_healthy()` normalizes `/etc/shadow` `lastchg=0` so serial/SSH login never hits an expired-password loop.
+  - Run (prompts twice with confirmation to set `arduino`'s password, or reads `TACTUS_ARDUINO_PASSWORD`):
     ```bash
     ./system/scripts/provision-factory-unoq.sh --adb \
       --pubkey ~/.ssh/id_ed25519.pub \
       --wifi-ssid "<BootstrapSSID>" --wifi-psk "<BootstrapPSK>" \
       --nopasswd-sudo
     ```
-  - **Security rule:** Never write personal bootstrap WiFi credentials into repo files, commits, or artifacts. Verify `/etc/NetworkManager/system-connections/` has no `tactus-bootstrap-wifi` profile after provisioning.
-- **Re-provisioning over SSH:**
+  - **Security rule:** Never write personal bootstrap WiFi credentials or passwords into repo files, commits, or artifacts. Verify `/etc/NetworkManager/system-connections/` has no `tactus-bootstrap-wifi` profile after provisioning.
+- **Re-provisioning / resetting `arduino` password over SSH:**
   ```bash
   ./system/scripts/provision-factory-unoq.sh --ssh arduino@tactus.local -i ~/.ssh/id_ed25519 --nopasswd-sudo
+  # To set/reset the 'arduino' serial console password (prompts with confirmation or uses TACTUS_ARDUINO_PASSWORD):
+  ./system/scripts/provision-factory-unoq.sh --ssh arduino@tactus.local -i ~/.ssh/id_ed25519 --reset-arduino-password
   ```
 
 ## 3. Bonjour / Zeroconf Verification

@@ -16,6 +16,7 @@ RUN_VERIFY=0
 TARGET_HOSTNAME=""
 DEB_DIR=""
 BINARY_PATH=""
+ARDUINO_PASSWORD_FILE=""
 
 usage() {
   cat <<'EOF'
@@ -37,6 +38,8 @@ Options:
   --hostname NAME     Set system hostname (e.g. tactus) and restart avahi-daemon
   --deb-dir DIR       Directory of pre-downloaded arm64 .deb packages for offline install
   --binary PATH       Install tactusd binary to /usr/local/bin/tactusd and enable/start tactusd.service
+  --arduino-password-file PATH
+                      Read new password for user 'arduino' from PATH, apply via chpasswd, and delete PATH
   --verify            Run post-provision verification checks
   --force-ap          Bypass SSH-over-wlan0 lockout protection during --activate-ap
   -h, --help          Show this help message
@@ -118,6 +121,14 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       BINARY_PATH="$2"
+      shift 2
+      ;;
+    --arduino-password-file)
+      if [[ $# -lt 2 || -z "$2" ]]; then
+        echo "error: --arduino-password-file requires a file path" >&2
+        exit 1
+      fi
+      ARDUINO_PASSWORD_FILE="$2"
       shift 2
       ;;
     --verify)
@@ -358,6 +369,46 @@ configure_nopasswd_sudo() {
   rm -f "$tmp_sudoers"
 }
 
+ensure_arduino_password_healthy() {
+  if [[ -n "$ARDUINO_PASSWORD_FILE" ]]; then
+    if [[ ! -f "$ARDUINO_PASSWORD_FILE" ]]; then
+      echo "error: --arduino-password-file '${ARDUINO_PASSWORD_FILE}' does not exist" >&2
+      exit 1
+    fi
+    local new_pw=""
+    IFS= read -r new_pw < "$ARDUINO_PASSWORD_FILE" || true
+    rm -f "$ARDUINO_PASSWORD_FILE"
+    if [[ -z "$new_pw" ]]; then
+      echo "error: empty password in --arduino-password-file" >&2
+      exit 1
+    fi
+    log "Updating login password for user 'arduino'..."
+    printf 'arduino:%s\n' "$new_pw" | chpasswd
+    passwd -u arduino >/dev/null 2>&1 || true
+  fi
+
+  if ! id -u arduino >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local shadow_hash shadow_lstchg
+  shadow_hash="$(awk -F: '$1=="arduino"{print $2}' /etc/shadow)"
+  shadow_lstchg="$(awk -F: '$1=="arduino"{print $3}' /etc/shadow)"
+
+  if [[ -n "$shadow_hash" && "$shadow_hash" != !* && "$shadow_hash" != \** ]]; then
+    if [[ "$shadow_lstchg" == "0" ]]; then
+      local epoch_days
+      epoch_days=$(( $(date -u +%s) / 86400 ))
+      if (( epoch_days > 0 )); then
+        log "Fixing /etc/shadow lastchg=0 (no-RTC clock trap) for user 'arduino' to day ${epoch_days}..."
+        chage -d "$epoch_days" arduino
+      fi
+    fi
+  else
+    log "WARNING: user 'arduino' has no active login password in /etc/shadow (serial TTY login disabled)."
+  fi
+}
+
 configure_volatile_journal() {
   log "Configuring systemd-journald for volatile tmpfs storage..."
   install -d -m 0755 /etc/systemd/journald.conf.d
@@ -458,6 +509,19 @@ activate_ap() {
   log "Enabling and starting tactus-ap.service..."
   systemctl enable tactus-ap.service
   systemctl restart tactus-ap.service
+
+  local ap_wait
+  for ap_wait in 1 2 3 4 5 6 7 8 9 10; do
+    if /usr/sbin/iw dev wlan0 info 2>/dev/null | grep -q 'type AP' &&
+       ip -4 -br addr show dev wlan0 2>/dev/null | grep -q '10\.42\.0\.1/24'; then
+      break
+    fi
+    sleep 0.5
+  done
+
+  if systemctl is-active --quiet avahi-daemon.service; then
+    systemctl restart avahi-daemon.service
+  fi
 }
 
 install_binary() {
@@ -556,7 +620,7 @@ verify_board() {
   local avahi_pid avahi_established=0 avahi_wait
   avahi_pid="$(systemctl show -p MainPID --value avahi-daemon.service 2>/dev/null || true)"
   if [[ -n "$avahi_pid" && "$avahi_pid" != "0" ]]; then
-    for avahi_wait in 1 2 3 4 5 6; do
+    for avahi_wait in 1 2 3 4 5 6 7 8 9 10; do
       if journalctl -u avahi-daemon.service _PID="$avahi_pid" --no-pager 2>/dev/null |
          grep -Fq '(/services/tactus.service) successfully established'; then
         avahi_established=1
@@ -570,6 +634,21 @@ verify_board() {
   else
     echo "  [FAIL] avahi-daemon did not report /services/tactus.service established" >&2
     failures=$((failures + 1))
+  fi
+
+  if id -u arduino >/dev/null 2>&1; then
+    local shadow_hash shadow_lstchg
+    shadow_hash="$(awk -F: '$1=="arduino"{print $2}' /etc/shadow)"
+    shadow_lstchg="$(awk -F: '$1=="arduino"{print $3}' /etc/shadow)"
+    if [[ -z "$shadow_hash" || "$shadow_hash" == !* || "$shadow_hash" == \** ]]; then
+      echo "  [FAIL] user 'arduino' has no active login password (run with --reset-arduino-password or 'sudo passwd arduino')" >&2
+      failures=$((failures + 1))
+    elif [[ "$shadow_lstchg" == "0" ]]; then
+      echo "  [FAIL] user 'arduino' password is expired (lastchg=0; must change on first login)" >&2
+      failures=$((failures + 1))
+    else
+      echo "  [PASS] user 'arduino' has an active, non-expired login password"
+    fi
   fi
 
   if [[ "$TRIM_SERVICES" -eq 1 ]]; then
@@ -633,6 +712,8 @@ fi
 if [[ "$NOPASSWD_SUDO" -eq 1 ]]; then
   configure_nopasswd_sudo
 fi
+
+ensure_arduino_password_healthy
 
 if [[ "$VOLATILE_JOURNAL" -eq 1 ]]; then
   configure_volatile_journal

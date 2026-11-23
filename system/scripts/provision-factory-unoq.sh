@@ -16,6 +16,8 @@ WIFI_PSK="${TACTUS_BOOTSTRAP_WIFI_PSK:-}"
 DEB_DIR=""
 BINARY_PATH=""
 NOPASSWD_SUDO=0
+RESET_ARDUINO_PASSWORD=0
+STAGE_ARDUINO_PW_FILE=0
 STAGE_ONLY=0
 ROLLBACK_AP=0
 FORCE_AP=0
@@ -41,6 +43,9 @@ Options:
   --hostname NAME         Target hostname (default: tactus)
   --psk PASSPHRASE        WPA2 passphrase for 'Tactus' WiFi AP (8..63 chars; or TACTUS_AP_PSK env var)
   --nopasswd-sudo         Configure passwordless sudo for user 'arduino'
+  --reset-arduino-password
+                          Set or update board user 'arduino' login password (via TACTUS_ARDUINO_PASSWORD
+                          or interactive confirmed prompt; fixes serial TTY login on factory boards)
   --wifi-ssid SSID        (--adb only) Temporary WiFi network to download hostapd/dnsmasq/iw if offline
   --wifi-psk PSK          (--adb only) Passphrase for --wifi-ssid (or TACTUS_BOOTSTRAP_WIFI_PSK env var)
   --deb-dir DIR           Local directory of arm64 .deb files for completely offline install
@@ -109,6 +114,10 @@ while [[ $# -gt 0 ]]; do
       NOPASSWD_SUDO=1
       shift
       ;;
+    --reset-arduino-password)
+      RESET_ARDUINO_PASSWORD=1
+      shift
+      ;;
     --stage-only)
       STAGE_ONLY=1
       shift
@@ -167,6 +176,24 @@ log() {
   echo "[tactus-factory] $*"
 }
 
+PROMPTED_ARDUINO_PASSWORD=""
+prompt_new_arduino_password() {
+  local pw1="" pw2=""
+  read -r -s -p "Set new password for board user 'arduino': " pw1
+  echo >&2
+  if [[ -z "$pw1" ]]; then
+    echo "error: password cannot be empty" >&2
+    exit 1
+  fi
+  read -r -s -p "Confirm password for 'arduino': " pw2
+  echo >&2
+  if [[ "$pw1" != "$pw2" ]]; then
+    echo "error: passwords do not match" >&2
+    exit 1
+  fi
+  PROMPTED_ARDUINO_PASSWORD="$pw1"
+}
+
 build_provision_args() {
   local extra_args=()
   if [[ "$ROLLBACK_AP" -eq 1 ]]; then
@@ -184,6 +211,9 @@ build_provision_args() {
     fi
     if [[ "$NOPASSWD_SUDO" -eq 1 ]]; then
       extra_args+=(--nopasswd-sudo)
+    fi
+    if [[ "$STAGE_ARDUINO_PW_FILE" -eq 1 ]]; then
+      extra_args+=(--arduino-password-file /tmp/.tactus-arduino-pw)
     fi
     if [[ -n "$DEB_DIR" ]]; then
       extra_args+=(--deb-dir /tmp/tactus-debs)
@@ -222,24 +252,50 @@ run_adb() {
 
   local need_sudo_pw=0
   local arduino_pw="${TACTUS_ARDUINO_PASSWORD:-}"
+  local stage_pw=""
+
   if ! "${ADB_CMD[@]}" shell -T 'sudo -n true 2>/dev/null'; then
     need_sudo_pw=1
-    if [[ -z "$arduino_pw" ]]; then
-      read -r -s -p "Enter (or set new) password for board user 'arduino': " arduino_pw
-      echo
+    if "${ADB_CMD[@]}" shell -T 'sudo -n -l /usr/local/bin/arduino-passwd >/dev/null 2>&1'; then
       if [[ -z "$arduino_pw" ]]; then
-        echo "error: non-empty password required when passwordless sudo is not configured" >&2
-        exit 1
+        log "Factory UNO Q detected (no password set for 'arduino')."
+        prompt_new_arduino_password
+        arduino_pw="$PROMPTED_ARDUINO_PASSWORD"
       fi
-    fi
-
-    if ! printf '%s\n' "$arduino_pw" | "${ADB_CMD[@]}" shell -T 'sudo -S -p "" true 2>/dev/null'; then
       log "Setting 'arduino' password via factory /usr/local/bin/arduino-passwd..."
       if ! printf '%s\n' "$arduino_pw" | "${ADB_CMD[@]}" shell -T 'sudo -n /usr/local/bin/arduino-passwd'; then
-        echo "error: sudo password rejected and factory arduino-passwd unavailable" >&2
+        echo "error: factory /usr/local/bin/arduino-passwd failed" >&2
         exit 1
       fi
       printf '%s\n' "$arduino_pw" | "${ADB_CMD[@]}" shell -T 'sudo -S -p "" true'
+    else
+      if [[ -z "$arduino_pw" ]]; then
+        read -r -s -p "Enter existing sudo password for board user 'arduino': " arduino_pw
+        echo
+        if [[ -z "$arduino_pw" ]]; then
+          echo "error: non-empty password required when passwordless sudo is not configured" >&2
+          exit 1
+        fi
+      fi
+      if ! printf '%s\n' "$arduino_pw" | "${ADB_CMD[@]}" shell -T 'sudo -S -p "" true 2>/dev/null'; then
+        echo "error: sudo password rejected for user 'arduino'" >&2
+        exit 1
+      fi
+      if [[ "$RESET_ARDUINO_PASSWORD" -eq 1 ]]; then
+        if [[ -n "${TACTUS_ARDUINO_PASSWORD:-}" ]]; then
+          stage_pw="$TACTUS_ARDUINO_PASSWORD"
+        else
+          prompt_new_arduino_password
+          stage_pw="$PROMPTED_ARDUINO_PASSWORD"
+        fi
+      fi
+    fi
+  elif [[ "$RESET_ARDUINO_PASSWORD" -eq 1 || -n "$arduino_pw" ]]; then
+    if [[ -n "$arduino_pw" ]]; then
+      stage_pw="$arduino_pw"
+    else
+      prompt_new_arduino_password
+      stage_pw="$PROMPTED_ARDUINO_PASSWORD"
     fi
   fi
 
@@ -248,7 +304,7 @@ run_adb() {
     if [[ "${ADB_CLEANUP_BOOTSTRAP:-0}" -eq 1 ]]; then
       "${ADB_CMD[@]}" shell -T 'nmcli connection delete tactus-bootstrap-wifi >/dev/null 2>&1 || true' || true
     fi
-    "${ADB_CMD[@]}" shell -T 'rm -rf /tmp/tactus-system /tmp/tactus-debs /tmp/tactus-bin /tmp/.tactus-env' >/dev/null 2>&1 || true
+    "${ADB_CMD[@]}" shell -T 'rm -rf /tmp/tactus-system /tmp/tactus-debs /tmp/tactus-bin /tmp/.tactus-env /tmp/.tactus-arduino-pw' >/dev/null 2>&1 || true
   }
   trap adb_cleanup EXIT
 
@@ -278,6 +334,11 @@ run_adb() {
 
   if [[ -n "$AP_PSK" ]]; then
     printf 'TACTUS_AP_PSK=%q\n' "$AP_PSK" | "${ADB_CMD[@]}" shell -T 'umask 077 && cat > /tmp/.tactus-env'
+  fi
+
+  if [[ -n "$stage_pw" ]]; then
+    printf '%s\n' "$stage_pw" | "${ADB_CMD[@]}" shell -T 'umask 077 && cat > /tmp/.tactus-arduino-pw'
+    STAGE_ARDUINO_PW_FILE=1
   fi
 
   # Over USB-C ADB, check if hostapd/dnsmasq/iw need internet to install.
@@ -369,7 +430,7 @@ run_ssh() {
 
   log "Streaming system/ files to ${SSH_TARGET}..."
   COPYFILE_DISABLE=1 tar "${tar_args[@]}" -C "$SYSTEM_DIR" -cf - . | \
-    "${ssh_base[@]}" "$SSH_TARGET" 'rm -rf /tmp/tactus-system /tmp/tactus-debs /tmp/tactus-bin /tmp/.tactus-env && mkdir -p /tmp/tactus-system && tar -C /tmp/tactus-system -xf - && chmod +x /tmp/tactus-system/scripts/*.sh'
+    "${ssh_base[@]}" "$SSH_TARGET" 'rm -rf /tmp/tactus-system /tmp/tactus-debs /tmp/tactus-bin /tmp/.tactus-env /tmp/.tactus-arduino-pw && mkdir -p /tmp/tactus-system && tar -C /tmp/tactus-system -xf - && chmod +x /tmp/tactus-system/scripts/*.sh'
 
   if [[ -n "$DEB_DIR" ]]; then
     log "Streaming offline .deb packages..."
@@ -386,12 +447,23 @@ run_ssh() {
     printf 'TACTUS_AP_PSK=%q\n' "$AP_PSK" | "${ssh_base[@]}" "$SSH_TARGET" 'umask 077 && cat > /tmp/.tactus-env'
   fi
 
-  local prov_args
+  if [[ "$RESET_ARDUINO_PASSWORD" -eq 1 || -n "${TACTUS_ARDUINO_PASSWORD:-}" ]]; then
+    local stage_pw="${TACTUS_ARDUINO_PASSWORD:-}"
+    if [[ -z "$stage_pw" ]]; then
+      prompt_new_arduino_password
+      stage_pw="$PROMPTED_ARDUINO_PASSWORD"
+    fi
+    printf '%s\n' "$stage_pw" | "${ssh_base[@]}" "$SSH_TARGET" 'umask 077 && cat > /tmp/.tactus-arduino-pw'
+    STAGE_ARDUINO_PW_FILE=1
+  fi
+
+  local prov_args host_epoch
   prov_args="$(build_provision_args)"
-  local remote_cmd="if [ -f /tmp/.tactus-env ]; then set -a; . /tmp/.tactus-env; set +a; fi; /tmp/tactus-system/scripts/provision-debian.sh ${prov_args}"
+  host_epoch="$(date -u +%s)"
+  local remote_cmd="if [ \"\$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo no)\" != 'yes' ]; then date -u -s '@${host_epoch}' >/dev/null 2>&1 || true; fi; if [ -f /tmp/.tactus-env ]; then set -a; . /tmp/.tactus-env; set +a; fi; /tmp/tactus-system/scripts/provision-debian.sh ${prov_args}"
 
   log "Running on-board provisioning script via SSH..."
-  local cleanup_cmd='rm -rf /tmp/tactus-system /tmp/tactus-debs /tmp/tactus-bin /tmp/.tactus-env'
+  local cleanup_cmd='rm -rf /tmp/tactus-system /tmp/tactus-debs /tmp/tactus-bin /tmp/.tactus-env /tmp/.tactus-arduino-pw'
   if "${ssh_base[@]}" "$SSH_TARGET" 'sudo -n true' >/dev/null 2>&1; then
     "${ssh_base[@]}" "$SSH_TARGET" "sudo -n bash -c $(printf '%q' "$remote_cmd"); rc=\$?; ${cleanup_cmd}; exit \$rc"
   else
