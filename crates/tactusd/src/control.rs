@@ -1,4 +1,4 @@
-//! Async `tokio` control plane: state hub, MIDI hotplug coordinator, FD reaper, and config sync.
+//! Async `tokio` control plane: state hub, MIDI hotplug coordinator, FD reaper, web UI, and config sync.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,13 +18,14 @@ use crate::log::{log_error, log_info, log_warn};
 use crate::midi::hotplug::UeventMonitor;
 use crate::midi::{close_fd_set, match_port, MidiBackend};
 use crate::rt::{FdReturn, RtMessage, WakeSender};
+use crate::web;
 
-const TELEMETRY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const TELEMETRY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const HOTPLUG_RESCAN_FALLBACK: Duration = Duration::from_secs(5);
 const HOTPLUG_DEBOUNCE: Duration = Duration::from_millis(150);
+const WEB_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Public control-plane handle shared with future M4 (`axum`) and M5 (`arduino-router`) tasks.
-#[allow(dead_code)]
+/// Public control-plane handle shared with M4 (`axum`) and future M5 (`arduino-router`) tasks.
 #[derive(Clone)]
 pub struct ControlHandle {
     pub state_rx: watch::Receiver<AppState>,
@@ -109,11 +110,19 @@ impl StateHub {
         self.state_tx.send_if_modified(|state| {
             let changed = state.available_midi_ports != ports
                 || state.selected_midi_input != new_in_id
-                || state.selected_midi_output != new_out_id;
+                || state.selected_midi_output != new_out_id
+                || state.midi_input_match != self.config.midi.input_port_match
+                || state.midi_output_match != self.config.midi.output_port_match;
             if changed {
                 state.available_midi_ports = ports;
                 state.selected_midi_input.clone_from(&new_in_id);
                 state.selected_midi_output.clone_from(&new_out_id);
+                state
+                    .midi_input_match
+                    .clone_from(&self.config.midi.input_port_match);
+                state
+                    .midi_output_match
+                    .clone_from(&self.config.midi.output_port_match);
             }
             changed
         });
@@ -183,6 +192,19 @@ impl StateHub {
             EngineCommand::SelectMidiPorts { input, output } => {
                 self.config.midi.input_port_match = input;
                 self.config.midi.output_port_match = output;
+                self.state_tx.send_if_modified(|state| {
+                    let changed = state.midi_input_match != self.config.midi.input_port_match
+                        || state.midi_output_match != self.config.midi.output_port_match;
+                    if changed {
+                        state
+                            .midi_input_match
+                            .clone_from(&self.config.midi.input_port_match);
+                        state
+                            .midi_output_match
+                            .clone_from(&self.config.midi.output_port_match);
+                    }
+                    changed
+                });
                 self.persister.schedule_save(self.config.clone());
                 self.reconcile_midi(true).await;
             }
@@ -326,12 +348,17 @@ pub async fn run_control_plane(args: ControlPlaneArgs) {
             midi_offset_ms: args.config.sync.midi_offset_ms,
             ..TelemetrySnapshot::default()
         },
+        midi_input_match: args.config.midi.input_port_match.clone(),
+        midi_output_match: args.config.midi.output_port_match.clone(),
         ..AppState::default()
     };
 
     let (state_tx, state_rx) = watch::channel(initial_state);
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<EngineCommand>(64);
-    let _control_handle = ControlHandle { state_rx, cmd_tx };
+    let control_handle = ControlHandle { state_rx, cmd_tx };
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let web_handle =
+        web::spawn_web_server(&args.config.web.listen_addr, control_handle, shutdown_rx).await;
 
     let uevent = match UeventMonitor::new() {
         Ok(mon) => Some(mon),
@@ -410,6 +437,19 @@ pub async fn run_control_plane(args: ControlPlaneArgs) {
         }
     }
 
+    let _ = shutdown_tx.send(true);
+    if let Some(handle) = web_handle {
+        if tokio::time::timeout(WEB_SHUTDOWN_TIMEOUT, handle)
+            .await
+            .is_err()
+        {
+            log_warn!(
+                "web UI server did not stop within {:?}; continuing shutdown",
+                WEB_SHUTDOWN_TIMEOUT
+            );
+        }
+    }
+
     hub.persister.shutdown().await;
 
     if hub.rt_cmd_tx.push(RtMessage::Shutdown).is_err() {
@@ -468,4 +508,136 @@ async fn shutdown_signal() {
 #[cfg(not(unix))]
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use rtrb::RingBuffer;
+
+    use super::*;
+    use crate::midi::MidiFdSet;
+    use crate::rt::create_rt_wake_pair;
+
+    struct FakeMidiBackend {
+        ports: Mutex<Vec<MidiPortInfo>>,
+    }
+
+    impl FakeMidiBackend {
+        fn new(ports: Vec<MidiPortInfo>) -> Self {
+            Self {
+                ports: Mutex::new(ports),
+            }
+        }
+
+        fn set_ports(&self, ports: Vec<MidiPortInfo>) {
+            *self.ports.lock().expect("lock fake ports") = ports;
+        }
+    }
+
+    impl MidiBackend for FakeMidiBackend {
+        fn enumerate_ports(&self) -> std::io::Result<Vec<MidiPortInfo>> {
+            Ok(self.ports.lock().expect("lock fake ports").clone())
+        }
+
+        fn open_ports(
+            &self,
+            _input: Option<&MidiPortInfo>,
+            _output: Option<&MidiPortInfo>,
+            generation: u64,
+        ) -> std::io::Result<MidiFdSet> {
+            Ok(MidiFdSet {
+                generation,
+                ..MidiFdSet::EMPTY
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_and_select_ports_propagate_match_rules_to_app_state() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("tactus-control-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).expect("create temp test dir");
+        let cfg_path = temp_dir.join("config.toml");
+
+        let config = TactusConfig::default();
+        let initial_state = AppState {
+            midi_input_match: config.midi.input_port_match.clone(),
+            midi_output_match: config.midi.output_port_match.clone(),
+            ..AppState::default()
+        };
+
+        let backend = Arc::new(FakeMidiBackend::new(Vec::new()));
+        let (state_tx, state_rx) = watch::channel(initial_state);
+        let (rt_cmd_tx, mut rt_cmd_rx) = RingBuffer::new(16);
+        let (_tel_tx, tel_rx) = RingBuffer::new(16);
+        let (_fd_ret_tx, fd_ret_rx) = RingBuffer::new(16);
+        let (wake_tx, wake_rx) = create_rt_wake_pair().expect("wake pair");
+
+        let mut hub = StateHub {
+            config,
+            persister: ConfigPersister::spawn(cfg_path),
+            backend: Arc::clone(&backend) as Arc<dyn MidiBackend>,
+            rt_cmd_tx,
+            tel_rx,
+            fd_ret_rx,
+            wake_tx,
+            state_tx,
+            attached_input_id: None,
+            attached_output_id: None,
+            fd_generation: 0,
+            last_logged_snap: None,
+            last_ports: Vec::new(),
+            ports_logged_once: false,
+        };
+
+        // Empty device list preserves saved match rules while selected IDs stay None.
+        hub.reconcile_midi(false).await;
+        {
+            let state = state_rx.borrow();
+            assert_eq!(state.midi_input_match, "WIDI");
+            assert_eq!(state.midi_output_match, "WIDI");
+            assert_eq!(state.selected_midi_input, None);
+            assert_eq!(state.selected_midi_output, None);
+        }
+
+        // Plugging in matching WIDI port selects it.
+        backend.set_ports(vec![MidiPortInfo {
+            id: "hw:1,0,0".to_string(),
+            card_name: "WIDI Uhost".to_string(),
+            port_name: "WIDI Uhost MIDI 1".to_string(),
+            can_read: true,
+            can_write: true,
+        }]);
+        hub.reconcile_midi(false).await;
+        while rt_cmd_rx.pop().is_ok() {}
+        {
+            let state = state_rx.borrow();
+            assert_eq!(state.selected_midi_input.as_deref(), Some("hw:1,0,0"));
+            assert_eq!(state.selected_midi_output.as_deref(), Some("hw:1,0,0"));
+            assert_eq!(state.midi_input_match, "WIDI");
+            assert_eq!(state.midi_output_match, "WIDI");
+        }
+
+        // Changing rules updates persisted matches immediately even if new rule has no hardware match.
+        hub.handle_command(EngineCommand::SelectMidiPorts {
+            input: "Rev2".to_string(),
+            output: String::new(),
+        })
+        .await;
+        while rt_cmd_rx.pop().is_ok() {}
+        {
+            let state = state_rx.borrow();
+            assert_eq!(state.midi_input_match, "Rev2");
+            assert_eq!(state.midi_output_match, "");
+            assert_eq!(state.selected_midi_input, None);
+            assert_eq!(state.selected_midi_output, None);
+        }
+
+        drop(wake_rx);
+        hub.persister.shutdown().await;
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }

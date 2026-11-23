@@ -150,20 +150,36 @@ midi_offset_ms = -3.5
     #[test]
     fn json_round_trip_for_commands_and_app_state() {
         let commands = [
-            EngineCommand::SetDirection(Direction::MidiToLink),
-            EngineCommand::SetStartStopSync(false),
-            EngineCommand::SetOffsetMs(12.5),
-            EngineCommand::SetQuantum(3.0),
-            EngineCommand::SelectMidiPorts {
-                input: "WIDI".to_string(),
-                output: "WIDI".to_string(),
-            },
-            EngineCommand::ResyncDownbeat,
-            EngineCommand::SetLinkTempoManual(128.0),
+            (
+                EngineCommand::SetDirection(Direction::MidiToLink),
+                r#"{"set_direction":"midi_to_link"}"#,
+            ),
+            (
+                EngineCommand::SetStartStopSync(false),
+                r#"{"set_start_stop_sync":false}"#,
+            ),
+            (
+                EngineCommand::SetOffsetMs(12.5),
+                r#"{"set_offset_ms":12.5}"#,
+            ),
+            (EngineCommand::SetQuantum(3.0), r#"{"set_quantum":3.0}"#),
+            (
+                EngineCommand::SelectMidiPorts {
+                    input: "WIDI".to_string(),
+                    output: "WIDI".to_string(),
+                },
+                r#"{"select_midi_ports":{"input":"WIDI","output":"WIDI"}}"#,
+            ),
+            (EngineCommand::ResyncDownbeat, r#""resync_downbeat""#),
+            (
+                EngineCommand::SetLinkTempoManual(128.0),
+                r#"{"set_link_tempo_manual":128.0}"#,
+            ),
         ];
 
-        for cmd in commands {
+        for (cmd, expected_wire) in commands {
             let json = serde_json::to_string(&cmd).expect("command serialize");
+            assert_eq!(json, expected_wire);
             let back: EngineCommand = serde_json::from_str(&json).expect("command deserialize");
             assert_eq!(back, cmd);
         }
@@ -190,12 +206,24 @@ midi_offset_ms = -3.5
                 can_read: true,
                 can_write: true,
             }],
-            selected_midi_input: Some("WIDI Uhost".to_string()),
-            selected_midi_output: Some("WIDI Uhost".to_string()),
+            selected_midi_input: Some("hw:1,0,0".to_string()),
+            selected_midi_output: Some("hw:1,0,0".to_string()),
+            midi_input_match: "WIDI".to_string(),
+            midi_output_match: "WIDI".to_string(),
         };
 
         let json = serde_json::to_string(&state).expect("state serialize");
         let back: AppState = serde_json::from_str(&json).expect("state deserialize");
         assert_eq!(back, state);
+
+        // Verify backward compatibility when midi_input_match / midi_output_match are omitted.
+        let legacy_json = json
+            .replace(r#","midi_input_match":"WIDI""#, "")
+            .replace(r#","midi_output_match":"WIDI""#, "");
+        let legacy_back: AppState =
+            serde_json::from_str(&legacy_json).expect("legacy AppState deserialize");
+        assert_eq!(legacy_back.midi_input_match, "");
+        assert_eq!(legacy_back.midi_output_match, "");
+        assert_eq!(legacy_back.selected_midi_input, state.selected_midi_input);
     }
 }

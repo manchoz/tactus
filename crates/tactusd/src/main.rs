@@ -1,4 +1,4 @@
-//! Tactus appliance daemon (`tactusd`) — headless RT sync engine, RawMIDI hotplug & atomic config.
+//! Tactus appliance daemon (`tactusd`) — RT sync engine, RawMIDI hotplug, atomic config, and Web UI.
 
 mod clock;
 mod config_store;
@@ -7,6 +7,7 @@ mod log;
 mod midi;
 mod rt;
 mod rt_os;
+mod web;
 
 use std::env;
 use std::path::PathBuf;

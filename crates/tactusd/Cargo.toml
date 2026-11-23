@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "json"] }
 libc = "0.2"
 rtrb = "0.3"
+serde_json.workspace = true
 tactus-link-sys = { path = "../tactus-link-sys" }
 tactus-protocol = { path = "../tactus-protocol" }
 tactus-sync-core = { path = "../tactus-sync-core" }

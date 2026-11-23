@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Tactus">
+  <meta name="theme-color" content="#0d0f14">
+  <title>Tactus</title>
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+  <link rel="icon" type="image/svg+xml" href="/icon.svg">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <h1>TACTUS</h1>
+      </div>
+      <div class="status-pills">
+        <span id="conn-pill" class="pill pill-offline">OFFLINE</span>
+        <span id="peers-pill" class="pill pill-neutral">0 LINK</span>
+      </div>
+    </header>
+
+    <section class="card hero-card" aria-label="Tempo and Phase">
+      <div class="hero-badges">
+        <span id="transport-badge" class="badge badge-stopped">STOPPED</span>
+        <span id="lock-badge" class="badge badge-neutral">LINK MASTER</span>
+      </div>
+
+      <div class="bpm-block">
+        <button id="bpm-btn" class="bpm-readout" type="button" aria-label="Tempo in BPM">
+          <span id="bpm-value">120.0</span>
+          <span class="bpm-unit">BPM</span>
+        </button>
+
+        <form id="bpm-editor" class="bpm-editor hidden">
+          <input id="bpm-input" type="number" inputmode="decimal" step="0.1" min="20" max="300" aria-label="Manual Link BPM">
+          <button type="submit" class="btn btn-accent btn-sm">Set</button>
+          <button id="bpm-cancel" type="button" class="btn btn-ghost btn-sm">Cancel</button>
+        </form>
+
+        <div id="bpm-nudge-row" class="bpm-nudge-row" role="group" aria-label="Manual Link Tempo Nudge">
+          <button type="button" class="btn btn-step" data-bpm-delta="-1">-1</button>
+          <button type="button" class="btn btn-step" data-bpm-delta="-0.5">-0.5</button>
+          <button type="button" class="btn btn-step" data-bpm-delta="0.5">+0.5</button>
+          <button type="button" class="btn btn-step" data-bpm-delta="1">+1</button>
+        </div>
+
+        <div id="midi-diag-row" class="diag-row hidden" aria-label="MIDI Clock Estimator Diagnostics">
+          <div class="diag-cell">
+            <span class="diag-label">MIDI 10s</span>
+            <span id="diag-long" class="diag-val">--.--</span>
+          </div>
+          <div class="diag-cell">
+            <span class="diag-label">Fast 1.5s</span>
+            <span id="diag-fast" class="diag-val">--.--</span>
+          </div>
+          <div class="diag-cell">
+            <span class="diag-label">Phase Err</span>
+            <span id="diag-phase" class="diag-val">+0.0 ms</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="phase-section">
+        <div id="beat-strip" class="beat-strip" aria-label="Bar Beat Position"></div>
+        <div class="phase-track" aria-hidden="true">
+          <div id="phase-bar-fill" class="phase-fill"></div>
+        </div>
+      </div>
+
+      <button id="resync-btn" type="button" class="btn btn-resync">
+        Resync Downbeat
+      </button>
+    </section>
+
+    <section class="card control-card" aria-label="Sync Direction">
+      <div class="section-label">Direction</div>
+      <div class="segmented segmented-2" role="group" aria-label="Sync Direction">
+        <button id="dir-link-to-midi" type="button" class="seg-btn active" data-dir="link_to_midi">
+          Link &rarr; MIDI
+        </button>
+        <button id="dir-midi-to-link" type="button" class="seg-btn" data-dir="midi_to_link">
+          MIDI &rarr; Link
+        </button>
+      </div>
+    </section>
+
+    <section class="card control-card" aria-label="Sync Parameters">
+      <div class="switch-row">
+        <div>
+          <div class="control-title">Start / Stop Sync</div>
+          <div class="control-sub">Transport 0xFA / 0xFC</div>
+        </div>
+        <button id="start-stop-toggle" type="button" class="switch" role="switch" aria-checked="true" aria-label="Start Stop Sync">
+          <span class="switch-thumb"></span>
+        </button>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="offset-block">
+        <div class="offset-header">
+          <span class="control-title">MIDI Latency Offset</span>
+          <div class="offset-actions">
+            <span id="offset-readout" class="mono-val">+0.0 ms</span>
+            <button id="offset-reset" type="button" class="btn btn-ghost btn-xs">0 ms</button>
+          </div>
+        </div>
+        <div class="slider-row">
+          <button id="offset-minus" type="button" class="btn btn-step btn-sm" aria-label="Decrease offset 0.5 ms">-0.5</button>
+          <input id="offset-slider" type="range" min="-50" max="50" step="0.5" value="0" aria-label="MIDI Latency Offset in milliseconds">
+          <button id="offset-plus" type="button" class="btn btn-step btn-sm" aria-label="Increase offset 0.5 ms">+0.5</button>
+        </div>
+        <div class="slider-scale" aria-hidden="true">
+          <span>-50 ms</span>
+          <span>0</span>
+          <span>+50 ms</span>
+        </div>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="quantum-block">
+        <div class="quantum-header">
+          <span class="control-title">Bar Quantum</span>
+          <span id="quantum-custom" class="control-sub"></span>
+        </div>
+        <div class="segmented segmented-4" role="group" aria-label="Bar Quantum in Beats">
+          <button type="button" class="seg-btn" data-quantum="3">3</button>
+          <button type="button" class="seg-btn active" data-quantum="4">4</button>
+          <button type="button" class="seg-btn" data-quantum="6">6</button>
+          <button type="button" class="seg-btn" data-quantum="8">8</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card control-card" aria-label="MIDI Ports">
+      <div class="port-block">
+        <div class="port-header">
+          <label for="midi-in" class="control-title">MIDI Input</label>
+          <span id="midi-in-status" class="port-status port-wait">Waiting</span>
+        </div>
+        <select id="midi-in" class="select-input"></select>
+      </div>
+
+      <div class="port-block">
+        <div class="port-header">
+          <label for="midi-out" class="control-title">MIDI Output</label>
+          <span id="midi-out-status" class="port-status port-wait">Waiting</span>
+        </div>
+        <select id="midi-out" class="select-input"></select>
+      </div>
+
+      <p id="midi-empty-hint" class="empty-hint hidden">
+        No USB-MIDI interface detected. Connect a class-compliant USB-MIDI adapter; Tactus attaches automatically.
+      </p>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

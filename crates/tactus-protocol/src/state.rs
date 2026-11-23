@@ -28,4 +28,10 @@ pub struct AppState {
     pub selected_midi_input: Option<String>,
     /// Currently selected MIDI output port match or identifier.
     pub selected_midi_output: Option<String>,
+    /// Configured MIDI input match rule persisted in `config.toml` (e.g. `"WIDI"` or port name).
+    #[serde(default)]
+    pub midi_input_match: String,
+    /// Configured MIDI output match rule persisted in `config.toml` (e.g. `"WIDI"` or port name).
+    #[serde(default)]
+    pub midi_output_match: String,
 }
