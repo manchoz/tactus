@@ -185,13 +185,13 @@ REMOTE_CREATED=0
 cleanup() {
   local rc=$?
   if [[ "$REMOTE_CREATED" -eq 1 ]]; then
-    ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "rm -rf '$REMOTE_DIR'" >/dev/null 2>&1 || true
+    ssh "${SSH_OPTS[@]}" "$SSH_TARGET" rm -rf -- "$REMOTE_DIR" >/dev/null 2>&1 || true
   fi
   return "$rc"
 }
 trap cleanup EXIT
 
-ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "mkdir -p '$REMOTE_DIR'"
+ssh "${SSH_OPTS[@]}" "$SSH_TARGET" mkdir -p -- "$REMOTE_DIR"
 REMOTE_CREATED=1
 
 STAGED_FILES=("$OPENOCD_ADAPTER_CFG" "$OPENOCD_FLASH_CFG")

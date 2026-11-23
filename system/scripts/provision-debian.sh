@@ -255,8 +255,7 @@ install_packages() {
   if [[ ${#missing[@]} -gt 0 ]]; then
     if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo no)" != "yes" ]]; then
       systemctl restart systemd-timesyncd.service 2>/dev/null || true
-      local t_wait
-      for t_wait in 1 2 3 4 5; do
+      for _ in 1 2 3 4 5; do
         if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo no)" == "yes" ]]; then
           break
         fi
@@ -629,8 +628,7 @@ activate_ap() {
   systemctl restart tactus-ap.service
   systemctl restart tactus-dhcp.service
 
-  local ap_wait
-  for ap_wait in 1 2 3 4 5 6 7 8 9 10; do
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
     if /usr/sbin/iw dev wlan0 info 2>/dev/null | grep -q 'type AP' &&
        ip -4 -br addr show dev wlan0 2>/dev/null | grep -q '10\.42\.0\.1/24'; then
       break
@@ -746,10 +744,10 @@ verify_board() {
     failures=$((failures + 1))
   fi
 
-  local avahi_pid avahi_established=0 avahi_wait
+  local avahi_pid avahi_established=0
   avahi_pid="$(systemctl show -p MainPID --value avahi-daemon.service 2>/dev/null || true)"
   if [[ -n "$avahi_pid" && "$avahi_pid" != "0" ]]; then
-    for avahi_wait in 1 2 3 4 5 6 7 8 9 10; do
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
       if journalctl -u avahi-daemon.service _PID="$avahi_pid" --no-pager 2>/dev/null |
          grep -Fq '(/services/tactus.service) successfully established'; then
         avahi_established=1

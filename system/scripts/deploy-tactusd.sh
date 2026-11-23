@@ -121,7 +121,7 @@ UPLOADED=0
 cleanup() {
   local rc=$?
   if [[ "$UPLOADED" -eq 1 ]]; then
-    ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "rm -f '$REMOTE_TMP'" >/dev/null 2>&1 || true
+    ssh "${SSH_OPTS[@]}" "$SSH_TARGET" rm -f -- "$REMOTE_TMP" >/dev/null 2>&1 || true
   fi
   return "$rc"
 }

@@ -377,6 +377,7 @@ run_adb() {
   # Over USB-C ADB, check if hostapd/dnsmasq/iw need internet to install.
   if [[ "$ROLLBACK_AP" -eq 0 && "$STAGE_ONLY" -eq 0 && -z "$DEB_DIR" ]]; then
     local missing_pkgs
+    # shellcheck disable=SC2016
     missing_pkgs="$("${ADB_CMD[@]}" shell -T 'for p in hostapd dnsmasq iw; do dpkg -s "$p" >/dev/null 2>&1 || echo "$p"; done' | tr '\r\n' ' ' | xargs)"
     local has_route
     has_route="$("${ADB_CMD[@]}" shell -T 'ip -4 route show default | grep -q "^default" && echo yes || echo no' | tr -d '\r')"
@@ -409,8 +410,7 @@ run_adb() {
           echo "error: failed to connect wlan0 to '${WIFI_SSID}' after 3 attempts" >&2
           exit 1
         fi
-        local i
-        for i in $(seq 1 15); do
+        for _ in {1..15}; do
           if [[ "$("${ADB_CMD[@]}" shell -T 'ip -4 route show default | grep -q "^default" && echo yes || echo no' | tr -d '\r')" == "yes" ]]; then
             break
           fi
