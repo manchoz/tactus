@@ -10,6 +10,7 @@ use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::serve::ListenerExt;
 use axum::{Json, Router};
 use tactus_protocol::EngineCommand;
 use tokio::net::TcpListener;
@@ -76,6 +77,8 @@ fn ui_asset_hash() -> &'static str {
             STYLE_CSS.as_bytes(),
             APP_JS.as_bytes(),
             MANIFEST_JSON.as_bytes(),
+            ICON_SVG.as_bytes(),
+            APPLE_TOUCH_ICON_PNG,
         ] {
             for &b in chunk {
                 h ^= u64::from(b);
@@ -99,7 +102,33 @@ fn rendered_index_html() -> &'static [u8] {
                 &format!("href=\"/style.css?v={hash}\""),
             )
             .replace("src=\"/app.js\"", &format!("src=\"/app.js?v={hash}\""))
+            .replace(
+                "href=\"/manifest.webmanifest\"",
+                &format!("href=\"/manifest.webmanifest?v={hash}\""),
+            )
+            .replace(
+                "href=\"/icon.svg\"",
+                &format!("href=\"/icon.svg?v={hash}\""),
+            )
+            .replace(
+                "href=\"/apple-touch-icon.png\"",
+                &format!("href=\"/apple-touch-icon.png?v={hash}\""),
+            )
             .replacen("</head>", &meta, 1)
+            .into_bytes()
+    })
+}
+
+fn rendered_manifest_json() -> &'static [u8] {
+    static RENDERED: OnceLock<Vec<u8>> = OnceLock::new();
+    RENDERED.get_or_init(|| {
+        let hash = ui_asset_hash();
+        MANIFEST_JSON
+            .replace(
+                "\"/apple-touch-icon.png\"",
+                &format!("\"/apple-touch-icon.png?v={hash}\""),
+            )
+            .replace("\"/icon.svg\"", &format!("\"/icon.svg?v={hash}\""))
             .into_bytes()
     })
 }
@@ -160,7 +189,7 @@ pub fn build_router(control: ControlHandle, shutdown_rx: watch::Receiver<bool>) 
             get(|| async {
                 no_store_asset(
                     "application/manifest+json; charset=utf-8",
-                    MANIFEST_JSON.as_bytes(),
+                    rendered_manifest_json(),
                 )
             }),
         )
@@ -206,6 +235,12 @@ pub async fn spawn_web_server(
         .local_addr()
         .map_or_else(|_| listen_addr.to_string(), |a| a.to_string());
     log_info!("web UI listening on http://{bound_addr}");
+
+    let listener = listener.tap_io(|tcp_stream| {
+        if let Err(err) = tcp_stream.set_nodelay(true) {
+            log_warn!("failed to set TCP_NODELAY on web client socket: {err}");
+        }
+    });
 
     let router = build_router(control, shutdown_rx.clone());
     let mut graceful_rx = shutdown_rx;
@@ -574,22 +609,32 @@ mod tests {
         assert!(hdr_lower.contains("pragma: no-cache"));
         let html = String::from_utf8(body).expect("utf8 index");
         assert!(html.contains("apple-mobile-web-app-capable"));
-        assert!(html.contains("/apple-touch-icon.png"));
         assert!(html.contains("clock-thru-toggle"));
+        assert!(html.contains("play-stop-btn"));
+        assert!(html.contains("round-bpm-toggle"));
         assert!(html.contains("midi-out-list"));
         assert!(html.contains(&format!(
             r#"<meta name="tactus-ui-hash" content="{ui_hash}">"#
         )));
         assert!(html.contains(&format!("/style.css?v={ui_hash}")));
         assert!(html.contains(&format!("/app.js?v={ui_hash}")));
+        assert!(html.contains(&format!("/manifest.webmanifest?v={ui_hash}")));
+        assert!(html.contains(&format!("/icon.svg?v={ui_hash}")));
+        assert!(html.contains(&format!("/apple-touch-icon.png?v={ui_hash}")));
 
         let css_versioned = format!("/style.css?v={ui_hash}");
         let js_versioned = format!("/app.js?v={ui_hash}");
+        let manifest_versioned = format!("/manifest.webmanifest?v={ui_hash}");
+        let icon_versioned = format!("/icon.svg?v={ui_hash}");
         for (path, ctype_sub, expect_no_store) in [
             (css_versioned.as_str(), "text/css", true),
             (js_versioned.as_str(), "application/javascript", true),
-            ("/manifest.webmanifest", "application/manifest+json", true),
-            ("/icon.svg", "image/svg+xml", false),
+            (
+                manifest_versioned.as_str(),
+                "application/manifest+json",
+                true,
+            ),
+            (icon_versioned.as_str(), "image/svg+xml", false),
         ] {
             let (h, b) = http_get(&srv, path).await;
             assert!(h.starts_with("HTTP/1.1 200"), "{path} status: {h}");
@@ -599,9 +644,23 @@ mod tests {
                 assert!(h_lower.contains("no-store"), "{path} cache: {h}");
             }
             assert!(!b.is_empty(), "{path} empty");
+            if path == manifest_versioned {
+                let manifest: serde_json::Value =
+                    serde_json::from_slice(&b).expect("manifest json");
+                let icons = manifest["icons"].as_array().expect("manifest icons");
+                assert_eq!(
+                    icons[0]["src"].as_str(),
+                    Some(format!("/apple-touch-icon.png?v={ui_hash}").as_str())
+                );
+                assert_eq!(
+                    icons[1]["src"].as_str(),
+                    Some(format!("/icon.svg?v={ui_hash}").as_str())
+                );
+            }
         }
 
-        let (png_hdr, png_body) = http_get(&srv, "/apple-touch-icon.png").await;
+        let png_versioned = format!("/apple-touch-icon.png?v={ui_hash}");
+        let (png_hdr, png_body) = http_get(&srv, &png_versioned).await;
         assert!(png_hdr.starts_with("HTTP/1.1 200"));
         assert!(png_body.starts_with(b"\x89PNG\r\n\x1a\n"));
 
@@ -663,6 +722,18 @@ mod tests {
         assert_eq!(
             srv.cmd_rx.recv().await,
             Some(EngineCommand::SetClockThru(false))
+        );
+
+        ws_send_client_text(&mut ws, r#"{"set_link_playing":true}"#).await;
+        assert_eq!(
+            srv.cmd_rx.recv().await,
+            Some(EngineCommand::SetLinkPlaying(true))
+        );
+
+        ws_send_client_text(&mut ws, r#"{"set_round_bpm":true}"#).await;
+        assert_eq!(
+            srv.cmd_rx.recv().await,
+            Some(EngineCommand::SetRoundBpm(true))
         );
 
         ws_send_client_text(

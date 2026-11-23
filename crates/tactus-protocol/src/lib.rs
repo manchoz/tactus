@@ -50,6 +50,12 @@ mod tests {
         let rt = RtCommand::try_from(&EngineCommand::SetLinkTempoManual(124.0));
         assert_eq!(rt, Ok(RtCommand::SetLinkTempoManual(124.0)));
 
+        let rt = RtCommand::try_from(&EngineCommand::SetLinkPlaying(true));
+        assert_eq!(rt, Ok(RtCommand::SetLinkPlaying(true)));
+
+        let rt = RtCommand::try_from(&EngineCommand::SetRoundBpm(true));
+        assert_eq!(rt, Ok(RtCommand::SetRoundBpm(true)));
+
         let non_rt = RtCommand::try_from(&EngineCommand::SelectMidiPorts {
             input: "WIDI Uhost".to_string(),
             outputs: vec!["WIDI Uhost".to_string(), "OP-XY".to_string()],
@@ -89,6 +95,27 @@ socket_path = "/var/run/arduino-router.sock"
         let parsed: TactusConfig = toml::from_str(spec_toml).expect("SPEC.md TOML should parse");
         assert_eq!(parsed, TactusConfig::default());
         assert_eq!(parsed.validate(), Ok(()));
+
+        let explicit_defaults_toml = r#"
+[sync]
+initial_bpm = 120.0
+round_bpm = false
+"#;
+        let parsed_defaults: TactusConfig =
+            toml::from_str(explicit_defaults_toml).expect("explicit defaults TOML should parse");
+        assert_eq!(parsed_defaults, TactusConfig::default());
+        assert_eq!(parsed_defaults.validate(), Ok(()));
+
+        let custom_sync_toml = r#"
+[sync]
+initial_bpm = 128.5
+round_bpm = true
+"#;
+        let parsed_custom: TactusConfig =
+            toml::from_str(custom_sync_toml).expect("custom sync TOML should parse");
+        assert_eq!(parsed_custom.sync.initial_bpm, 128.5);
+        assert!(parsed_custom.sync.round_bpm);
+        assert_eq!(parsed_custom.validate(), Ok(()));
     }
 
     #[test]
@@ -188,6 +215,48 @@ midi_offset_ms = -3.5
 
         let cfg = TactusConfig {
             sync: SyncConfig {
+                ols_window_secs: 30.0,
+                ..SyncConfig::default()
+            },
+            ..TactusConfig::default()
+        };
+        assert_eq!(cfg.validate(), Ok(()));
+
+        for bad_ols in [30.1, f64::INFINITY] {
+            let cfg = TactusConfig {
+                sync: SyncConfig {
+                    ols_window_secs: bad_ols,
+                    ..SyncConfig::default()
+                },
+                ..TactusConfig::default()
+            };
+            assert!(cfg.validate().is_err());
+        }
+
+        for ok_bpm in [20.0, 120.0, 999.0] {
+            let cfg = TactusConfig {
+                sync: SyncConfig {
+                    initial_bpm: ok_bpm,
+                    ..SyncConfig::default()
+                },
+                ..TactusConfig::default()
+            };
+            assert_eq!(cfg.validate(), Ok(()));
+        }
+
+        for bad_bpm in [19.9, 1000.0, f64::NAN] {
+            let cfg = TactusConfig {
+                sync: SyncConfig {
+                    initial_bpm: bad_bpm,
+                    ..SyncConfig::default()
+                },
+                ..TactusConfig::default()
+            };
+            assert!(cfg.validate().is_err());
+        }
+
+        let cfg = TactusConfig {
+            sync: SyncConfig {
                 step_change_beats: 0,
                 ..SyncConfig::default()
             },
@@ -228,6 +297,14 @@ midi_offset_ms = -3.5
                 EngineCommand::SetLinkTempoManual(128.0),
                 r#"{"set_link_tempo_manual":128.0}"#,
             ),
+            (
+                EngineCommand::SetLinkPlaying(true),
+                r#"{"set_link_playing":true}"#,
+            ),
+            (
+                EngineCommand::SetRoundBpm(true),
+                r#"{"set_round_bpm":true}"#,
+            ),
         ];
 
         for (cmd, expected_wire) in commands {
@@ -252,6 +329,7 @@ midi_offset_ms = -3.5
                 link_peers: 2,
                 is_playing: true,
                 midi_offset_ms: 1.5,
+                round_bpm: true,
             },
             available_midi_ports: vec![MidiPortInfo {
                 id: "hw:1,0,0".to_string(),
@@ -272,11 +350,13 @@ midi_offset_ms = -3.5
 
         // Verify backward compatibility when new fields are omitted.
         let legacy_json = json
+            .replace(r#","round_bpm":true"#, "")
             .replace(r#","midi_input_match":"OP-XY""#, "")
             .replace(r#","midi_output_matches":["WIDI","OP-XY"]"#, "")
             .replace(r#","selected_midi_outputs":["hw:1,0,0","hw:2,0,0"]"#, "");
         let legacy_back: AppState =
             serde_json::from_str(&legacy_json).expect("legacy AppState deserialize");
+        assert!(!legacy_back.telemetry.round_bpm);
         assert_eq!(legacy_back.midi_input_match, "");
         assert!(legacy_back.midi_output_matches.is_empty());
         assert!(legacy_back.selected_midi_outputs.is_empty());

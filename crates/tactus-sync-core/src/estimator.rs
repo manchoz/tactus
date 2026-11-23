@@ -2,8 +2,10 @@
 
 use tactus_protocol::{LockState, SyncConfig};
 
-use crate::link::{ns_to_us, LinkSession};
-use crate::ring::{ClockSample, SampleRing, FAST_RING_CAPACITY, LONG_RING_CAPACITY};
+use crate::link::{ns_to_us, offset_ms_to_ns, LinkSession};
+use crate::ring::{
+    ClockSample, SampleRing, FAST_RING_CAPACITY, LONG_RING_CAPACITY, MAX_VALID_BPM, MIN_VALID_BPM,
+};
 
 /// Incoming MIDI clock silence threshold before transitioning to `Unlocked` (`SPEC.md §2.3.5`).
 pub const MIDI_TIMEOUT_NS: i64 = 500_000_000;
@@ -11,6 +13,16 @@ pub const MIDI_TIMEOUT_NS: i64 = 500_000_000;
 const MIN_OLS_TICKS: usize = 24;
 const TICKS_PER_BEAT_U64: u64 = 24;
 const START_LAUNCH_MARGIN_US: i64 = 1_000;
+const LONG_OLS_LOCKED_STRIDE: u64 = 6;
+
+#[inline]
+fn commit_bpm(raw_bpm: f64, round_bpm: bool) -> f64 {
+    if round_bpm {
+        raw_bpm.round().clamp(MIN_VALID_BPM, MAX_VALID_BPM)
+    } else {
+        raw_bpm
+    }
+}
 
 /// State machine implementing `SPEC.md §2.3` (`MidiToLink`).
 #[derive(Debug, Clone)]
@@ -130,16 +142,16 @@ impl MidiToLinkEstimator {
         self.expecting_downbeat_tick = true;
         self.phase_error_ms = 0.0;
 
-        let now_us = ns_to_us(now_ns);
+        let start_us = ns_to_us(now_ns.saturating_add(offset_ms_to_ns(config.midi_offset_ms)));
         // Force session beat 0 to the incoming MIDI Start instant (`Link.hpp` recommends
         // `forceBeatAtTime` for external clock bridges; `requestBeatAtTime` is a no-op on
         // session phase when `peers > 0` and triggers up to a 1-bar preroll on Link peers).
-        link.force_beat_at_time(0.0, now_us, config.quantum);
+        link.force_beat_at_time(0.0, start_us, config.quantum);
         if config.start_stop_sync {
             // Place `startStopState` 1 ms before forced beat 0 so remote peers running
-            // `requestBeatAtStartPlayingTime(0, quantum)` always snap immediately to `now_us`
+            // `requestBeatAtStartPlayingTime(0, quantum)` always snap immediately to `start_us`
             // instead of rolling forward by a full quantum on +1 us clock-transform rounding.
-            link.set_is_playing(true, now_us.saturating_sub(START_LAUNCH_MARGIN_US));
+            link.set_is_playing(true, start_us.saturating_sub(START_LAUNCH_MARGIN_US));
         }
     }
 
@@ -208,16 +220,27 @@ impl MidiToLinkEstimator {
             .is_some_and(|start| now_ns.saturating_sub(start) >= fast_window_ns)
             && self.fast_ring.len() >= MIN_OLS_TICKS;
 
-        let long_est = if long_ready {
-            self.long_ring.ols_estimate()
+        let compute_long = long_ready
+            && (self.lock_state != LockState::Locked
+                || is_beat_boundary
+                || self
+                    .monotonic_tick_index
+                    .is_multiple_of(LONG_OLS_LOCKED_STRIDE)
+                || self.bpm_midi_long.is_none());
+        let long_est = if compute_long {
+            let est = self.long_ring.ols_estimate();
+            self.bpm_midi_long = est.map(|e| e.bpm);
+            est
         } else {
+            if !long_ready {
+                self.bpm_midi_long = None;
+            }
             None
         };
-        self.bpm_midi_long = long_est.map(|e| e.bpm);
 
         // Once Locked with an active long window, fast OLS is only needed on beat boundaries.
-        let compute_fast = fast_ready
-            && (self.lock_state != LockState::Locked || is_beat_boundary || long_est.is_none());
+        let compute_fast =
+            fast_ready && (self.lock_state != LockState::Locked || is_beat_boundary || !long_ready);
         let fast_est = if compute_fast {
             let est = self.fast_ring.ols_estimate();
             self.bpm_midi_fast = est.map(|e| e.bpm);
@@ -235,7 +258,7 @@ impl MidiToLinkEstimator {
             }
             LockState::Acquiring => {
                 if let Some(est) = long_est {
-                    link.set_tempo(est.bpm, ns_to_us(now_ns));
+                    link.set_tempo(commit_bpm(est.bpm, config.round_bpm), ns_to_us(now_ns));
                     self.lock_state = LockState::Locked;
                     self.step_change_beats_count = 0;
                     self.step_change_sign = 0;
@@ -263,8 +286,9 @@ impl MidiToLinkEstimator {
                                 self.long_ring.push(sample);
                                 self.long_start_ns = Some(now_ns);
                                 self.bpm_midi_long = None;
-                                link.set_tempo(fast.bpm, ns_to_us(now_ns));
-                                link_bpm = fast.bpm;
+                                let target_bpm = commit_bpm(fast.bpm, config.round_bpm);
+                                link.set_tempo(target_bpm, ns_to_us(now_ns));
+                                link_bpm = target_bpm;
                                 self.step_change_beats_count = 0;
                                 self.step_change_sign = 0;
                                 step_triggered = true;
@@ -278,8 +302,16 @@ impl MidiToLinkEstimator {
 
                 if !step_triggered {
                     if let Some(long) = long_est {
-                        if (long.bpm - link_bpm).abs() > config.bpm_deadband {
-                            link.set_tempo(long.bpm, ns_to_us(now_ns));
+                        let target_bpm = commit_bpm(long.bpm, config.round_bpm);
+                        let should_commit = if config.round_bpm {
+                            (target_bpm - link_bpm).abs() > config.bpm_deadband
+                                && ((long.bpm - link_bpm).abs() > 0.5 + config.bpm_deadband
+                                    || (link_bpm - link_bpm.round()).abs() > 1e-6)
+                        } else {
+                            (target_bpm - link_bpm).abs() > config.bpm_deadband
+                        };
+                        if should_commit {
+                            link.set_tempo(target_bpm, ns_to_us(now_ns));
                         }
                     }
                 }
@@ -288,7 +320,9 @@ impl MidiToLinkEstimator {
                     let denoised_ns = long_est
                         .or(fast_est)
                         .map_or(now_ns, |est| est.predicted_newest_ns);
-                    let beat_ts_us = ns_to_us(denoised_ns);
+                    let beat_ts_us = ns_to_us(
+                        denoised_ns.saturating_add(offset_ms_to_ns(config.midi_offset_ms)),
+                    );
 
                     if self.pending_resync_downbeat {
                         self.pending_resync_downbeat = false;

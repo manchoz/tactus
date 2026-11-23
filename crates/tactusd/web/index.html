@@ -75,9 +75,14 @@
         </div>
       </div>
 
-      <button id="resync-btn" type="button" class="btn btn-resync">
-        Resync Downbeat
-      </button>
+      <div class="hero-actions">
+        <button id="play-stop-btn" type="button" class="btn btn-transport" aria-pressed="false">
+          Play
+        </button>
+        <button id="resync-btn" type="button" class="btn btn-resync">
+          Resync Downbeat
+        </button>
+      </div>
     </section>
 
     <section class="card control-card" aria-label="Sync Direction">
@@ -111,6 +116,19 @@
             <div class="control-sub">Relay MIDI In to other outputs</div>
           </div>
           <button id="clock-thru-toggle" type="button" class="switch" role="switch" aria-checked="true" aria-label="MIDI Clock Thru">
+            <span class="switch-thumb"></span>
+          </button>
+        </div>
+      </div>
+
+      <div id="round-bpm-block" class="clock-thru-block hidden">
+        <div class="divider"></div>
+        <div class="switch-row">
+          <div>
+            <div class="control-title">Round BPM to Integer</div>
+            <div class="control-sub">Snap Link tempo to whole BPM</div>
+          </div>
+          <button id="round-bpm-toggle" type="button" class="switch" role="switch" aria-checked="false" aria-label="Round BPM to Integer">
             <span class="switch-thumb"></span>
           </button>
         </div>

@@ -76,6 +76,8 @@ pub struct SyncConfig {
     pub start_stop_sync: bool,
     pub clock_thru: bool,
     pub quantum: f64,
+    pub initial_bpm: f64,
+    pub round_bpm: bool,
     pub midi_offset_ms: f32,
     pub ols_window_secs: f64,
     pub fast_window_secs: f64,
@@ -93,6 +95,8 @@ impl Default for SyncConfig {
             start_stop_sync: true,
             clock_thru: true,
             quantum: 4.0,
+            initial_bpm: 120.0,
+            round_bpm: false,
             midi_offset_ms: 0.0,
             ols_window_secs: 10.0,
             fast_window_secs: 1.5,
@@ -114,6 +118,12 @@ impl SyncConfig {
                 "must be finite and greater than 0.0",
             ));
         }
+        if !self.initial_bpm.is_finite() || !(20.0..=999.0).contains(&self.initial_bpm) {
+            return Err(ConfigError::new(
+                "sync.initial_bpm",
+                "must be finite and within 20.0..=999.0 BPM",
+            ));
+        }
         if !self.midi_offset_ms.is_finite() || !(-50.0..=50.0).contains(&self.midi_offset_ms) {
             return Err(ConfigError::new(
                 "sync.midi_offset_ms",
@@ -126,10 +136,13 @@ impl SyncConfig {
                 "must be finite and greater than 0.0",
             ));
         }
-        if !self.ols_window_secs.is_finite() || self.ols_window_secs < self.fast_window_secs {
+        if !self.ols_window_secs.is_finite()
+            || self.ols_window_secs < self.fast_window_secs
+            || self.ols_window_secs > 30.0
+        {
             return Err(ConfigError::new(
                 "sync.ols_window_secs",
-                "must be finite and >= fast_window_secs",
+                "must be finite, >= fast_window_secs, and <= 30.0",
             ));
         }
         if !self.bpm_deadband.is_finite() || self.bpm_deadband < 0.0 {

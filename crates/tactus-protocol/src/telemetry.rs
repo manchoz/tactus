@@ -44,6 +44,9 @@ pub struct TelemetrySnapshot {
     pub is_playing: bool,
     /// Active signed MIDI clock offset in milliseconds.
     pub midi_offset_ms: f32,
+    /// Whether integer BPM rounding is active in `MidiToLink` mode.
+    #[serde(default)]
+    pub round_bpm: bool,
 }
 
 impl Default for TelemetrySnapshot {
@@ -62,6 +65,7 @@ impl Default for TelemetrySnapshot {
             link_peers: 0,
             is_playing: false,
             midi_offset_ms: 0.0,
+            round_bpm: false,
         }
     }
 }

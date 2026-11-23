@@ -31,6 +31,10 @@ pub enum EngineCommand {
     ResyncDownbeat,
     /// Manually set Link tempo in BPM (used in `LinkToMidi` mode).
     SetLinkTempoManual(f64),
+    /// Start or stop Link transport playback (used in `LinkToMidi` mode).
+    SetLinkPlaying(bool),
+    /// Enable or disable integer BPM rounding in `MidiToLink` mode.
+    SetRoundBpm(bool),
 }
 
 /// Strictly `Copy`, zero-allocation command subset sent over `rtrb` to the `SCHED_FIFO` RT thread.
@@ -50,6 +54,10 @@ pub enum RtCommand {
     ResyncDownbeat,
     /// Manually set Link tempo in BPM.
     SetLinkTempoManual(f64),
+    /// Start or stop Link transport playback (`LinkToMidi` mode).
+    SetLinkPlaying(bool),
+    /// Enable or disable integer BPM rounding (`MidiToLink` mode).
+    SetRoundBpm(bool),
 }
 
 impl TryFrom<&EngineCommand> for RtCommand {
@@ -66,6 +74,8 @@ impl TryFrom<&EngineCommand> for RtCommand {
             EngineCommand::SelectMidiPorts { .. } => Err(()),
             EngineCommand::ResyncDownbeat => Ok(Self::ResyncDownbeat),
             EngineCommand::SetLinkTempoManual(bpm) => Ok(Self::SetLinkTempoManual(bpm)),
+            EngineCommand::SetLinkPlaying(playing) => Ok(Self::SetLinkPlaying(playing)),
+            EngineCommand::SetRoundBpm(enabled) => Ok(Self::SetRoundBpm(enabled)),
         }
     }
 }

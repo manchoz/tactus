@@ -18,8 +18,8 @@ pub const RT_PREFERRED_CORE: usize = 3;
 /// `SCHED_FIFO` real-time priority (`MILESTONES.md` M3).
 pub const RT_SCHED_FIFO_PRIO: i32 = 75;
 
-/// Target periodic telemetry cadence (`~15 Hz` = `66.67 ms`).
-pub const TELEMETRY_INTERVAL_NS: i64 = 66_666_667;
+/// Target periodic telemetry cadence (`10 Hz` = `100 ms`; beats also push immediately).
+pub const TELEMETRY_INTERVAL_NS: i64 = 100_000_000;
 
 const MAX_MIDI_BATCH_BYTES: usize = 8;
 const MAX_READ_CHUNKS_PER_WAKE: usize = 16;
@@ -50,6 +50,7 @@ pub struct RtLoopChannels {
     pub tel_tx: Producer<TelemetrySnapshot>,
     pub fd_ret_tx: Producer<FdReturn>,
     pub wake_rx: WakeReceiver,
+    pub rt_notify_tx: WakeSender,
 }
 
 /// Production [`LinkSession`] backed by pre-allocated `abl_link` `SessionState`.
@@ -152,10 +153,10 @@ pub struct AblLinkDriver {
 }
 
 impl AblLinkDriver {
-    /// Construct and enable an `AblLink` instance initialized at 120 BPM.
+    /// Construct and enable an `AblLink` instance initialized at `initial_bpm`.
     #[must_use]
-    pub fn new(start_stop_sync: bool) -> Self {
-        let link = AblLink::new(120.0);
+    pub fn new(initial_bpm: f64, start_stop_sync: bool) -> Self {
+        let link = AblLink::new(initial_bpm);
         link.enable_start_stop_sync(start_stop_sync);
         link.enable(true);
         Self {
@@ -215,7 +216,7 @@ pub fn spawn_rt_thread(
     let handle = thread::Builder::new()
         .name("rt-sync".to_string())
         .spawn(move || {
-            let mut driver = AblLinkDriver::new(config.start_stop_sync);
+            let mut driver = AblLinkDriver::new(config.initial_bpm, config.start_stop_sync);
             let mut engine = SyncEngine::new(config);
 
             #[cfg(target_os = "linux")]
@@ -262,6 +263,70 @@ type PlatformTimer = Option<crate::rt_os::TimerFd>;
 #[cfg(not(target_os = "linux"))]
 type PlatformTimer = Option<()>;
 
+struct FdReturnOutbox<'a> {
+    tx: &'a mut Producer<FdReturn>,
+    notify_tx: &'a WakeSender,
+    pending: Option<FdReturn>,
+}
+
+impl<'a> FdReturnOutbox<'a> {
+    fn new(tx: &'a mut Producer<FdReturn>, notify_tx: &'a WakeSender) -> Self {
+        Self {
+            tx,
+            notify_tx,
+            pending: None,
+        }
+    }
+
+    const fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    fn flush(&mut self) {
+        if let Some(ret) = self.pending {
+            if self.tx.push(ret).is_ok() {
+                self.pending = None;
+                self.notify_tx.wake();
+            }
+        }
+    }
+
+    fn push(&mut self, ret: FdReturn) {
+        self.flush();
+        if self.pending.is_none() {
+            match self.tx.push(ret) {
+                Ok(()) => self.notify_tx.wake(),
+                Err(rtrb::PushError::Full(unsent)) => {
+                    self.pending = Some(unsent);
+                    self.notify_tx.wake();
+                }
+            }
+            return;
+        }
+
+        if let (
+            Some(FdReturn::DetachedOnError {
+                fds: ref mut existing,
+                ..
+            }),
+            FdReturn::DetachedOnError { fds: next, .. },
+        ) = (&mut self.pending, ret)
+        {
+            if existing.generation == next.generation {
+                if next.in_fd >= 0 && existing.in_fd < 0 {
+                    existing.in_fd = next.in_fd;
+                }
+                for &fd in next.active_outputs() {
+                    if !existing.active_outputs().contains(&fd) {
+                        let _ = existing.push_output(fd);
+                    }
+                }
+                self.notify_tx.wake();
+            }
+        }
+    }
+}
+
 fn run_rt_loop_with_timer<D: RtLinkDriver>(
     engine: &mut SyncEngine,
     driver: &mut D,
@@ -271,6 +336,7 @@ fn run_rt_loop_with_timer<D: RtLinkDriver>(
     let mut active_fds = MidiFdSet::EMPTY;
     let mut prev_snap = engine.snapshot();
     let mut tel_initialized = false;
+    let mut fd_outbox = FdReturnOutbox::new(&mut ch.fd_ret_tx, &ch.rt_notify_tx);
 
     let init_now_ns = driver.now_link_ns();
     let mut next_telemetry_ns = init_now_ns.saturating_add(TELEMETRY_INTERVAL_NS);
@@ -288,21 +354,19 @@ fn run_rt_loop_with_timer<D: RtLinkDriver>(
     };
     let init_snap = engine.snapshot();
     driver.commit_if_dirty();
-    write_midi_batch(
-        &mut active_fds,
-        &init_poll.midi_out,
-        false,
-        &mut ch.fd_ret_tx,
-    );
+    write_midi_batch(&mut active_fds, &init_poll.midi_out, false, &mut fd_outbox);
     if ch.tel_tx.push(init_snap).is_ok() {
         prev_snap = init_snap;
         tel_initialized = true;
+        ch.rt_notify_tx.wake();
     }
     let mut next_engine_deadline = init_poll.next_deadline_ns;
     let mut next_wakeup_raw_ns = min_deadline(next_engine_deadline, Some(next_telemetry_ns))
         .unwrap_or_else(|| init_now_ns.saturating_add(TELEMETRY_INTERVAL_NS));
 
     loop {
+        fd_outbox.flush();
+
         let mut pfds = [libc::pollfd {
             fd: -1,
             events: 0,
@@ -353,9 +417,12 @@ fn run_rt_loop_with_timer<D: RtLinkDriver>(
                 bridge.maybe_refresh_os(now_raw, true);
                 target_mono = bridge.raw_to_mono_ns(next_wakeup_raw_ns);
             }
-            let armed_mono = target_mono.max(now_mono.saturating_add(5_000));
-            let _ = tfd.arm_abstime_ns(armed_mono);
-            -1
+            if target_mono <= now_mono {
+                0
+            } else {
+                let _ = tfd.arm_abstime_ns(target_mono);
+                -1
+            }
         } else {
             compute_poll_timeout_ms(driver.now_link_ns(), next_wakeup_raw_ns)
         };
@@ -379,10 +446,8 @@ fn run_rt_loop_with_timer<D: RtLinkDriver>(
             if (pfds[1].revents & libc::POLLIN) != 0 {
                 tfd.drain();
                 // If CLOCK_MONOTONIC slewed forward enough to wake >200 us early in RAW, re-anchor.
-                if let Some(eng_dl) = next_engine_deadline {
-                    if now_raw_ns < eng_dl.saturating_sub(200_000) {
-                        bridge.maybe_refresh_os(now_raw_ns, true);
-                    }
+                if is_early_timer_wakeup(now_raw_ns, next_wakeup_raw_ns) {
+                    bridge.maybe_refresh_os(now_raw_ns, true);
                 }
             }
         }
@@ -408,7 +473,7 @@ fn run_rt_loop_with_timer<D: RtLinkDriver>(
                             now_raw_ns,
                             engine,
                             session,
-                            &mut ch.fd_ret_tx,
+                            &mut fd_outbox,
                         );
                     }
                     if detach_err.is_none()
@@ -422,13 +487,21 @@ fn run_rt_loop_with_timer<D: RtLinkDriver>(
                     }
                     if let Some(errno) = detach_err {
                         let ret = detach_input_fd(&mut active_fds, errno);
-                        let _ = ch.fd_ret_tx.push(ret);
+                        fd_outbox.push(ret);
                     }
                 }
             }
 
             // 2. Drain non-blocking RT commands & FD hot-swaps.
-            while let Ok(msg) = ch.cmd_rx.pop() {
+            loop {
+                if fd_outbox.has_pending()
+                    && matches!(ch.cmd_rx.peek(), Ok(RtMessage::AttachMidi(_)))
+                {
+                    break;
+                }
+                let Ok(msg) = ch.cmd_rx.pop() else {
+                    break;
+                };
                 match msg {
                     RtMessage::Command(cmd) => {
                         if let RtCommand::SetStartStopSync(enabled) = cmd {
@@ -438,11 +511,11 @@ fn run_rt_loop_with_timer<D: RtLinkDriver>(
                             || (matches!(cmd, RtCommand::SetDirection(Direction::LinkToMidi))
                                 && engine.config().direction == Direction::MidiToLink);
                         let batch = engine.apply_command(cmd, now_raw_ns, session);
-                        write_midi_batch(&mut active_fds, &batch, exclude_input, &mut ch.fd_ret_tx);
+                        write_midi_batch(&mut active_fds, &batch, exclude_input, &mut fd_outbox);
                     }
                     RtMessage::AttachMidi(new_fds) => {
                         if !active_fds.is_empty() {
-                            let _ = ch.fd_ret_tx.push(FdReturn::Replaced(active_fds));
+                            fd_outbox.push(FdReturn::Replaced(active_fds));
                         }
                         active_fds = new_fds;
                     }
@@ -454,14 +527,14 @@ fn run_rt_loop_with_timer<D: RtLinkDriver>(
                                 now_raw_ns,
                                 session,
                             );
-                            write_midi_batch(&mut active_fds, &batch, false, &mut ch.fd_ret_tx);
+                            write_midi_batch(&mut active_fds, &batch, false, &mut fd_outbox);
                         } else if engine.config().clock_thru {
                             let batch = engine.apply_command(
                                 RtCommand::SetClockThru(false),
                                 now_raw_ns,
                                 session,
                             );
-                            write_midi_batch(&mut active_fds, &batch, true, &mut ch.fd_ret_tx);
+                            write_midi_batch(&mut active_fds, &batch, true, &mut fd_outbox);
                         }
                         break;
                     }
@@ -472,12 +545,7 @@ fn run_rt_loop_with_timer<D: RtLinkDriver>(
             if !shutdown_requested {
                 let poll_res = engine.poll(now_raw_ns, session);
                 next_engine_deadline = poll_res.next_deadline_ns;
-                write_midi_batch(
-                    &mut active_fds,
-                    &poll_res.midi_out,
-                    false,
-                    &mut ch.fd_ret_tx,
-                );
+                write_midi_batch(&mut active_fds, &poll_res.midi_out, false, &mut fd_outbox);
             }
         }
 
@@ -489,30 +557,28 @@ fn run_rt_loop_with_timer<D: RtLinkDriver>(
 
         if shutdown_requested {
             if !active_fds.is_empty() {
-                let _ = ch.fd_ret_tx.push(FdReturn::Replaced(active_fds));
+                fd_outbox.push(FdReturn::Replaced(active_fds));
             }
+            fd_outbox.flush();
             break;
         }
 
-        if should_emit_telemetry(
-            tel_initialized,
-            prev_snap,
-            snap,
-            now_raw_ns,
-            next_telemetry_ns,
-        ) && ch.tel_tx.push(snap).is_ok()
-        {
+        let discrete_change = is_discrete_telemetry_change(tel_initialized, prev_snap, snap);
+        let periodic_due = now_raw_ns >= next_telemetry_ns;
+        if (discrete_change || periodic_due) && ch.tel_tx.push(snap).is_ok() {
             prev_snap = snap;
             tel_initialized = true;
-            if now_raw_ns >= next_telemetry_ns {
-                next_telemetry_ns = now_raw_ns.saturating_add(TELEMETRY_INTERVAL_NS);
-            }
-        } else if now_raw_ns >= next_telemetry_ns {
+            next_telemetry_ns = now_raw_ns.saturating_add(TELEMETRY_INTERVAL_NS);
+            ch.rt_notify_tx.wake();
+        } else if periodic_due {
             next_telemetry_ns = now_raw_ns.saturating_add(TELEMETRY_INTERVAL_NS);
         }
 
         next_wakeup_raw_ns = min_deadline(next_engine_deadline, Some(next_telemetry_ns))
             .unwrap_or_else(|| now_raw_ns.saturating_add(TELEMETRY_INTERVAL_NS));
+        if fd_outbox.has_pending() {
+            next_wakeup_raw_ns = next_wakeup_raw_ns.min(now_raw_ns.saturating_add(5_000_000));
+        }
     }
 }
 
@@ -521,7 +587,7 @@ fn read_midi_input<S: LinkSession>(
     now_raw_ns: i64,
     engine: &mut SyncEngine,
     session: &mut S,
-    fd_ret_tx: &mut Producer<FdReturn>,
+    fd_outbox: &mut FdReturnOutbox<'_>,
 ) -> Option<i32> {
     let in_fd = active_fds.in_fd;
     if in_fd < 0 {
@@ -535,7 +601,7 @@ fn read_midi_input<S: LinkSession>(
                 if let Some(ev) = MidiEvent::from_byte(byte) {
                     let relay = engine.on_midi_event(ev, now_raw_ns, session);
                     if !relay.is_empty() {
-                        write_midi_batch(active_fds, &relay, true, fd_ret_tx);
+                        write_midi_batch(active_fds, &relay, true, fd_outbox);
                     }
                 }
             }
@@ -560,7 +626,7 @@ fn write_midi_batch(
     active_fds: &mut MidiFdSet,
     batch: &MidiOutputBatch,
     exclude_input: bool,
-    fd_ret_tx: &mut Producer<FdReturn>,
+    fd_outbox: &mut FdReturnOutbox<'_>,
 ) {
     if batch.is_empty() || active_fds.out_count == 0 {
         return;
@@ -600,7 +666,7 @@ fn write_midi_batch(
                 break;
             }
             let ret = detach_output_fd_at(active_fds, idx, err);
-            let _ = fd_ret_tx.push(ret);
+            fd_outbox.push(ret);
             detached = true;
             break;
         }
@@ -656,24 +722,34 @@ fn detach_output_fd_at(active_fds: &mut MidiFdSet, idx: usize, errno: i32) -> Fd
     }
 }
 
-fn should_emit_telemetry(
+#[inline]
+fn beat_index(beat_phase: f64) -> i64 {
+    beat_phase.max(0.0).floor() as i64
+}
+
+fn is_discrete_telemetry_change(
     initialized: bool,
     prev: TelemetrySnapshot,
     curr: TelemetrySnapshot,
-    now_raw_ns: i64,
-    next_telemetry_ns: i64,
 ) -> bool {
     !initialized
-        || now_raw_ns >= next_telemetry_ns
         || curr.direction != prev.direction
         || curr.lock_state != prev.lock_state
         || curr.start_stop_sync != prev.start_stop_sync
         || curr.clock_thru != prev.clock_thru
+        || curr.round_bpm != prev.round_bpm
         || curr.is_playing != prev.is_playing
         || curr.link_peers != prev.link_peers
         || curr.midi_offset_ms != prev.midi_offset_ms
         || curr.quantum != prev.quantum
+        || (curr.bpm_link - prev.bpm_link).abs() >= 0.05
+        || beat_index(curr.beat_phase) != beat_index(prev.beat_phase)
         || curr.beat_phase + 0.5 < prev.beat_phase
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn is_early_timer_wakeup(now_raw_ns: i64, armed_wakeup_raw_ns: i64) -> bool {
+    now_raw_ns < armed_wakeup_raw_ns.saturating_sub(200_000)
 }
 
 fn min_deadline(a: Option<i64>, b: Option<i64>) -> Option<i64> {
@@ -688,7 +764,7 @@ fn min_deadline(a: Option<i64>, b: Option<i64>) -> Option<i64> {
 fn compute_poll_timeout_ms(now_raw_ns: i64, next_wakeup_raw_ns: i64) -> libc::c_int {
     let delta_ns = next_wakeup_raw_ns.saturating_sub(now_raw_ns);
     if delta_ns <= 0 {
-        1
+        0
     } else {
         ((delta_ns.saturating_add(999_999)) / 1_000_000).clamp(1, 50) as libc::c_int
     }
@@ -869,6 +945,7 @@ mod tests {
         let (tel_tx, mut tel_rx) = RingBuffer::new(64);
         let (fd_ret_tx, mut fd_ret_rx) = RingBuffer::new(32);
         let (wake_tx, wake_rx) = create_rt_wake_pair().expect("wake pair");
+        let (rt_notify_tx, _rt_notify_rx) = create_rt_wake_pair().expect("rt notify pair");
 
         let (out_read, out_write) = make_pipe();
         let mut driver = MockLinkDriver::new_wall(120.0);
@@ -892,6 +969,7 @@ mod tests {
                     tel_tx,
                     fd_ret_tx,
                     wake_rx,
+                    rt_notify_tx,
                 },
             )
             .expect("rt loop");
@@ -966,6 +1044,7 @@ mod tests {
         let (tel_tx, mut tel_rx) = RingBuffer::new(128);
         let (fd_ret_tx, mut fd_ret_rx) = RingBuffer::new(32);
         let (wake_tx, wake_rx) = create_rt_wake_pair().expect("wake pair");
+        let (rt_notify_tx, _rt_notify_rx) = create_rt_wake_pair().expect("rt notify pair");
 
         let (in_read_1, in_write_1) = make_pipe();
         let (in_read_2, in_write_2) = make_pipe();
@@ -987,6 +1066,7 @@ mod tests {
                     tel_tx,
                     fd_ret_tx,
                     wake_rx,
+                    rt_notify_tx,
                 },
             )
             .expect("rt loop");
@@ -1131,6 +1211,7 @@ mod tests {
         let (tel_tx, _tel_rx) = RingBuffer::new(64);
         let (fd_ret_tx, mut fd_ret_rx) = RingBuffer::new(32);
         let (wake_tx, wake_rx) = create_rt_wake_pair().expect("wake pair");
+        let (rt_notify_tx, _rt_notify_rx) = create_rt_wake_pair().expect("rt notify pair");
 
         let (out1_r, out1_w) = make_pipe();
         let (out2_r, out2_w) = make_pipe();
@@ -1155,6 +1236,7 @@ mod tests {
                     tel_tx,
                     fd_ret_tx,
                     wake_rx,
+                    rt_notify_tx,
                 },
             )
             .expect("rt loop");
@@ -1238,6 +1320,7 @@ mod tests {
         let (tel_tx, _tel_rx) = RingBuffer::new(64);
         let (fd_ret_tx, mut fd_ret_rx) = RingBuffer::new(32);
         let (wake_tx, wake_rx) = create_rt_wake_pair().expect("wake pair");
+        let (rt_notify_tx, _rt_notify_rx) = create_rt_wake_pair().expect("rt notify pair");
 
         let (duplex_rt, duplex_peer) = make_unix_duplex_pair();
         let (other_r, other_w) = make_pipe();
@@ -1259,6 +1342,7 @@ mod tests {
                     tel_tx,
                     fd_ret_tx,
                     wake_rx,
+                    rt_notify_tx,
                 },
             )
             .expect("rt loop");
@@ -1347,5 +1431,157 @@ mod tests {
             libc::close(duplex_peer);
             libc::close(other_r);
         }
+    }
+
+    #[test]
+    fn early_timer_wakeup_checks_armed_wakeup_deadline() {
+        // In MidiToLink, timerfd is armed for next_telemetry_ns (e.g. 66.7 ms) while
+        // next_engine_deadline may be 500 ms away. Waking at next_telemetry_ns is NOT early.
+        let armed_wakeup_ns = 66_666_667_i64;
+        assert!(!is_early_timer_wakeup(armed_wakeup_ns, armed_wakeup_ns));
+        assert!(!is_early_timer_wakeup(
+            armed_wakeup_ns - 150_000,
+            armed_wakeup_ns
+        ));
+        assert!(is_early_timer_wakeup(
+            armed_wakeup_ns - 250_000,
+            armed_wakeup_ns
+        ));
+    }
+
+    #[test]
+    fn pending_fd_return_retries_without_dropping_fds_and_wakes_notify() {
+        let (mut cmd_tx, cmd_rx) = RingBuffer::new(32);
+        let (tel_tx, _tel_rx) = RingBuffer::new(64);
+        // 1-slot ring forces FdReturnOutbox::pending to retain the second return until drained.
+        let (fd_ret_tx, mut fd_ret_rx) = RingBuffer::new(1);
+        let (wake_tx, wake_rx) = create_rt_wake_pair().expect("wake pair");
+        let (rt_notify_tx, rt_notify_rx) = create_rt_wake_pair().expect("rt notify pair");
+
+        let (r1, w1) = make_pipe();
+        let (r2, w2) = make_pipe();
+        let (r3, w3) = make_pipe();
+
+        let mut driver = MockLinkDriver::new_wall(120.0);
+        let mut engine = SyncEngine::new(SyncConfig::default());
+        let handle = thread::spawn(move || {
+            run_rt_loop(
+                &mut engine,
+                &mut driver,
+                RtLoopChannels {
+                    cmd_rx,
+                    tel_tx,
+                    fd_ret_tx,
+                    wake_rx,
+                    rt_notify_tx,
+                },
+            )
+            .expect("rt loop");
+        });
+
+        let set1 = MidiFdSet::single_output(w1, 1);
+        let set2 = MidiFdSet::single_output(w2, 2);
+        let set3 = MidiFdSet::single_output(w3, 3);
+        cmd_tx.push(RtMessage::AttachMidi(set1)).unwrap();
+        cmd_tx.push(RtMessage::AttachMidi(set2)).unwrap();
+        cmd_tx.push(RtMessage::AttachMidi(set3)).unwrap();
+        wake_tx.wake();
+
+        // Drain initial wakeups, wait for first Replaced(set1) while set2 sits in pending_fd_return.
+        let mut returned = Vec::new();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline && returned.len() < 2 {
+            while let Ok(ret) = fd_ret_rx.pop() {
+                if let FdReturn::Replaced(fds) = ret {
+                    returned.push(fds);
+                    close_fd_set(fds);
+                }
+            }
+            rt_notify_rx.drain();
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // Verify rt_notify_rx receives discrete wakeup signal on state transitions and FD returns.
+        let mut pfd = libc::pollfd {
+            fd: rt_notify_rx.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        cmd_tx
+            .push(RtMessage::Command(RtCommand::SetRoundBpm(true)))
+            .unwrap();
+        wake_tx.wake();
+        let notify_ready = unsafe { libc::poll(&raw mut pfd, 1, 200) };
+        assert_eq!(notify_ready, 1);
+        rt_notify_rx.drain();
+
+        cmd_tx.push(RtMessage::Shutdown).unwrap();
+        wake_tx.wake();
+        handle.join().expect("rt loop joins");
+
+        while let Ok(ret) = fd_ret_rx.pop() {
+            if let FdReturn::Replaced(fds) = ret {
+                returned.push(fds);
+                close_fd_set(fds);
+            }
+        }
+        assert_eq!(returned, vec![set1, set2, set3]);
+
+        unsafe {
+            libc::close(r1);
+            libc::close(r2);
+            libc::close(r3);
+        }
+    }
+
+    #[test]
+    fn discrete_telemetry_triggers_on_every_beat_boundary_not_only_downbeat() {
+        let base = TelemetrySnapshot {
+            quantum: 4.0,
+            beat_phase: 0.10,
+            ..TelemetrySnapshot::default()
+        };
+
+        // Same beat (sub-beat progression within beat 1): NOT discrete.
+        let sub_beat = TelemetrySnapshot {
+            beat_phase: 0.85,
+            ..base
+        };
+        assert!(!is_discrete_telemetry_change(true, base, sub_beat));
+
+        // Crossing into beat 2, beat 3, beat 4, and wrapping back to beat 1: ALL discrete.
+        let beat2 = TelemetrySnapshot {
+            beat_phase: 1.02,
+            ..base
+        };
+        let beat3 = TelemetrySnapshot {
+            beat_phase: 2.01,
+            ..base
+        };
+        let beat4 = TelemetrySnapshot {
+            beat_phase: 3.03,
+            ..base
+        };
+        let beat1_wrap = TelemetrySnapshot {
+            beat_phase: 0.01,
+            ..base
+        };
+        assert!(is_discrete_telemetry_change(true, sub_beat, beat2));
+        assert!(is_discrete_telemetry_change(true, beat2, beat3));
+        assert!(is_discrete_telemetry_change(true, beat3, beat4));
+        assert!(is_discrete_telemetry_change(true, beat4, beat1_wrap));
+
+        // Quantum = 1.0 wrap (beat_phase stays < 1.0, wraps e.g. 0.9 -> 0.05): still discrete.
+        let q1_end = TelemetrySnapshot {
+            quantum: 1.0,
+            beat_phase: 0.90,
+            ..base
+        };
+        let q1_wrap = TelemetrySnapshot {
+            quantum: 1.0,
+            beat_phase: 0.05,
+            ..base
+        };
+        assert!(is_discrete_telemetry_change(true, q1_end, q1_wrap));
     }
 }

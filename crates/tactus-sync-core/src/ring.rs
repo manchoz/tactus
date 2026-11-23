@@ -1,7 +1,7 @@
 //! Fixed-capacity circular sample buffer and numerically stable two-pass OLS regression.
 
-/// Capacity of the long OLS window (`SPEC.md §2.3.3`: covers up to 512 BPM over 10 s).
-pub const LONG_RING_CAPACITY: usize = 2048;
+/// Capacity of the long OLS window (`SPEC.md §2.3.3`: covers `30 s` at `340 BPM` or `10 s` at `999 BPM`).
+pub const LONG_RING_CAPACITY: usize = 4096;
 
 /// Capacity of the fast step-detection window (covers up to 512 BPM over 1.5 s with headroom).
 pub const FAST_RING_CAPACITY: usize = 512;
@@ -122,6 +122,20 @@ impl<const N: usize> SampleRing<N> {
         }
     }
 
+    /// Return the active samples as two contiguous slices (`head..end`, `0..tail`).
+    #[must_use]
+    pub fn as_slices(&self) -> (&[ClockSample], &[ClockSample]) {
+        if self.len == 0 {
+            return (&[], &[]);
+        }
+        let first_len = self.len.min(N - self.head);
+        let second_len = self.len - first_len;
+        (
+            &self.buf[self.head..self.head + first_len],
+            &self.buf[..second_len],
+        )
+    }
+
     /// Compute a shifted two-pass Ordinary Least Squares tempo and newest-timestamp estimate.
     ///
     /// Shifting coordinates relative to the oldest sample `(x0, y0)` avoids precision loss
@@ -136,15 +150,17 @@ impl<const N: usize> SampleRing<N> {
         let newest = self.newest()?;
         let x0 = oldest.tick_index;
         let y0 = oldest.timestamp_ns;
+        let (first, second) = self.as_slices();
 
         let mut sum_x = 0.0_f64;
         let mut sum_y = 0.0_f64;
-        for offset in 0..self.len {
-            let sample = self.buf[(self.head + offset) % N];
-            let dx = sample.tick_index.saturating_sub(x0) as f64;
-            let dy = sample.timestamp_ns.saturating_sub(y0) as f64;
-            sum_x += dx;
-            sum_y += dy;
+        for slice in [first, second] {
+            for sample in slice {
+                let dx = sample.tick_index.saturating_sub(x0) as f64;
+                let dy = sample.timestamp_ns.saturating_sub(y0) as f64;
+                sum_x += dx;
+                sum_y += dy;
+            }
         }
 
         let count = self.len as f64;
@@ -153,12 +169,13 @@ impl<const N: usize> SampleRing<N> {
 
         let mut s_xx = 0.0_f64;
         let mut s_xy = 0.0_f64;
-        for offset in 0..self.len {
-            let sample = self.buf[(self.head + offset) % N];
-            let cx = (sample.tick_index.saturating_sub(x0) as f64) - mean_x;
-            let cy = (sample.timestamp_ns.saturating_sub(y0) as f64) - mean_y;
-            s_xx += cx * cx;
-            s_xy += cx * cy;
+        for slice in [first, second] {
+            for sample in slice {
+                let cx = (sample.tick_index.saturating_sub(x0) as f64) - mean_x;
+                let cy = (sample.timestamp_ns.saturating_sub(y0) as f64) - mean_y;
+                s_xx += cx * cx;
+                s_xy += cx * cy;
+            }
         }
 
         if !s_xx.is_finite() || s_xx <= 0.0 || !s_xy.is_finite() {
@@ -254,8 +271,61 @@ mod tests {
                 timestamp_ns: ((i as f64) * tick_ns).round() as i64,
             });
         }
-        assert_eq!(ring.len(), LONG_RING_CAPACITY);
+        assert_eq!(ring.len(), 2048);
         let est = ring.ols_estimate().expect("OLS estimate at 512 BPM");
         assert!((est.bpm - 512.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn long_ring_capacity_covers_340_bpm_for_30_seconds() {
+        // 340 BPM * 24 PPQN / 60s * 30s = 4080 ticks <= LONG_RING_CAPACITY (4096).
+        let mut ring: SampleRing<LONG_RING_CAPACITY> = SampleRing::new();
+        let tick_ns = 60_000_000_000.0 / (24.0 * 340.0);
+        for i in 0..4080_u64 {
+            ring.push(ClockSample {
+                tick_index: i,
+                timestamp_ns: ((i as f64) * tick_ns).round() as i64,
+            });
+        }
+        assert_eq!(ring.len(), 4080);
+        let est = ring.ols_estimate().expect("OLS estimate at 340 BPM");
+        assert!((est.bpm - 340.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn as_slices_handles_empty_wrapped_and_evicted_rings() {
+        let mut ring: SampleRing<4> = SampleRing::new();
+        assert_eq!(ring.as_slices(), (&[][..], &[][..]));
+
+        for i in 0..3_u64 {
+            ring.push(ClockSample {
+                tick_index: i,
+                timestamp_ns: (i as i64) * 10_000_000,
+            });
+        }
+        let (a, b) = ring.as_slices();
+        let ticks: Vec<u64> = a.iter().chain(b.iter()).map(|s| s.tick_index).collect();
+        assert_eq!(ticks, vec![0, 1, 2]);
+        assert!(b.is_empty());
+
+        for i in 3..6_u64 {
+            ring.push(ClockSample {
+                tick_index: i,
+                timestamp_ns: (i as i64) * 10_000_000,
+            });
+        }
+        let (a, b) = ring.as_slices();
+        let ticks: Vec<u64> = a.iter().chain(b.iter()).map(|s| s.tick_index).collect();
+        assert_eq!(ticks, vec![2, 3, 4, 5]);
+        assert_eq!(a.len(), 2);
+        assert_eq!(b.len(), 2);
+        let est = ring.ols_estimate().expect("OLS across wrapped slices");
+        assert!((est.bpm - 250.0).abs() < 1e-6);
+
+        ring.evict_older_than(45_000_000);
+        let (a, b) = ring.as_slices();
+        let ticks: Vec<u64> = a.iter().chain(b.iter()).map(|s| s.tick_index).collect();
+        assert_eq!(ticks, vec![5]);
+        assert!(b.is_empty());
     }
 }

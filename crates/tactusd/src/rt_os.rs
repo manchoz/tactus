@@ -3,6 +3,52 @@
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
+#[cfg(target_os = "linux")]
+use tokio::io::unix::AsyncFd;
+#[cfg(target_os = "linux")]
+use tokio::io::Interest;
+
+/// Restrict the calling thread (and child threads it subsequently spawns) to non-RT CPU cores,
+/// excluding `excluded_core` when at least 2 online cores exist.
+#[cfg(target_os = "linux")]
+pub fn pin_non_rt_threads(excluded_core: usize) -> Result<usize, i32> {
+    let online = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    if online <= 1 {
+        return Ok(online.max(0) as usize);
+    }
+    let capped_online = (online as usize).min(libc::CPU_SETSIZE as usize);
+    if capped_online <= 1 {
+        return Ok(capped_online);
+    }
+    let excluded = excluded_core.min(capped_online - 1);
+
+    let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::CPU_ZERO(&mut cpuset);
+        for core in 0..capped_online {
+            if core != excluded {
+                libc::CPU_SET(core, &mut cpuset);
+            }
+        }
+    }
+    let rc = unsafe {
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw const cpuset)
+    };
+    if rc == 0 {
+        Ok(capped_online - 1)
+    } else {
+        Err(io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EPERM))
+    }
+}
+
+/// Non-Linux stub for [`pin_non_rt_threads`].
+#[cfg(not(target_os = "linux"))]
+pub fn pin_non_rt_threads(_excluded_core: usize) -> Result<usize, i32> {
+    Ok(0)
+}
+
 /// Result of attempting to apply `SCHED_FIFO`, `mlockall`, and CPU core affinity on the RT thread.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RtHardeningReport {
@@ -152,6 +198,13 @@ impl WakeReceiver {
         self.fd.as_raw_fd()
     }
 
+    /// Extract the owned descriptor for registration with `tokio::io::unix::AsyncFd`.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn into_owned_fd(self) -> OwnedFd {
+        self.fd
+    }
+
     /// Drain all pending wakeup notifications without blocking or allocating.
     pub fn drain(&self) {
         #[cfg(target_os = "linux")]
@@ -165,6 +218,96 @@ impl WakeReceiver {
                 break;
             }
         }
+    }
+}
+
+/// Async-side wrapper around [`WakeReceiver`] waking `tokio` immediately on RT `eventfd` signals.
+#[cfg(target_os = "linux")]
+pub struct AsyncWakeReceiver {
+    fd: AsyncFd<OwnedFd>,
+}
+
+#[cfg(target_os = "linux")]
+impl AsyncWakeReceiver {
+    /// Register the RT notification descriptor with `tokio`'s reactor (must run inside `tokio`).
+    pub fn new(rx: WakeReceiver) -> io::Result<Self> {
+        // SAFETY: `rx.into_owned_fd()` transfers an open `OwnedFd` whose descriptor remains valid
+        // and owned exclusively by `AsyncFd` for its entire lifetime.
+        let fd =
+            unsafe { AsyncFd::register_with_interest(rx.into_owned_fd(), Interest::READABLE)? };
+        Ok(Self { fd })
+    }
+
+    /// Wait until at least one RT notification arrives, draining `eventfd` without spinning.
+    pub async fn wait(&self) -> io::Result<()> {
+        loop {
+            let mut guard = self.fd.readable().await?;
+            let res = guard.try_io(|inner| {
+                let mut drained = false;
+                let mut buf = [0u8; 8];
+                loop {
+                    let n = unsafe {
+                        libc::read(
+                            inner.get_ref().as_raw_fd(),
+                            buf.as_mut_ptr().cast(),
+                            buf.len(),
+                        )
+                    };
+                    if n > 0 {
+                        drained = true;
+                        continue;
+                    }
+                    if n == 0 {
+                        return Ok(drained);
+                    }
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        return if drained { Ok(true) } else { Err(err) };
+                    }
+                    if err.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(err);
+                }
+            });
+
+            match res {
+                Ok(Ok(true)) => {
+                    guard.clear_ready();
+                    return Ok(());
+                }
+                Ok(Ok(false)) => continue,
+                Ok(Err(err)) => return Err(err),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    /// No-op on Linux (`wait()` drains `eventfd` directly).
+    pub fn drain_fallback(&self) {}
+}
+
+/// Non-Linux async wakeup fallback preserving the pipe read end while relying on fallback polling.
+#[cfg(not(target_os = "linux"))]
+pub struct AsyncWakeReceiver {
+    rx: WakeReceiver,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl AsyncWakeReceiver {
+    /// Wrap the wake receiver (keeps the pipe read end alive so RT writes never hit `SIGPIPE`).
+    pub fn new(rx: WakeReceiver) -> io::Result<Self> {
+        Ok(Self { rx })
+    }
+
+    /// Pending future on non-Linux hosts; `control.rs` drains notifications on fallback ticks.
+    pub async fn wait(&self) -> io::Result<()> {
+        std::future::pending().await
+    }
+
+    /// Drain pending bytes from the pipe on fallback ticks.
+    pub fn drain_fallback(&self) {
+        self.rx.drain();
     }
 }
 

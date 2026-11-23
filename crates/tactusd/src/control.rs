@@ -20,9 +20,13 @@ use crate::log::{log_error, log_info, log_warn};
 use crate::midi::hotplug::UeventMonitor;
 use crate::midi::{close_fd_set, match_output_ports, match_port, MidiBackend, MidiFdSet};
 use crate::rt::{FdReturn, RtMessage, WakeSender};
+use crate::rt_os::{AsyncWakeReceiver, WakeReceiver};
 use crate::web;
 
-const TELEMETRY_POLL_INTERVAL: Duration = Duration::from_millis(25);
+#[cfg(target_os = "linux")]
+const TELEMETRY_POLL_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(not(target_os = "linux"))]
+const TELEMETRY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const HOTPLUG_RESCAN_FALLBACK: Duration = Duration::from_secs(5);
 const HOTPLUG_DEBOUNCE: Duration = Duration::from_millis(150);
 const WEB_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -45,6 +49,7 @@ pub struct ControlPlaneArgs {
     pub tel_rx: Consumer<TelemetrySnapshot>,
     pub fd_ret_rx: Consumer<FdReturn>,
     pub wake_tx: WakeSender,
+    pub rt_notify_rx: WakeReceiver,
     pub rt_handle: JoinHandle<()>,
 }
 
@@ -363,6 +368,15 @@ impl StateHub {
                             log_warn!("ignoring out-of-bounds SetLinkTempoManual({bpm})");
                             return;
                         }
+                        if self.config.sync.direction == tactus_protocol::Direction::LinkToMidi {
+                            self.config.sync.initial_bpm = bpm;
+                            persist = true;
+                        }
+                    }
+                    RtCommand::SetLinkPlaying(_) => {}
+                    RtCommand::SetRoundBpm(enabled) => {
+                        self.config.sync.round_bpm = enabled;
+                        persist = true;
                     }
                     RtCommand::ResyncDownbeat => {}
                 }
@@ -473,20 +487,22 @@ impl StateHub {
                     || prev.link_peers != snap.link_peers
                     || prev.start_stop_sync != snap.start_stop_sync
                     || prev.clock_thru != snap.clock_thru
+                    || prev.round_bpm != snap.round_bpm
                     || (prev.bpm_link - snap.bpm_link).abs() >= 0.05
             }
         };
 
         if discrete_changed {
             log_info!(
-                "sync state: dir={:?}, lock={:?}, playing={}, peers={}, bpm_link={:.2}, start_stop={}, clock_thru={}",
+                "sync state: dir={:?}, lock={:?}, playing={}, peers={}, bpm_link={:.2}, start_stop={}, clock_thru={}, round_bpm={}",
                 snap.direction,
                 snap.lock_state,
                 snap.is_playing,
                 snap.link_peers,
                 snap.bpm_link,
                 snap.start_stop_sync,
-                snap.clock_thru
+                snap.clock_thru,
+                snap.round_bpm
             );
             self.last_logged_snap = Some(snap);
         }
@@ -500,8 +516,10 @@ pub async fn run_control_plane(args: ControlPlaneArgs) {
             direction: args.config.sync.direction,
             start_stop_sync: args.config.sync.start_stop_sync,
             clock_thru: args.config.sync.clock_thru,
+            bpm_link: args.config.sync.initial_bpm,
             quantum: args.config.sync.quantum,
             midi_offset_ms: args.config.sync.midi_offset_ms,
+            round_bpm: args.config.sync.round_bpm,
             ..TelemetrySnapshot::default()
         },
         midi_input_match: args.config.midi.input_port_match.clone(),
@@ -520,6 +538,15 @@ pub async fn run_control_plane(args: ControlPlaneArgs) {
         Ok(mon) => Some(mon),
         Err(err) => {
             log_warn!("NETLINK_KOBJECT_UEVENT unavailable ({err}); relying on 5s periodic rescan");
+            None
+        }
+    };
+    let rt_notify = match AsyncWakeReceiver::new(args.rt_notify_rx) {
+        Ok(rx) => Some(rx),
+        Err(err) => {
+            log_warn!(
+                "RT notification wakeup registration failed ({err}); relying on periodic poll"
+            );
             None
         }
     };
@@ -561,6 +588,15 @@ pub async fn run_control_plane(args: ControlPlaneArgs) {
             Some(cmd) = cmd_rx.recv() => {
                 hub.handle_command(cmd).await;
             }
+            res = wait_rt_notify_opt(rt_notify.as_ref()) => {
+                if let Err(err) = res {
+                    log_warn!("RT notification wait failed: {err}");
+                }
+                if hub.drain_rt_returns() {
+                    hotplug_deadline = Some(Instant::now() + HOTPLUG_DEBOUNCE);
+                }
+                hub.drain_telemetry();
+            }
             res = wait_uevent_opt(uevent.as_ref()) => {
                 match res {
                     Ok(()) => {
@@ -586,6 +622,9 @@ pub async fn run_control_plane(args: ControlPlaneArgs) {
                 hub.reconcile_midi().await;
             }
             _ = telemetry_tick.tick() => {
+                if let Some(ref notify) = rt_notify {
+                    notify.drain_fallback();
+                }
                 if hub.drain_rt_returns() {
                     hotplug_deadline = Some(Instant::now() + HOTPLUG_DEBOUNCE);
                 }
@@ -609,6 +648,7 @@ pub async fn run_control_plane(args: ControlPlaneArgs) {
 
     hub.persister.shutdown().await;
 
+    let _ = hub.drain_rt_returns();
     if hub.rt_cmd_tx.push(RtMessage::Shutdown).is_err() {
         log_warn!("RT command ring full while sending Shutdown");
     }
@@ -626,6 +666,14 @@ pub async fn run_control_plane(args: ControlPlaneArgs) {
     let _ = hub.drain_rt_returns();
     hub.drain_telemetry();
     log_info!("shutdown complete");
+}
+
+async fn wait_rt_notify_opt(notify: Option<&AsyncWakeReceiver>) -> std::io::Result<()> {
+    if let Some(rx) = notify {
+        rx.wait().await
+    } else {
+        std::future::pending().await
+    }
 }
 
 async fn wait_uevent_opt(mon: Option<&UeventMonitor>) -> std::io::Result<()> {
@@ -1161,5 +1209,54 @@ mod tests {
         );
 
         rig.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn persists_initial_bpm_and_round_bpm_without_persisting_link_playing() {
+        let mut rig = ControlTestRig::spawn("persist-sync-flags", TactusConfig::default(), vec![]);
+        let cfg_path = rig.temp_dir.join("config.toml");
+
+        // SetLinkPlaying alone must forward to RT without creating/saving config.toml.
+        rig.hub
+            .handle_command(EngineCommand::SetLinkPlaying(true))
+            .await;
+        rig.hub.persister.shutdown().await;
+        assert!(!cfg_path.exists());
+        rig.shutdown().await;
+
+        let mut rig2 =
+            ControlTestRig::spawn("persist-sync-flags-2", TactusConfig::default(), vec![]);
+        let cfg_path2 = rig2.temp_dir.join("config.toml");
+
+        rig2.hub
+            .handle_command(EngineCommand::SetLinkTempoManual(134.5))
+            .await;
+        rig2.hub
+            .handle_command(EngineCommand::SetRoundBpm(true))
+            .await;
+        assert_eq!(rig2.hub.config.sync.initial_bpm, 134.5);
+        assert!(rig2.hub.config.sync.round_bpm);
+
+        // SetLinkTempoManual while in MidiToLink must NOT overwrite persisted initial_bpm.
+        rig2.hub
+            .handle_command(EngineCommand::SetDirection(
+                tactus_protocol::Direction::MidiToLink,
+            ))
+            .await;
+        rig2.hub
+            .handle_command(EngineCommand::SetLinkTempoManual(150.0))
+            .await;
+        assert_eq!(rig2.hub.config.sync.initial_bpm, 134.5);
+
+        // Flush debounced config writes before `rig2.shutdown()` removes `temp_dir`.
+        rig2.hub.persister.shutdown().await;
+
+        let (reloaded, existed) =
+            crate::config_store::load_config(&cfg_path2).expect("load flushed config.toml");
+        assert!(existed);
+        assert_eq!(reloaded.sync.initial_bpm, 134.5);
+        assert!(reloaded.sync.round_bpm);
+
+        rig2.shutdown().await;
     }
 }

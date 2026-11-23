@@ -36,8 +36,10 @@ impl SyncEngine {
             lock_state: LockState::Unlocked,
             start_stop_sync: config.start_stop_sync,
             clock_thru: config.clock_thru,
+            bpm_link: config.initial_bpm,
             quantum: config.quantum,
             midi_offset_ms: config.midi_offset_ms,
+            round_bpm: config.round_bpm,
             ..TelemetrySnapshot::default()
         };
         Self {
@@ -100,8 +102,14 @@ impl SyncEngine {
                     if !enabled {
                         self.midi_thru_playing = false;
                     }
-                    self.scheduler
-                        .on_start_stop_sync_changed(enabled, link.is_playing());
+                    if self.config.direction == Direction::LinkToMidi {
+                        midi_out = self.scheduler.on_start_stop_sync_changed(
+                            enabled,
+                            now_ns,
+                            &self.config,
+                            link,
+                        );
+                    }
                 }
             }
             RtCommand::SetClockThru(enabled) => {
@@ -146,6 +154,25 @@ impl SyncEngine {
                     && (MIN_VALID_BPM..=MAX_VALID_BPM).contains(&bpm)
                 {
                     link.set_tempo(bpm, ns_to_us(now_ns));
+                }
+            }
+            RtCommand::SetLinkPlaying(playing) => {
+                if self.config.direction == Direction::LinkToMidi {
+                    link.set_is_playing(playing, ns_to_us(now_ns));
+                }
+            }
+            RtCommand::SetRoundBpm(enabled) => {
+                self.config.round_bpm = enabled;
+                if enabled
+                    && self.config.direction == Direction::MidiToLink
+                    && self.estimator.lock_state() == LockState::Locked
+                {
+                    if let Some(raw_bpm) = self.estimator.bpm_midi_long() {
+                        let rounded = raw_bpm.round().clamp(MIN_VALID_BPM, MAX_VALID_BPM);
+                        if (rounded - link.tempo()).abs() > 1e-6 {
+                            link.set_tempo(rounded, ns_to_us(now_ns));
+                        }
+                    }
                 }
             }
         }
@@ -250,6 +277,7 @@ impl SyncEngine {
             link_peers: link.num_peers(),
             is_playing: link.is_playing(),
             midi_offset_ms: self.config.midi_offset_ms,
+            round_bpm: self.config.round_bpm,
         };
     }
 }

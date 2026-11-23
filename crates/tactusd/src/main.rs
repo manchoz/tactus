@@ -22,6 +22,7 @@ use crate::midi::default_midi_backend;
 use crate::rt::{create_rt_wake_pair, spawn_rt_thread, RT_PREFERRED_CORE, RT_SCHED_FIFO_PRIO};
 
 const RING_CAPACITY: usize = 64;
+const FD_RET_RING_CAPACITY: usize = 256;
 
 enum CliAction {
     Run { config_override: Option<PathBuf> },
@@ -131,23 +132,47 @@ fn main() -> ExitCode {
     };
 
     log_info!(
-        "starting tactusd v{} (config=`{}` [{}], direction={:?}, start_stop_sync={}, clock_thru={}, offset_ms={:.1})",
+        "starting tactusd v{} (config=`{}` [{}], direction={:?}, start_stop_sync={}, clock_thru={}, initial_bpm={:.1}, round_bpm={}, offset_ms={:.1})",
         env!("CARGO_PKG_VERSION"),
         config_path.display(),
         if existed { "loaded" } else { "defaults" },
         config.sync.direction,
         config.sync.start_stop_sync,
         config.sync.clock_thru,
+        config.sync.initial_bpm,
+        config.sync.round_bpm,
         config.sync.midi_offset_ms
     );
 
+    match rt_os::pin_non_rt_threads(RT_PREFERRED_CORE) {
+        Ok(cores) if cores > 0 => {
+            log_info!(
+                "non-RT threads pinned to {cores} core(s) (excluding core {RT_PREFERRED_CORE})"
+            );
+        }
+        Ok(_) => {}
+        Err(errno) => {
+            log_warn!(
+                "non-RT CPU affinity isolation failed ({}); continuing with default affinity",
+                std::io::Error::from_raw_os_error(errno)
+            );
+        }
+    }
+
     let (rt_cmd_tx, cmd_rx) = RingBuffer::new(RING_CAPACITY);
     let (tel_tx, tel_rx) = RingBuffer::new(RING_CAPACITY);
-    let (fd_ret_tx, fd_ret_rx) = RingBuffer::new(RING_CAPACITY);
+    let (fd_ret_tx, fd_ret_rx) = RingBuffer::new(FD_RET_RING_CAPACITY);
     let (wake_tx, wake_rx) = match create_rt_wake_pair() {
         Ok(pair) => pair,
         Err(err) => {
             log_error!("failed to create RT wakeup descriptor: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (rt_notify_tx, rt_notify_rx) = match create_rt_wake_pair() {
+        Ok(pair) => pair,
+        Err(err) => {
+            log_error!("failed to create RT notification descriptor: {err}");
             return ExitCode::FAILURE;
         }
     };
@@ -159,6 +184,7 @@ fn main() -> ExitCode {
             tel_tx,
             fd_ret_tx,
             wake_rx,
+            rt_notify_tx,
         },
     ) {
         Ok(res) => res,
@@ -190,6 +216,7 @@ fn main() -> ExitCode {
         tel_rx,
         fd_ret_rx,
         wake_tx,
+        rt_notify_rx,
         rt_handle,
     }));
 

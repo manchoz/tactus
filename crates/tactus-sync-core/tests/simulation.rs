@@ -945,3 +945,231 @@ fn midi_to_link_direction_switch_stops_relayed_outputs_only_when_thru_playing() 
         )
         .is_empty());
 }
+
+#[test]
+fn midi_to_link_applies_symmetric_latency_offset() {
+    // 1. Negative offset (-10 ms) shifts Start and beat-boundary phase lock earlier in Link time.
+    let mut neg_engine = SyncEngine::new(SyncConfig {
+        midi_offset_ms: -10.0,
+        ..midi_to_link_config()
+    });
+    let mut neg_link = MockLinkSession::new(120.0);
+    neg_link.peers = 1;
+
+    let start_ns = 1_000_000_000_i64;
+    neg_engine.on_midi_event(MidiEvent::Start, start_ns, &mut neg_link);
+    assert_eq!(neg_link.forced_beats.last(), Some(&(0.0, 990_000)));
+    assert_eq!(neg_link.play_changes.last(), Some(&(true, 989_000)));
+
+    // Feed 120 BPM ticks delayed by +10 ms relative to ideal Link beat grid: -10 ms offset locks
+    // with near-zero phase error and zero phase nudges.
+    neg_link.phase_nudges_us.clear();
+    let tick_ns = 60_000_000_000.0 / (24.0 * 120.0);
+    for i in 0..144 {
+        let ts = start_ns + ((i as f64) * tick_ns).round() as i64;
+        neg_engine.on_midi_event(MidiEvent::Clock, ts, &mut neg_link);
+    }
+    assert_eq!(neg_engine.snapshot().lock_state, LockState::Locked);
+    assert!(
+        neg_engine.snapshot().phase_error_ms.abs() < 0.5,
+        "expected <0.5 ms phase error with matching -10 ms offset, got {}",
+        neg_engine.snapshot().phase_error_ms
+    );
+    assert!(
+        neg_link.phase_nudges_us.is_empty(),
+        "unexpected phase nudges when -10 ms offset matches Start: {:?}",
+        neg_link.phase_nudges_us
+    );
+
+    // 2. Positive offset (+10 ms) shifts Start forward and dynamic SetOffsetMs converges cleanly.
+    let mut pos_engine = SyncEngine::new(SyncConfig {
+        midi_offset_ms: 10.0,
+        ..midi_to_link_config()
+    });
+    let mut pos_link = MockLinkSession::new(120.0);
+    pos_engine.on_midi_event(MidiEvent::Start, start_ns, &mut pos_link);
+    assert_eq!(pos_link.forced_beats.last(), Some(&(0.0, 1_010_000)));
+    assert_eq!(pos_link.play_changes.last(), Some(&(true, 1_009_000)));
+
+    let mut clk_ns = start_ns;
+    for i in 0..96 {
+        clk_ns = start_ns + ((i as f64) * tick_ns).round() as i64;
+        pos_engine.on_midi_event(MidiEvent::Clock, clk_ns, &mut pos_link);
+    }
+    // Dynamic SetOffsetMs(-10.0) produces a +20 ms shift that bounded phase lock converges within deadband.
+    let _ = pos_engine.apply_command(RtCommand::SetOffsetMs(-10.0), clk_ns, &mut pos_link);
+    pos_link.phase_nudges_us.clear();
+    for i in 96..(96 + 40 * 24) {
+        let ts = start_ns + ((i as f64) * tick_ns).round() as i64;
+        pos_engine.on_midi_event(MidiEvent::Clock, ts, &mut pos_link);
+    }
+    assert!(!pos_link.phase_nudges_us.is_empty());
+    assert!(pos_engine.snapshot().phase_error_ms.abs() <= 4.0);
+}
+
+#[test]
+fn link_to_midi_mid_playback_start_stop_sync_toggle() {
+    let mut engine = SyncEngine::new(SyncConfig::default());
+    let mut link = MockLinkSession::new(120.0);
+    link.set_is_playing(true, 0);
+
+    // Poll at t=0: emits Start + Clock at beat 0 and transitions to Playing.
+    let res0 = engine.poll(0, &mut link);
+    assert!(res0
+        .midi_out
+        .as_slice()
+        .iter()
+        .any(|e| e.event == MidiEvent::Start));
+
+    // Disable start_stop_sync mid-playback -> must emit Stop (0xFC) immediately.
+    let stop_batch =
+        engine.apply_command(RtCommand::SetStartStopSync(false), 250_000_000, &mut link);
+    assert_eq!(
+        stop_batch.as_slice(),
+        &[ScheduledMidiEvent {
+            event: MidiEvent::Stop,
+            timestamp_ns: 250_000_000,
+        }]
+    );
+
+    // Re-enable start_stop_sync while Link is still playing at t=750 ms (beat 1.5, quantum=4.0):
+    // must arm quantized Start (0xFA) at next quantum boundary (beat 4.0 = 2.0 s).
+    let enable_batch =
+        engine.apply_command(RtCommand::SetStartStopSync(true), 750_000_000, &mut link);
+    assert!(enable_batch.is_empty());
+
+    let mut events = Vec::new();
+    let mut t = 760_000_000_i64;
+    while t <= 2_100_000_000 {
+        events.extend_from_slice(engine.poll(t, &mut link).midi_out.as_slice());
+        t += 10_000_000;
+    }
+    let starts: Vec<i64> = events
+        .iter()
+        .filter(|e| e.event == MidiEvent::Start)
+        .map(|e| e.timestamp_ns)
+        .collect();
+    assert_eq!(starts, vec![2_000_000_000]);
+}
+
+#[test]
+fn link_to_midi_set_link_playing_starts_and_stops_transport() {
+    let mut engine = SyncEngine::new(SyncConfig::default());
+    let mut link = MockLinkSession::new(120.0);
+
+    // Advance into beat 1.2 (t = 600 ms) while stopped.
+    let mut t = 0_i64;
+    while t <= 600_000_000 {
+        let _ = engine.poll(t, &mut link);
+        t += 10_000_000;
+    }
+    assert!(!link.is_playing());
+
+    // SetLinkPlaying(true) starts Link and arms quantized 0xFA at beat 4.0 (2.0 s).
+    let _ = engine.apply_command(RtCommand::SetLinkPlaying(true), 600_000_000, &mut link);
+    assert!(link.is_playing());
+    assert!(engine.snapshot().is_playing);
+
+    let mut events = Vec::new();
+    while t <= 2_050_000_000 {
+        events.extend_from_slice(engine.poll(t, &mut link).midi_out.as_slice());
+        t += 10_000_000;
+    }
+    let starts: Vec<i64> = events
+        .iter()
+        .filter(|e| e.event == MidiEvent::Start)
+        .map(|e| e.timestamp_ns)
+        .collect();
+    assert_eq!(starts, vec![2_000_000_000]);
+
+    // SetLinkPlaying(false) stops Link and emits immediate 0xFC on poll.
+    let _ = engine.apply_command(RtCommand::SetLinkPlaying(false), 2_200_000_000, &mut link);
+    assert!(!link.is_playing());
+    let stop_poll = engine.poll(2_200_000_000, &mut link);
+    assert!(stop_poll
+        .midi_out
+        .as_slice()
+        .iter()
+        .any(|e| e.event == MidiEvent::Stop));
+
+    // Ignored in MidiToLink mode.
+    let _ = engine.apply_command(
+        RtCommand::SetDirection(Direction::MidiToLink),
+        2_300_000_000,
+        &mut link,
+    );
+    let _ = engine.apply_command(RtCommand::SetLinkPlaying(true), 2_310_000_000, &mut link);
+    assert!(!link.is_playing());
+}
+
+#[test]
+fn midi_to_link_round_bpm_snaps_to_nearest_integer() {
+    let cfg = SyncConfig {
+        round_bpm: true,
+        ..midi_to_link_config()
+    };
+    let mut engine = SyncEngine::new(cfg);
+    let mut link = MockLinkSession::new(115.0);
+
+    // 1. Steady 120.12 BPM snaps Link to 120.0 while keeping unrounded diagnostic bpm_midi_long.
+    let tick_120_12 = 60_000_000_000.0 / (24.0 * 120.12);
+    let mut now_ns = 0_i64;
+    for i in 0..144 {
+        now_ns = ((i as f64) * tick_120_12).round() as i64;
+        engine.on_midi_event(MidiEvent::Clock, now_ns, &mut link);
+    }
+    let snap = engine.snapshot();
+    assert_eq!(snap.lock_state, LockState::Locked);
+    assert!(snap.round_bpm);
+    assert_eq!(snap.bpm_link, 120.0);
+    assert!((snap.bpm_midi_long.unwrap() - 120.12).abs() < 0.02);
+
+    // 2. Step change to 127.85 BPM snaps Link to 128.0.
+    let tick_127_85 = 60_000_000_000.0 / (24.0 * 127.85);
+    let seg_start = now_ns;
+    for k in 1..=200 {
+        now_ns = seg_start + ((k as f64) * tick_127_85).round() as i64;
+        engine.on_midi_event(MidiEvent::Clock, now_ns, &mut link);
+    }
+    assert_eq!(engine.snapshot().bpm_link, 128.0);
+
+    // 3. Dynamic SetRoundBpm(false) then SetRoundBpm(true) on fractional 124.42 BPM.
+    let mut dyn_engine = SyncEngine::new(midi_to_link_config());
+    let mut dyn_link = MockLinkSession::new(120.0);
+    let tick_124_42 = 60_000_000_000.0 / (24.0 * 124.42);
+    let mut dyn_ns = 0_i64;
+    for i in 0..144 {
+        dyn_ns = ((i as f64) * tick_124_42).round() as i64;
+        dyn_engine.on_midi_event(MidiEvent::Clock, dyn_ns, &mut dyn_link);
+    }
+    assert!((dyn_engine.snapshot().bpm_link - 124.42).abs() < 0.05);
+    let _ = dyn_engine.apply_command(RtCommand::SetRoundBpm(true), dyn_ns, &mut dyn_link);
+    assert_eq!(dyn_engine.snapshot().bpm_link, 124.0);
+    assert!(dyn_engine.snapshot().round_bpm);
+}
+
+#[test]
+fn midi_to_link_30s_ols_window_capacity() {
+    let cfg = SyncConfig {
+        ols_window_secs: 30.0,
+        ..midi_to_link_config()
+    };
+    assert_eq!(cfg.validate(), Ok(()));
+
+    let mut engine = SyncEngine::new(cfg);
+    let mut link = MockLinkSession::new(120.0);
+
+    // 30 s at 300 BPM = 3600 ticks (> old 2048 cap, <= new 4096 LONG_RING_CAPACITY).
+    let tick_300_ns = 60_000_000_000.0 / (24.0 * 300.0);
+    for i in 0..3840 {
+        let ts = ((i as f64) * tick_300_ns).round() as i64;
+        engine.on_midi_event(MidiEvent::Clock, ts, &mut link);
+    }
+    let snap = engine.snapshot();
+    assert_eq!(snap.lock_state, LockState::Locked);
+    assert!(
+        (snap.bpm_link - 300.0).abs() <= 0.05,
+        "expected 300 BPM lock over 30 s OLS window, got {}",
+        snap.bpm_link
+    );
+}

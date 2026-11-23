@@ -208,7 +208,7 @@ check_ssh_cutover_safety() {
 
 rollback_ap() {
   log "Rolling back AP configuration and restoring wlan0 to NetworkManager..."
-  systemctl disable --now tactus-ap.service 2>/dev/null || true
+  systemctl disable --now tactus-dhcp.service tactus-ap.service 2>/dev/null || true
   rm -f /etc/NetworkManager/conf.d/99-tactus-unmanaged.conf
   if systemctl is-active --quiet NetworkManager.service; then
     nmcli general reload || systemctl reload NetworkManager.service || true
@@ -287,6 +287,87 @@ ensure_tactus_user() {
   install -d -o tactus -g tactus -m 0750 /var/lib/tactus
 }
 
+resolve_tactus_version() {
+  local ver="${TACTUS_VERSION:-}"
+  if [[ -z "$ver" && -r "${SYSTEM_DIR}/../Cargo.toml" ]]; then
+    ver="$(awk '
+      /^\[workspace\.package\]/ { in_ws = 1; next }
+      /^\[/ { in_ws = 0 }
+      in_ws && /^[[:space:]]*version[[:space:]]*=/ {
+        gsub(/.*=[[:space:]]*"|".*/, "", $0)
+        print
+        exit
+      }
+    ' "${SYSTEM_DIR}/../Cargo.toml")"
+  fi
+  if [[ -z "$ver" && -n "$BINARY_PATH" && -x "$BINARY_PATH" ]]; then
+    ver="$("$BINARY_PATH" --help 2>&1 | awk 'NR==1 { print $2; exit }' || true)"
+  elif [[ -z "$ver" && -x /usr/local/bin/tactusd ]]; then
+    ver="$(/usr/local/bin/tactusd --help 2>&1 | awk 'NR==1 { print $2; exit }' || true)"
+  fi
+  ver="$(printf '%s' "$ver" | tr -cd 'A-Za-z0-9._+-')"
+  printf '%s' "${ver:-0.1.0}"
+}
+
+configure_avahi_ipv4_only() {
+  local avahi_conf="/etc/avahi/avahi-daemon.conf"
+  if [[ ! -f "$avahi_conf" ]]; then
+    log "Creating ${avahi_conf} with use-ipv6=no..."
+    printf '[server]\nuse-ipv6=no\n' >"$avahi_conf"
+    chmod 0644 "$avahi_conf"
+    systemctl restart avahi-daemon.service
+    return 0
+  fi
+
+  local tmp_conf
+  tmp_conf="$(mktemp)"
+  awk '
+    BEGIN { in_server = 0; seen_server = 0; wrote_ipv6 = 0 }
+    /^\[server\]/ {
+      print
+      in_server = 1
+      seen_server = 1
+      next
+    }
+    /^\[/ {
+      if (in_server && !wrote_ipv6) {
+        print "use-ipv6=no"
+        wrote_ipv6 = 1
+      }
+      in_server = 0
+      print
+      next
+    }
+    in_server && /^[#;[:space:]]*use-ipv6[[:space:]]*=/ {
+      if (!wrote_ipv6) {
+        print "use-ipv6=no"
+        wrote_ipv6 = 1
+      }
+      next
+    }
+    { print }
+    END {
+      if (!seen_server) {
+        print ""
+        print "[server]"
+        print "use-ipv6=no"
+      } else if (in_server && !wrote_ipv6) {
+        print "use-ipv6=no"
+      }
+    }
+  ' "$avahi_conf" >"$tmp_conf"
+
+  if ! cmp -s "$tmp_conf" "$avahi_conf"; then
+    log "Setting use-ipv6=no in ${avahi_conf}..."
+    install -m 0644 "$tmp_conf" "$avahi_conf"
+    rm -f "$tmp_conf"
+    systemctl restart avahi-daemon.service
+  else
+    rm -f "$tmp_conf"
+    systemctl reload-or-restart avahi-daemon.service
+  fi
+}
+
 install_system_files() {
   log "Installing hostapd, dnsmasq, avahi, config, and systemd unit files..."
   install -d -m 0755 /etc/hostapd /etc/dnsmasq.d /etc/avahi/services /etc/systemd/system
@@ -295,6 +376,10 @@ install_system_files() {
     local psk_len=${#TACTUS_AP_PSK}
     if (( psk_len < 8 || psk_len > 63 )); then
       echo "error: TACTUS_AP_PSK must be 8..63 characters" >&2
+      exit 1
+    fi
+    if [[ "$TACTUS_AP_PSK" =~ [[:cntrl:]] ]]; then
+      echo "error: TACTUS_AP_PSK cannot contain control characters" >&2
       exit 1
     fi
     local tmp_conf
@@ -309,30 +394,39 @@ install_system_files() {
 
   install -m 0644 "${SYSTEM_DIR}/dnsmasq/tactus-ap.conf" /etc/dnsmasq.d/tactus-ap.conf
 
-  local tmp_avahi board_serial=""
+  local tmp_avahi board_serial="" tactus_version=""
   tmp_avahi="$(mktemp)"
+  tactus_version="$(resolve_tactus_version)"
   if [[ -r /sys/devices/soc0/serial_number ]]; then
     board_serial="$(tr -cd 'A-Za-z0-9._-' </sys/devices/soc0/serial_number)"
   fi
-  if [[ -n "$board_serial" ]]; then
-    awk -v serial="$board_serial" '
-      /<type>_tactus\._tcp<\/type>/ { in_tactus = 1 }
-      in_tactus && /<\/service>/ {
+  awk -v serial="$board_serial" -v ver="$tactus_version" '
+    /<type>_tactus\._tcp<\/type>/ { in_tactus = 1 }
+    in_tactus && /<txt-record>version=.*<\/txt-record>/ {
+      sub(/<txt-record>version=.*<\/txt-record>/, "<txt-record>version=" ver "</txt-record>")
+    }
+    in_tactus && /<\/service>/ {
+      if (serial != "") {
         print "    <txt-record>serial_number=" serial "</txt-record>"
-        in_tactus = 0
       }
-      { print }
-    ' "${SYSTEM_DIR}/avahi/tactus.service" >"$tmp_avahi"
-  else
-    cp "${SYSTEM_DIR}/avahi/tactus.service" "$tmp_avahi"
-  fi
+      in_tactus = 0
+    }
+    { print }
+  ' "${SYSTEM_DIR}/avahi/tactus.service" >"$tmp_avahi"
   if command -v python3 >/dev/null 2>&1; then
     python3 -c 'import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1])' "$tmp_avahi"
   fi
   install -m 0644 "$tmp_avahi" /etc/avahi/services/tactus.service
   rm -f "$tmp_avahi"
 
+  local tactusd_unit_changed=0
+  if [[ ! -f /etc/systemd/system/tactusd.service ]] ||
+     ! cmp -s "${SYSTEM_DIR}/systemd/tactusd.service" /etc/systemd/system/tactusd.service; then
+    tactusd_unit_changed=1
+  fi
+
   install -m 0644 "${SYSTEM_DIR}/systemd/tactus-ap.service" /etc/systemd/system/tactus-ap.service
+  install -m 0644 "${SYSTEM_DIR}/systemd/tactus-dhcp.service" /etc/systemd/system/tactus-dhcp.service
   install -m 0644 "${SYSTEM_DIR}/systemd/tactusd.service" /etc/systemd/system/tactusd.service
 
   if [[ ! -f /var/lib/tactus/config.toml ]]; then
@@ -345,7 +439,13 @@ install_system_files() {
   dnsmasq --test --conf-file=/etc/dnsmasq.d/tactus-ap.conf
   systemctl daemon-reload
   systemctl enable --now avahi-daemon.service
-  systemctl reload-or-restart avahi-daemon.service
+  configure_avahi_ipv4_only
+
+  if [[ "$tactusd_unit_changed" -eq 1 && -z "$BINARY_PATH" ]] &&
+     systemctl is-active --quiet tactusd.service; then
+    log "Restarting tactusd.service after systemd unit update..."
+    systemctl restart tactusd.service
+  fi
 }
 
 enable_ssh() {
@@ -506,9 +606,10 @@ activate_ap() {
     rfkill unblock wifi || true
   fi
 
-  log "Enabling and starting tactus-ap.service..."
-  systemctl enable tactus-ap.service
+  log "Enabling and starting tactus-ap.service and tactus-dhcp.service..."
+  systemctl enable tactus-ap.service tactus-dhcp.service
   systemctl restart tactus-ap.service
+  systemctl restart tactus-dhcp.service
 
   local ap_wait
   for ap_wait in 1 2 3 4 5 6 7 8 9 10; do
@@ -558,7 +659,7 @@ verify_board() {
     core_services+=(ssh.service)
   fi
   if [[ "$MODE" == "activate" ]]; then
-    core_services+=(tactus-ap.service)
+    core_services+=(tactus-ap.service tactus-dhcp.service)
   fi
   local svc
   for svc in "${core_services[@]}"; do
@@ -617,6 +718,13 @@ verify_board() {
     echo "  [PASS] /etc/avahi/services/tactus.service declares _tactus._tcp + _http._tcp with serial"
   else
     echo "  [FAIL] /etc/avahi/services/tactus.service missing, invalid XML, or missing _tactus._tcp/serial" >&2
+    failures=$((failures + 1))
+  fi
+
+  if grep -Eq '^[[:space:]]*use-ipv6=no([[:space:]]|$)' /etc/avahi/avahi-daemon.conf 2>/dev/null; then
+    echo "  [PASS] /etc/avahi/avahi-daemon.conf sets use-ipv6=no"
+  else
+    echo "  [FAIL] /etc/avahi/avahi-daemon.conf missing use-ipv6=no" >&2
     failures=$((failures + 1))
   fi
 

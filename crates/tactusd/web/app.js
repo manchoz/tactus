@@ -6,6 +6,10 @@
   const WATCHDOG_INTERVAL_MS = 2000;
   const DRAG_SETTLE_MS = 250;
   const OFFSET_THROTTLE_MS = 50;
+  const MAX_MIDI_OUTPUTS = 8;
+  const PHASE_SNAP_MS = 35;
+  const PHASE_BLEND_ALPHA = 0.35;
+  const BACKWARD_GUARD_MS = 25;
 
   const localUiHash =
     document.querySelector('meta[name="tactus-ui-hash"]')?.getAttribute("content") || "";
@@ -27,6 +31,7 @@
     diagPhase: document.getElementById("diag-phase"),
     beatStrip: document.getElementById("beat-strip"),
     phaseBarFill: document.getElementById("phase-bar-fill"),
+    playStopBtn: document.getElementById("play-stop-btn"),
     resyncBtn: document.getElementById("resync-btn"),
     dirButtons: Array.from(document.querySelectorAll("[data-dir]")),
     bpmStepButtons: Array.from(document.querySelectorAll("[data-bpm-delta]")),
@@ -35,6 +40,8 @@
     startStopToggle: document.getElementById("start-stop-toggle"),
     clockThruBlock: document.getElementById("clock-thru-block"),
     clockThruToggle: document.getElementById("clock-thru-toggle"),
+    roundBpmBlock: document.getElementById("round-bpm-block"),
+    roundBpmToggle: document.getElementById("round-bpm-toggle"),
     offsetReadout: document.getElementById("offset-readout"),
     offsetReset: document.getElementById("offset-reset"),
     offsetMinus: document.getElementById("offset-minus"),
@@ -58,9 +65,76 @@
   let offsetSettleTimer = null;
   let lastOffsetSentAt = 0;
   let lastRenderedBeats = 0;
+  let lastActiveBeatIdx = -1;
+  let phaseRafId = null;
+  const phaseClock = {
+    valid: false,
+    anchorPhase: 0,
+    anchorTimeMs: 0,
+    bpm: 120,
+    quantum: 4,
+    beatCount: 4,
+  };
   let lastInSignature = null;
   let lastOutSignature = null;
   let resyncTimer = null;
+  let wakeLockSentinel = null;
+  let wakeLockBusy = false;
+
+  function supportsWakeLock() {
+    return Boolean(
+      window.isSecureContext &&
+        navigator.wakeLock &&
+        typeof navigator.wakeLock.request === "function"
+    );
+  }
+
+  async function requestScreenWakeLock() {
+    if (
+      !supportsWakeLock() ||
+      paused ||
+      document.hidden ||
+      wakeLockSentinel ||
+      wakeLockBusy
+    ) {
+      return;
+    }
+    wakeLockBusy = true;
+    try {
+      const sentinel = await navigator.wakeLock.request("screen");
+      if (document.hidden || paused) {
+        try {
+          await sentinel.release();
+        } catch (_err) {
+          // Ignore release failures when hidden.
+        }
+        return;
+      }
+      wakeLockSentinel = sentinel;
+      sentinel.addEventListener("release", () => {
+        if (wakeLockSentinel === sentinel) {
+          wakeLockSentinel = null;
+        }
+      });
+    } catch (_err) {
+      // Silently ignore unsupported, non-HTTPS, or gesture-gated rejections.
+    } finally {
+      wakeLockBusy = false;
+    }
+  }
+
+  async function releaseScreenWakeLock() {
+    const sentinel = wakeLockSentinel;
+    wakeLockSentinel = null;
+    if (!sentinel) {
+      return;
+    }
+    try {
+      await sentinel.release();
+    } catch (_err) {
+      // Ignore release failures during background transitions.
+    }
+  }
 
   function setConnectionStatus(status) {
     els.connPill.className = "pill";
@@ -99,6 +173,7 @@
   }
 
   function closeSocketCleanly() {
+    stopPhaseLoop(true);
     if (ws) {
       const stale = ws;
       ws = null;
@@ -197,6 +272,7 @@
         return;
       }
       ws = null;
+      stopPhaseLoop(true);
       if (paused || document.hidden) {
         setConnectionStatus("offline");
       } else {
@@ -317,6 +393,118 @@
       els.beatStrip.appendChild(cell);
     }
     lastRenderedBeats = beatCount;
+    lastActiveBeatIdx = -1;
+  }
+
+  function wrapPhase(phase, quantum) {
+    return ((phase % quantum) + quantum) % quantum;
+  }
+
+  function shortestPhaseDelta(target, current, quantum) {
+    let delta = wrapPhase(target - current, quantum);
+    if (delta > quantum * 0.5) {
+      delta -= quantum;
+    }
+    return delta;
+  }
+
+  function predictPhase(nowMs) {
+    const dtMs = Math.max(0, nowMs - phaseClock.anchorTimeMs);
+    const deltaBeats = dtMs * (phaseClock.bpm / 60000);
+    return wrapPhase(phaseClock.anchorPhase + deltaBeats, phaseClock.quantum);
+  }
+
+  function syncPhaseClock(t, nowMs) {
+    const quantum = Number.isFinite(t.quantum) && t.quantum > 0 ? t.quantum : 4;
+    const beatCount = Math.max(1, Math.min(16, Math.round(quantum)));
+    const bpm = Number.isFinite(t.bpm_link) && t.bpm_link > 0 ? t.bpm_link : 120;
+    const serverPhase = wrapPhase(Number.isFinite(t.beat_phase) ? t.beat_phase : 0, quantum);
+
+    if (
+      !phaseClock.valid ||
+      Math.abs(quantum - phaseClock.quantum) > 1e-6 ||
+      Math.abs(bpm - phaseClock.bpm) > 0.05
+    ) {
+      phaseClock.valid = true;
+      phaseClock.anchorPhase = serverPhase;
+      phaseClock.anchorTimeMs = nowMs;
+      phaseClock.bpm = bpm;
+      phaseClock.quantum = quantum;
+      phaseClock.beatCount = beatCount;
+      return;
+    }
+
+    const predicted = predictPhase(nowMs);
+    const errBeats = shortestPhaseDelta(serverPhase, predicted, quantum);
+    const errMs = (errBeats * 60000) / bpm;
+    const predBeat = Math.floor(predicted) % beatCount;
+    const serverBeat = Math.floor(serverPhase) % beatCount;
+
+    let nextPhase;
+    if (Math.abs(errMs) > PHASE_SNAP_MS || (errBeats > 0 && serverBeat !== predBeat)) {
+      nextPhase = serverPhase;
+    } else if (errBeats < 0 && serverBeat !== predBeat && Math.abs(errMs) <= BACKWARD_GUARD_MS) {
+      nextPhase = predBeat;
+    } else {
+      nextPhase = wrapPhase(predicted + errBeats * PHASE_BLEND_ALPHA, quantum);
+    }
+
+    phaseClock.anchorPhase = nextPhase;
+    phaseClock.anchorTimeMs = nowMs;
+    phaseClock.bpm = bpm;
+    phaseClock.quantum = quantum;
+    phaseClock.beatCount = beatCount;
+  }
+
+  function paintPhase(phase) {
+    if (phaseClock.beatCount !== lastRenderedBeats) {
+      rebuildBeatStrip(phaseClock.beatCount);
+    }
+    const activeIdx = Math.min(phaseClock.beatCount - 1, Math.max(0, Math.floor(phase)));
+    if (activeIdx !== lastActiveBeatIdx) {
+      const cells = els.beatStrip.children;
+      for (let i = 0; i < cells.length; i += 1) {
+        const cell = cells[i];
+        cell.classList.toggle("active", i === activeIdx);
+        cell.classList.toggle("downbeat", i === 0 && activeIdx === 0);
+      }
+      lastActiveBeatIdx = activeIdx;
+    }
+    const progress = Math.max(0, Math.min(1, phase / phaseClock.quantum));
+    els.phaseBarFill.style.transform = `scaleX(${progress.toFixed(4)})`;
+  }
+
+  function stepPhaseFrame(nowMs) {
+    phaseRafId = null;
+    if (paused || document.hidden || !phaseClock.valid || !ws || ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    paintPhase(predictPhase(nowMs));
+    phaseRafId = window.requestAnimationFrame(stepPhaseFrame);
+  }
+
+  function startPhaseLoop() {
+    if (
+      phaseRafId !== null ||
+      paused ||
+      document.hidden ||
+      !phaseClock.valid ||
+      !ws ||
+      ws.readyState !== WebSocket.OPEN
+    ) {
+      return;
+    }
+    phaseRafId = window.requestAnimationFrame(stepPhaseFrame);
+  }
+
+  function stopPhaseLoop(invalidate) {
+    if (phaseRafId !== null) {
+      window.cancelAnimationFrame(phaseRafId);
+      phaseRafId = null;
+    }
+    if (invalidate) {
+      phaseClock.valid = false;
+    }
   }
 
   function renderInputPortSelect(state) {
@@ -437,11 +625,13 @@
       const isAttached = selectedIds.includes(port.id);
       const isSelected =
         isAttached || matchedByRule.some((matched) => matched && matched.id === port.id);
+      const atOutputLimit = !isSelected && matchRules.length >= MAX_MIDI_OUTPUTS;
 
       const row = document.createElement("button");
       row.type = "button";
-      row.className = `port-row${isSelected ? " selected" : ""}`;
+      row.className = `port-row${isSelected ? " selected" : ""}${atOutputLimit ? " disabled" : ""}`;
       row.setAttribute("aria-pressed", String(isSelected));
+      row.disabled = atOutputLimit;
 
       const main = document.createElement("div");
       main.className = "port-row-main";
@@ -481,6 +671,11 @@
         tag.className = "port-tag tag-wait";
         tag.textContent = "Attaching";
         meta.appendChild(tag);
+      } else if (atOutputLimit) {
+        const tag = document.createElement("span");
+        tag.className = "port-tag tag-idle";
+        tag.textContent = "Max 8";
+        meta.appendChild(tag);
       }
 
       const check = document.createElement("span");
@@ -509,6 +704,9 @@
             return !matched || matched.id !== port.id;
           });
         } else {
+          if (currentRules.length >= MAX_MIDI_OUTPUTS) {
+            return;
+          }
           const val = persistentMatchValue(port, currentEligible);
           nextOutputs = [...currentRules, val];
         }
@@ -615,28 +813,24 @@
 
     els.bpmValue.textContent = t.bpm_link.toFixed(1);
 
-    const beatCount = Math.max(1, Math.min(16, Math.round(t.quantum || 4)));
-    if (beatCount !== lastRenderedBeats) {
-      rebuildBeatStrip(beatCount);
-    }
-    const wrappedPhase = ((t.beat_phase % beatCount) + beatCount) % beatCount;
-    const activeIdx = Math.floor(wrappedPhase);
-    const cells = els.beatStrip.children;
-    for (let i = 0; i < cells.length; i += 1) {
-      const cell = cells[i];
-      cell.classList.toggle("active", i === activeIdx);
-      cell.classList.toggle("downbeat", i === 0 && activeIdx === 0);
-    }
-    const progressPct = Math.max(0, Math.min(100, (wrappedPhase / beatCount) * 100));
-    els.phaseBarFill.style.width = `${progressPct.toFixed(1)}%`;
+    syncPhaseClock(t, performance.now());
+    paintPhase(phaseClock.anchorPhase);
+    startPhaseLoop();
 
     for (const btn of els.dirButtons) {
       btn.classList.toggle("active", btn.dataset.dir === t.direction);
     }
 
+    els.playStopBtn.classList.toggle("hidden", !isLinkToMidi);
+    els.playStopBtn.textContent = t.is_playing ? "Stop" : "Play";
+    els.playStopBtn.classList.toggle("playing", Boolean(t.is_playing));
+    els.playStopBtn.setAttribute("aria-pressed", String(Boolean(t.is_playing)));
+
     els.startStopToggle.setAttribute("aria-checked", String(Boolean(t.start_stop_sync)));
     els.clockThruBlock.classList.toggle("hidden", isLinkToMidi);
     els.clockThruToggle.setAttribute("aria-checked", String(Boolean(t.clock_thru)));
+    els.roundBpmBlock.classList.toggle("hidden", isLinkToMidi);
+    els.roundBpmToggle.setAttribute("aria-checked", String(Boolean(t.round_bpm)));
 
     if (!isDraggingOffset) {
       const snapped = snapHalfMs(t.midi_offset_ms || 0);
@@ -700,19 +894,38 @@
   els.startStopToggle.addEventListener("click", () => {
     const current = els.startStopToggle.getAttribute("aria-checked") === "true";
     const next = !current;
-    els.startStopToggle.setAttribute("aria-checked", String(next));
-    sendCommand({ set_start_stop_sync: next });
+    if (sendCommand({ set_start_stop_sync: next })) {
+      els.startStopToggle.setAttribute("aria-checked", String(next));
+    }
   });
 
   els.clockThruToggle.addEventListener("click", () => {
     const current = els.clockThruToggle.getAttribute("aria-checked") === "true";
     const next = !current;
-    els.clockThruToggle.setAttribute("aria-checked", String(next));
-    sendCommand({ set_clock_thru: next });
+    if (sendCommand({ set_clock_thru: next })) {
+      els.clockThruToggle.setAttribute("aria-checked", String(next));
+    }
+  });
+
+  els.roundBpmToggle.addEventListener("click", () => {
+    const current = els.roundBpmToggle.getAttribute("aria-checked") === "true";
+    const next = !current;
+    if (sendCommand({ set_round_bpm: next })) {
+      els.roundBpmToggle.setAttribute("aria-checked", String(next));
+    }
+  });
+
+  els.playStopBtn.addEventListener("click", () => {
+    if (!latestState || latestState.telemetry.direction !== "link_to_midi") {
+      return;
+    }
+    sendCommand({ set_link_playing: !latestState.telemetry.is_playing });
   });
 
   els.resyncBtn.addEventListener("click", () => {
-    sendCommand("resync_downbeat");
+    if (!sendCommand("resync_downbeat")) {
+      return;
+    }
     els.resyncBtn.classList.add("confirmed");
     els.resyncBtn.textContent = "Resync Sent";
     if (resyncTimer !== null) {
@@ -809,16 +1022,28 @@
   });
 
   // Page Visibility / iOS Lock-Unlock / Network Resume silent recovery
+  document.addEventListener(
+    "pointerdown",
+    () => {
+      if (!wakeLockSentinel) {
+        void requestScreenWakeLock();
+      }
+    },
+    { passive: true }
+  );
+
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
       paused = true;
       clearReconnectTimer();
       closeSocketCleanly();
       setConnectionStatus("offline");
+      void releaseScreenWakeLock();
     } else {
       paused = false;
       reconnectAttempt = 0;
       scheduleReconnect(true);
+      void requestScreenWakeLock();
     }
   });
 
@@ -829,6 +1054,7 @@
       if (!ws || ws.readyState !== WebSocket.OPEN) {
         scheduleReconnect(true);
       }
+      void requestScreenWakeLock();
     }
   });
 
@@ -841,6 +1067,7 @@
   });
 
   window.addEventListener("offline", () => {
+    stopPhaseLoop(true);
     setConnectionStatus("offline");
   });
 
@@ -860,4 +1087,5 @@
 
   rebuildBeatStrip(4);
   connectWebSocket();
+  void requestScreenWakeLock();
 })();

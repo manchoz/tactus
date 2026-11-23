@@ -2,7 +2,7 @@
 
 use tactus_protocol::SyncConfig;
 
-use crate::link::{ns_to_us, us_to_ns, LinkSession};
+use crate::link::{ns_to_us, offset_ms_to_ns, us_to_ns, LinkSession};
 use crate::midi::{MidiEvent, MidiOutputBatch, ScheduledMidiEvent};
 use crate::ring::{MIN_VALID_BPM, TICKS_PER_BEAT};
 
@@ -56,13 +56,38 @@ impl LinkToMidiScheduler {
     }
 
     /// Synchronize scheduler transport state when `start_stop_sync` is toggled dynamically.
-    pub fn on_start_stop_sync_changed(&mut self, enabled: bool, link_is_playing: bool) {
+    pub fn on_start_stop_sync_changed(
+        &mut self,
+        enabled: bool,
+        now_ns: i64,
+        config: &SyncConfig,
+        link: &impl LinkSession,
+    ) -> MidiOutputBatch {
+        let mut batch = MidiOutputBatch::new();
+        let link_is_playing = link.is_playing();
         self.last_link_playing = link_is_playing;
-        self.transport = if enabled && link_is_playing {
-            MidiTransportState::Playing
+
+        if !enabled {
+            if self.transport == MidiTransportState::Playing {
+                let _ = batch.push(ScheduledMidiEvent {
+                    event: MidiEvent::Stop,
+                    timestamp_ns: now_ns,
+                });
+            }
+            self.transport = MidiTransportState::Stopped;
+        } else if link_is_playing {
+            let offset_ns = offset_ms_to_ns(config.midi_offset_ms);
+            let min_tick = self.next_tick_index.unwrap_or_else(|| {
+                let now_link_us = ns_to_us(now_ns.saturating_sub(offset_ns));
+                tick_ceil_from_beat(link.beat_at_time(now_link_us, config.quantum))
+            });
+            let start_tick = next_quantum_tick(min_tick, config.quantum);
+            self.transport = MidiTransportState::ArmedForStart { start_tick };
         } else {
-            MidiTransportState::Stopped
-        };
+            self.transport = MidiTransportState::Stopped;
+        }
+
+        batch
     }
 
     /// Arm a quantized `Start (0xFA)` on the next Link quantum boundary (if playing & synced).
@@ -170,11 +195,6 @@ impl Default for LinkToMidiScheduler {
     fn default() -> Self {
         Self::new()
     }
-}
-
-#[inline]
-fn offset_ms_to_ns(offset_ms: f32) -> i64 {
-    (f64::from(offset_ms) * 1_000_000.0).round() as i64
 }
 
 #[inline]

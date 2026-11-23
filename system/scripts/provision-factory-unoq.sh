@@ -157,6 +157,11 @@ if [[ -n "$AP_PSK" ]] && (( ${#AP_PSK} < 8 || ${#AP_PSK} > 63 )); then
   exit 1
 fi
 
+if [[ -n "$AP_PSK" && "$AP_PSK" =~ [[:cntrl:]] ]]; then
+  echo "error: AP passphrase cannot contain control characters" >&2
+  exit 1
+fi
+
 if [[ -n "$DEB_DIR" && ! -d "$DEB_DIR" ]]; then
   echo "error: --deb-dir '$DEB_DIR' does not exist" >&2
   exit 1
@@ -174,6 +179,32 @@ fi
 
 log() {
   echo "[tactus-factory] $*"
+}
+
+resolve_workspace_version() {
+  local cargo_toml="${SYSTEM_DIR}/../Cargo.toml"
+  if [[ -r "$cargo_toml" ]]; then
+    awk '
+      /^\[workspace\.package\]/ { in_ws = 1; next }
+      /^\[/ { in_ws = 0 }
+      in_ws && /^[[:space:]]*version[[:space:]]*=/ {
+        gsub(/.*=[[:space:]]*"|".*/, "", $0)
+        print
+        exit
+      }
+    ' "$cargo_toml"
+  fi
+}
+
+build_env_payload() {
+  local ver=""
+  ver="$(resolve_workspace_version)"
+  if [[ -n "$ver" ]]; then
+    printf 'TACTUS_VERSION=%q\n' "$ver"
+  fi
+  if [[ -n "$AP_PSK" ]]; then
+    printf 'TACTUS_AP_PSK=%q\n' "$AP_PSK"
+  fi
 }
 
 PROMPTED_ARDUINO_PASSWORD=""
@@ -332,8 +363,10 @@ run_adb() {
     "${ADB_CMD[@]}" shell -T 'chmod 0755 /tmp/tactus-bin/tactusd'
   fi
 
-  if [[ -n "$AP_PSK" ]]; then
-    printf 'TACTUS_AP_PSK=%q\n' "$AP_PSK" | "${ADB_CMD[@]}" shell -T 'umask 077 && cat > /tmp/.tactus-env'
+  local env_payload=""
+  env_payload="$(build_env_payload)"
+  if [[ -n "$env_payload" ]]; then
+    printf '%s' "$env_payload" | "${ADB_CMD[@]}" shell -T 'umask 077 && cat > /tmp/.tactus-env'
   fi
 
   if [[ -n "$stage_pw" ]]; then
@@ -443,8 +476,10 @@ run_ssh() {
     "${ssh_base[@]}" "$SSH_TARGET" 'mkdir -p /tmp/tactus-bin && cat > /tmp/tactus-bin/tactusd && chmod 0755 /tmp/tactus-bin/tactusd' < "$BINARY_PATH"
   fi
 
-  if [[ -n "$AP_PSK" ]]; then
-    printf 'TACTUS_AP_PSK=%q\n' "$AP_PSK" | "${ssh_base[@]}" "$SSH_TARGET" 'umask 077 && cat > /tmp/.tactus-env'
+  local env_payload=""
+  env_payload="$(build_env_payload)"
+  if [[ -n "$env_payload" ]]; then
+    printf '%s' "$env_payload" | "${ssh_base[@]}" "$SSH_TARGET" 'umask 077 && cat > /tmp/.tactus-env'
   fi
 
   if [[ "$RESET_ARDUINO_PASSWORD" -eq 1 || -n "${TACTUS_ARDUINO_PASSWORD:-}" ]]; then

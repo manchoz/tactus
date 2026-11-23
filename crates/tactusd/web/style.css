@@ -271,13 +271,14 @@ body {
   font-weight: 700;
   color: var(--muted);
   user-select: none;
-  transition: background-color 60ms linear, color 60ms linear, border-color 60ms linear;
+  transition: background-color 70ms ease-out, color 70ms ease-out, border-color 70ms ease-out;
 }
 
 .beat-cell.active {
   background: var(--teal-dim);
   border-color: var(--teal);
   color: var(--teal);
+  transition: none;
 }
 
 .beat-cell.active.downbeat {
@@ -296,9 +297,11 @@ body {
 
 .phase-fill {
   height: 100%;
-  width: 0%;
+  width: 100%;
+  transform-origin: left center;
+  transform: scaleX(0);
+  will-change: transform;
   background: linear-gradient(90deg, var(--amber), var(--teal));
-  transition: width 55ms linear;
 }
 
 .btn {
@@ -346,6 +349,31 @@ body {
   background: transparent;
   border-color: var(--border);
   color: var(--muted);
+}
+
+.hero-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.hero-actions > .btn {
+  flex: 1;
+  min-height: 50px;
+}
+
+.btn-transport {
+  font-size: 0.98rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  background: var(--teal-dim);
+  border-color: rgba(45, 212, 191, 0.55);
+  color: var(--teal);
+}
+
+.btn-transport.playing {
+  background: var(--red-dim);
+  border-color: rgba(239, 68, 68, 0.6);
+  color: var(--red);
 }
 
 .btn-resync {
@@ -623,6 +651,17 @@ input[type="range"]::-webkit-slider-thumb {
 }
 
 .port-row.unplugged:active {
+  transform: none;
+}
+
+.port-row:disabled,
+.port-row.disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.port-row:disabled:active,
+.port-row.disabled:active {
   transform: none;
 }
 

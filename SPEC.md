@@ -11,14 +11,14 @@
 - `LinkToMidi`: Ableton Link timeline drives MIDI Clock output.
 - `MidiToLink`: Incoming MIDI Clock drives Ableton Link tempo and phase.
 - **Direction Switch:** Switching direction MUST immediately reset estimator state (`Unlocked`). When leaving `LinkToMidi` while playing and `start_stop_sync = true`, emit MIDI `Stop (0xFC)` cleanly so downstream sequencers do not hang.
-- **Clock Domain:** Use `abl_link_clock_micros()` for all Ableton Link queries (`beat_at_time`, `time_at_beat`) and `CLOCK_MONOTONIC` for RT scheduling (`clock_nanosleep` with `TIMER_ABSTIME`). On Linux both map to the monotonic clock; maintain a single monotonic microsecond/nanosecond reference inside `tactus-sync-core`.
+- **Clock Domain:** Official `abl_link` reads `CLOCK_MONOTONIC_RAW` on Linux (`abl_link_clock_micros()`), whereas `timerfd_settime(TFD_TIMER_ABSTIME)` uses NTP-slewed `CLOCK_MONOTONIC`. `tactusd` runs `SyncEngine` in `CLOCK_MONOTONIC_RAW` nanoseconds and explicitly bridges deadlines to `CLOCK_MONOTONIC` via `ClockBridge` (`100 ms` bracketed refresh) so slewed drift never accumulates.
 
 ### 2.2 Mode A: `LinkToMidi`
 - Query Ableton Link session state (`beat`, `phase`, `tempo`, `is_playing`) at each tick deadline.
 - Generate 24 PPQN (`0xF8`) ticks scheduled with absolute timestamps (`TIMER_ABSTIME`) so isolated wake-up jitter never accumulates drift.
 - **Transport (when `start_stop_sync = true`):**
-  - Emit MIDI `Start (0xFA)` quantized to the next Link quantum boundary (default `quantum = 4.0` beats) when Link transitions to playing or on manual `ResyncDownbeat`.
-  - Emit MIDI `Stop (0xFC)` immediately when Link stops.
+  - Emit MIDI `Start (0xFA)` quantized to the next Link quantum boundary (default `quantum = 4.0` beats) when Link transitions to playing (including via Web UI `SetLinkPlaying`), when `start_stop_sync` is enabled mid-playback while Link is playing, or on manual `ResyncDownbeat`.
+  - Emit MIDI `Stop (0xFC)` immediately when Link stops or when `start_stop_sync` is disabled while playing.
   - When `start_stop_sync = false`, emit continuous `0xF8` clock ticks without `0xFA`/`0xFC`.
 - **Latency Offset:** Apply configurable signed offset (`-50.0 ms` to `+50.0 ms`, step `0.5 ms`) to shift the emitted MIDI clock grid relative to Link peers.
 
@@ -26,19 +26,21 @@
 Designed for setups where MIDI tempo changes rarely and rock-solid Link BPM stability is prioritized over instant tracking.
 
 1. **Timestamp Capture:**
-   - Record each incoming `0xF8` with a monotonic timestamp (`CLOCK_MONOTONIC` captured immediately on `snd_seq_event_input` in the `SCHED_FIFO` thread, or via an ALSA timestamping queue) and a monotonically increasing `tick_index`.
+   - Record each incoming `0xF8` with a monotonic timestamp (`CLOCK_MONOTONIC_RAW` captured immediately on ALSA RawMIDI `/dev/snd/midiC*D*` read in the `SCHED_FIFO` thread; `snd_seq` remains optional for future Yocto `meta-tactus`) and a monotonically increasing `tick_index`.
 2. **Acquisition Phase (`Unlocked` → `Acquiring` → `Locked`):**
    - On first `0xF8`, enter `Acquiring` without modifying Ableton Link yet.
-   - Once at least `fast_window_secs` (default `1.5 s`, minimum `24` ticks) of valid ticks are collected, commit the initial OLS BPM to Link and transition to `Locked`, then continue growing the long window up to `ols_window_secs` (`10.0 s`).
-3. **Long Window (Frequency Lock — 10.0 s):**
-   - Maintain a fixed-capacity ring buffer (`2048` samples, zero heap allocations; covers up to 512 BPM over 10 s) storing `(tick_index, timestamp_ns)` pairs within the last **10.0 seconds**.
-   - Compute tempo via **Ordinary Least Squares (OLS) linear regression** of `timestamp_ns` vs `tick_index`. Slope `m` (ns/tick) yields `BPM = 60_000_000_000.0 / (24.0 * m)`.
-   - Apply a deadband (default `±0.05 BPM`): commit the new tempo to Ableton Link only when the OLS estimate differs from the current committed Link BPM by more than the deadband.
+   - Once at least `fast_window_secs` (default `1.5 s`, minimum `24` ticks) of valid ticks are collected, commit the initial OLS BPM to Link and transition to `Locked`, then continue growing the long window up to `ols_window_secs` (default `10.0 s`, configurable up to `30.0 s`).
+3. **Long Window (Frequency Lock — `ols_window_secs` up to `30.0 s`):**
+   - Maintain a fixed-capacity ring buffer (`4096` samples, zero heap allocations; covers up to `340 BPM` over `30 s` or `999 BPM` over `10 s`) storing `(tick_index, timestamp_ns)` pairs within `ols_window_secs`.
+   - Compute tempo via contiguous-slice **Ordinary Least Squares (OLS) linear regression** (`SampleRing::as_slices`) of `timestamp_ns` vs `tick_index`. Slope `m` (ns/tick) yields `BPM = 60_000_000_000.0 / (24.0 * m)`.
+   - Once `Locked`, evaluate the long OLS window on every `6` ticks and all beat boundaries to minimize hot-path CPU overhead.
+   - Apply a deadband (default `±0.05 BPM`): commit the new tempo to Ableton Link only when the OLS estimate differs from the current committed Link BPM by more than the deadband. Optionally snap committed BPM to the nearest integer when `round_bpm = true` (preserving unrounded diagnostics).
 4. **Fast Window (Step-Change Detector — 1.5 s):**
    - Maintain a secondary short OLS window (default `1.5 s`, ~72 ticks at 120 BPM).
-   - If `|fast_bpm - committed_bpm| > step_change_bpm` (default `1.5 BPM`) consistently for `step_change_beats` consecutive beats (default `3` beats), declare an intentional tempo change: flush the 10 s buffer, immediately commit `fast_bpm` to Link, and resume long-window integration.
+   - If `|fast_bpm - committed_bpm| > step_change_bpm` (default `1.5 BPM`) consistently for `step_change_beats` consecutive beats (default `3` beats), declare an intentional tempo change: flush the long buffer, immediately commit `fast_bpm` to Link, and resume long-window integration.
 5. **Phase Lock & Transport:**
-   - On MIDI `Start (0xFA)`: reset `tick_index = 0`, align Link beat 1 via `force_beat_at_time()`, and start Link transport via `set_is_playing()` (1 ms pre-downbeat margin so remote Link peers align immediately without a 1-bar preroll) if `start_stop_sync = true`.
+   - Apply symmetric `midi_offset_ms` (`±50.0 ms`) to incoming `Start (0xFA)` and beat-boundary denoised timestamps (negative offset compensates incoming MIDI/BLE-MIDI transport latency symmetrically with `LinkToMidi`).
+   - On MIDI `Start (0xFA)`: reset `tick_index = 0`, align Link beat 0 at the offset-adjusted timestamp via `force_beat_at_time()`, and start Link transport via `set_is_playing()` (1 ms pre-downbeat margin so remote Link peers align immediately without a 1-bar preroll) if `start_stop_sync = true`.
    - On MIDI `Continue (0xFB)`: resume without resetting bar phase; start Link transport if `start_stop_sync = true`.
    - On MIDI `Stop (0xFC)`: stop Link transport if `start_stop_sync = true`; keep tempo tracking if `0xF8` ticks continue to arrive.
    - Every 24 ticks (quarter note), measure phase error between the MIDI beat timestamp and Link timeline phase.
@@ -58,7 +60,7 @@ Designed for setups where MIDI tempo changes rarely and rock-solid Link BPM stab
   - Meta tags for iOS fullscreen Home Screen app (`apple-mobile-web-app-capable`, `apple-mobile-web-app-status-bar-style`, SVG/PNG touch icon).
   - WebSocket `/ws` pushing telemetry snapshots at `10–15 Hz` (plus immediate push on state/downbeat change).
   - Automatic silent reconnect on `document.visibilitychange` and network resume, immediately hydrating UI from a full state snapshot.
-  - Core controls: Direction toggle (`Link → MIDI` / `MIDI → Link`), Start/Stop Sync toggle, BPM & Lock status readout, Link peer count, Downbeat indicator, Latency offset slider (`±50 ms`), MIDI input/output port selectors, Resync button.
+  - Core controls: Direction toggle (`Link → MIDI` / `MIDI → Link`), Start/Stop Sync toggle, Play/Stop transport control (`Link → MIDI`), Round BPM toggle (`MIDI → Link`), BPM & Lock status readout, Link peer count, Downbeat indicator, Latency offset slider (`±50 ms`), MIDI input/output port selectors (up to `8` simultaneous outputs), Resync button, and feature-detected Screen Wake Lock (`navigator.wakeLock` when available in secure contexts).
 
 ## 5. Configuration Schema (`/var/lib/tactus/config.toml`)
 ```toml
@@ -67,8 +69,10 @@ direction = "link_to_midi"        # "link_to_midi" | "midi_to_link"
 start_stop_sync = true
 clock_thru = true                 # Relay incoming MIDI clock/transport to other selected outputs in midi_to_link
 quantum = 4.0
+initial_bpm = 120.0               # Standalone Link tempo restored on boot when no peers are present
+round_bpm = false                 # Snap committed MidiToLink BPM to nearest integer BPM
 midi_offset_ms = 0.0
-ols_window_secs = 10.0
+ols_window_secs = 10.0            # Max 30.0 s
 fast_window_secs = 1.5
 bpm_deadband = 0.05
 step_change_bpm = 1.5

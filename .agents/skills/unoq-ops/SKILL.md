@@ -11,7 +11,7 @@ description: >-
 
 ## 1. SSH & Serial Console Access from macOS
 - **SSH shortcut (`~/.ssh/config`):**
-  - `ssh tactus` (Ethernet LAN `tactus.local`, forces IPv4 `AddressFamily inet` because UNO Q advertises an unroutable IPv6 ULA on mDNS before IPv4 — also force IPv4 for HTTP/WebSocket checks from macOS via `curl -4` or Python `socket.AF_INET`).
+  - `ssh tactus` (Ethernet LAN `tactus.local`; provisioned boards configure `use-ipv6=no` in `/etc/avahi/avahi-daemon.conf` so `tactus.local` resolves cleanly over IPv4 without `-4`, though keeping `AddressFamily inet` / `-4` remains helpful on unprovisioned boards advertising an unroutable IPv6 ULA).
   - `ssh tactus-ap` (`10.42.0.1` when joined to the `Tactus` WiFi AP).
   - Or explicitly: `ssh -4 -i ~/.ssh/id_ed25519 arduino@tactus.local` / `arduino@10.42.0.1`.
 - **Serial Linux console (UART):** `/dev/cu.usbserial-*` at `115200 8N1`. Log in as **`arduino`** (`tactus` is a locked `nologin` daemon user).
@@ -55,13 +55,14 @@ cargo zigbuild --workspace --release --target aarch64-unknown-linux-gnu.2.36
   -i ~/.ssh/id_ed25519 \
   --binary target/aarch64-unknown-linux-gnu/release/tactusd
 ```
-- **Post-deploy live verification (from macOS over IPv4):**
+- **Post-deploy live verification (from macOS):**
   ```bash
   shasum -a 256 target/aarch64-unknown-linux-gnu/release/tactusd
-  ssh tactus 'sha256sum /usr/local/bin/tactusd && ps -eLo pid,tid,psr,cls,rtprio,comm | grep -E "tactusd|rt-sync"; journalctl -u tactusd.service -n 20 --no-pager'
-  curl -4 -sS http://tactus.local/healthz && curl -4 -sSI http://tactus.local/
+  ssh tactus 'sha256sum /usr/local/bin/tactusd && ps -eLo pid,tid,psr,cls,rtprio,comm | grep -E "tactus|rt-sync|asio"; journalctl -u tactusd.service -n 20 --no-pager'
+  ssh tactus 'systemctl is-active tactus-ap.service tactus-dhcp.service && sudo pkill -9 dnsmasq && sleep 3 && systemctl is-active tactus-dhcp.service'
+  curl -sS http://tactus.local/healthz && curl -sSI http://tactus.local/ && curl -sS http://tactus.local/manifest.webmanifest
   ```
-  Confirm matching binary SHA256, `rt-sync` on Core `3` (`FF 75`, `mlockall=locked`), `ui_hash` + `no-store` headers on `/`, and zero `Device or resource busy` (`EBUSY`) lines in `journalctl`.
+  Confirm matching binary SHA256, `rt-sync` **alone** on Core `3` (`PSR=3`, `FF 75`, `mlockall=locked`) with `tactus-async` and `asio` confined to `PSR=0..2`, `tactus-dhcp.service` auto-restarting after `SIGKILL`, IPv4 resolution without `-4`, `ui_hash` + `no-store` headers on `/` + versioned icon URLs in `/manifest.webmanifest`, and zero `Device or resource busy` (`EBUSY`) lines in `journalctl`.
 
 ## 5. UNO Q Hardware Quick Reference
 - **OS / Kernel:** Debian 13 (`trixie`), `7.2.11-arduino1+`, `aarch64` (4 cores, QRB2210), glibc `2.41`.

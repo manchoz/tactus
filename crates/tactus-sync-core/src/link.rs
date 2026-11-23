@@ -14,6 +14,13 @@ pub(crate) fn us_to_ns(us: i64) -> i64 {
     us.saturating_mul(1_000)
 }
 
+/// Convert signed millisecond latency offset to nanoseconds.
+#[inline]
+#[must_use]
+pub(crate) fn offset_ms_to_ns(offset_ms: f32) -> i64 {
+    (f64::from(offset_ms) * 1_000_000.0).round() as i64
+}
+
 /// Abstraction over an `abl_link` session state captured on the RT thread.
 ///
 /// Implemented over real `tactus-link-sys` handles in `tactusd` (M3) and over deterministic
