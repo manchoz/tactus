@@ -135,7 +135,7 @@ impl SyncConfig {
     }
 }
 
-/// ALSA Sequencer port matching rules (`[midi]` section).
+/// ALSA MIDI (RawMIDI or Sequencer) port matching rules (`[midi]` section).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MidiConfig {

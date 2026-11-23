@@ -4,7 +4,7 @@
 
 ## Architectural Highlights
 
-- **Userspace Real-Time Determinism:** Targets stock Debian Linux (and future Yocto QLI `meta-tactus`) without `PREEMPT_RT` or PipeWire — uses a dedicated `SCHED_FIFO` thread, `mlockall`, `CLOCK_MONOTONIC` absolute timers (`TIMER_ABSTIME`), CPU core affinity, and direct ALSA Sequencer (`/dev/snd/seq`) I/O.
+- **Userspace Real-Time Determinism:** Targets stock Debian Linux (and future Yocto QLI `meta-tactus`) without `PREEMPT_RT` or PipeWire — uses a dedicated `SCHED_FIFO` thread, `mlockall`, `CLOCK_MONOTONIC` absolute timers (`TIMER_ABSTIME`), CPU core affinity, and direct ALSA RawMIDI (`/dev/snd/midiC*D*`) I/O (keeping `/dev/snd/seq` optional for Yocto `meta-tactus`).
 - **Strict RT vs. Async Separation:** The RT sync thread performs zero heap allocations, zero mutexes, zero blocking I/O, and zero `tokio` calls; the `tokio` control plane (`axum` HTTP/WebSocket, config persistence, MCU RPC) communicates exclusively through lock-free SPSC ring buffers (`rtrb`) with strictly `Copy` `TelemetrySnapshot` and `RtCommand` messages.
 - **Official Ableton Link C API:** Wraps `Ableton/link`'s `extensions/abl_link` C99 API (`tactus-link-sys`), avoiding custom Link protocol reimplementations.
 - **Yocto & Read-Only Rootfs Ready:** Offline builds with zero network/`git` activity in `build.rs`, dual prebuilt/vendored `abl_link` resolution, atomic state writes restricted to `/var/lib/tactus/config.toml`, and runtime state on `tmpfs` (`/run/tactus/`).
@@ -16,7 +16,7 @@
 | **M0** | Cargo workspace & offline-safe `abl_link` FFI build | Complete |
 | **M1** | Pure-Rust `tactus-sync-core` & deterministic simulations | Complete |
 | **M2** | WiFi AP (`hostapd`/`dnsmasq`/`avahi`), Zeroconf & UNO Q provisioning | Complete |
-| **M3** | Headless `tactusd` RT engine, ALSA hotplug & atomic `config.toml` | Planned |
+| **M3** | Headless `tactusd` RT engine, ALSA RawMIDI hotplug & atomic `config.toml` | Complete |
 | **M4** | Embedded mobile Web UI (`axum` + WebSocket + Home Screen PWA) | Planned |
 | **M5** | Optional STM32U585 Zephyr LED matrix bridge (`Arduino_RouterBridge`) | Planned |
 
@@ -34,7 +34,7 @@ tactus/
 │   ├── tactus-protocol/        # Shared EngineCommand, Copy RtCommand/TelemetrySnapshot, AppState, TactusConfig
 │   ├── tactus-link-sys/        # Offline-safe build.rs + C99 FFI + safe RAII AblLink/SessionState wrappers
 │   ├── tactus-sync-core/       # Pure-Rust, OS-independent, zero-alloc bidirectional sync engine
-│   └── tactusd/                # Daemon binary (M0 skeleton; RT/ALSA/Web/RPC wired in M3–M5)
+│   └── tactusd/                # Headless daemon (RT sync engine, ALSA RawMIDI hotplug, atomic config; Web/RPC in M4–M5)
 └── vendor/
     └── ableton-link/           # Pinned Ableton/link submodule (Link-4.1.1 + asio-standalone)
 ```
@@ -82,7 +82,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Smoke-run the `tactusd` M0 skeleton on the host:
+Run `tactusd` locally on the host (uses defaults if `/var/lib/tactus/config.toml` is missing, or pass `--config <PATH>`):
 
 ```bash
 cargo run -p tactusd
@@ -134,7 +134,7 @@ CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
 cargo build --workspace --target aarch64-unknown-linux-gnu
 ```
 
-*(Note: Once M3 introduces `alsa` / `libasound2-dev`, Linux cross-builds or `cargo-zigbuild` will also require target `aarch64` ALSA headers/sysroot.)*
+*(Note: `tactusd` talks directly to Linux kernel ALSA RawMIDI UAPI ioctls and `NETLINK_KOBJECT_UEVENT` via `libc`, so `cargo zigbuild` requires no target `libasound2-dev` or `libudev` sysroot.)*
 
 ### 5. Prebuilt `abl_link` Overrides (Yocto / BitBake Offline Builds)
 
@@ -186,7 +186,7 @@ avahi-browse -rt _tactus._tcp
 
 - **Daemon binary:** `tactusd`
 - **mDNS hostname:** `tactus.local`
-- **Config path:** `/var/lib/tactus/config.toml` (override via `--config` or `TACTUS_CONFIG` once wired in M3; schema defined in [SPEC.md §5](SPEC.md#L62-L87))
+- **Config path:** `/var/lib/tactus/config.toml` (override via `--config` or `TACTUS_CONFIG`; schema defined in [SPEC.md §5](SPEC.md#L62-L87))
 - **Runtime socket / temp path:** `/run/tactus/` (`tmpfs`)
 
 ---

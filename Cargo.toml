@@ -14,3 +14,4 @@ license = "MPL-2.0"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
+toml = "0.8"

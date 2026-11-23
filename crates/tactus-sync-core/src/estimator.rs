@@ -10,6 +10,7 @@ pub const MIDI_TIMEOUT_NS: i64 = 500_000_000;
 
 const MIN_OLS_TICKS: usize = 24;
 const TICKS_PER_BEAT_U64: u64 = 24;
+const START_LAUNCH_MARGIN_US: i64 = 1_000;
 
 /// State machine implementing `SPEC.md §2.3` (`MidiToLink`).
 #[derive(Debug, Clone)]
@@ -130,10 +131,15 @@ impl MidiToLinkEstimator {
         self.phase_error_ms = 0.0;
 
         let now_us = ns_to_us(now_ns);
+        // Force session beat 0 to the incoming MIDI Start instant (`Link.hpp` recommends
+        // `forceBeatAtTime` for external clock bridges; `requestBeatAtTime` is a no-op on
+        // session phase when `peers > 0` and triggers up to a 1-bar preroll on Link peers).
+        link.force_beat_at_time(0.0, now_us, config.quantum);
         if config.start_stop_sync {
-            link.set_is_playing_and_request_beat_at_time(true, now_us, 0.0, config.quantum);
-        } else {
-            link.request_beat_at_time(0.0, now_us, config.quantum);
+            // Place `startStopState` 1 ms before forced beat 0 so remote peers running
+            // `requestBeatAtStartPlayingTime(0, quantum)` always snap immediately to `now_us`
+            // instead of rolling forward by a full quantum on +1 us clock-transform rounding.
+            link.set_is_playing(true, now_us.saturating_sub(START_LAUNCH_MARGIN_US));
         }
     }
 
@@ -286,7 +292,7 @@ impl MidiToLinkEstimator {
 
                     if self.pending_resync_downbeat {
                         self.pending_resync_downbeat = false;
-                        link.request_beat_at_time(0.0, beat_ts_us, config.quantum);
+                        link.force_beat_at_time(0.0, beat_ts_us, config.quantum);
                         self.phase_error_ms = 0.0;
                     } else {
                         let nearest_beat = link.beat_at_time(beat_ts_us, config.quantum).round();

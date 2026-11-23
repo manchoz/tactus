@@ -38,7 +38,7 @@ Designed for setups where MIDI tempo changes rarely and rock-solid Link BPM stab
    - Maintain a secondary short OLS window (default `1.5 s`, ~72 ticks at 120 BPM).
    - If `|fast_bpm - committed_bpm| > step_change_bpm` (default `1.5 BPM`) consistently for `step_change_beats` consecutive beats (default `3` beats), declare an intentional tempo change: flush the 10 s buffer, immediately commit `fast_bpm` to Link, and resume long-window integration.
 5. **Phase Lock & Transport:**
-   - On MIDI `Start (0xFA)`: reset `tick_index = 0`, align Link beat 1 via `request_beat_at_time()`, and start Link transport if `start_stop_sync = true`.
+   - On MIDI `Start (0xFA)`: reset `tick_index = 0`, align Link beat 1 via `force_beat_at_time()`, and start Link transport via `set_is_playing()` (1 ms pre-downbeat margin so remote Link peers align immediately without a 1-bar preroll) if `start_stop_sync = true`.
    - On MIDI `Continue (0xFB)`: resume without resetting bar phase; start Link transport if `start_stop_sync = true`.
    - On MIDI `Stop (0xFC)`: stop Link transport if `start_stop_sync = true`; keep tempo tracking if `0xF8` ticks continue to arrive.
    - Every 24 ticks (quarter note), measure phase error between the MIDI beat timestamp and Link timeline phase.

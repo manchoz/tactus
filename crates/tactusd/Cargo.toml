@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+libc = "0.2"
+rtrb = "0.3"
 tactus-link-sys = { path = "../tactus-link-sys" }
 tactus-protocol = { path = "../tactus-protocol" }
 tactus-sync-core = { path = "../tactus-sync-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
+toml.workspace = true

@@ -184,9 +184,8 @@ midi_offset_ms = -3.5
                 midi_offset_ms: 1.5,
             },
             available_midi_ports: vec![MidiPortInfo {
-                client_id: 20,
-                port_id: 0,
-                client_name: "WIDI Uhost".to_string(),
+                id: "hw:1,0,0".to_string(),
+                card_name: "WIDI Uhost".to_string(),
                 port_name: "WIDI Uhost MIDI 1".to_string(),
                 can_read: true,
                 can_write: true,

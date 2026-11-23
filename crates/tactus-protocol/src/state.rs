@@ -2,20 +2,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::TelemetrySnapshot;
 
-/// Metadata for an ALSA Sequencer MIDI port discovered on the async control plane.
+/// Metadata for an ALSA MIDI port discovered on the async control plane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MidiPortInfo {
-    /// ALSA Sequencer client ID.
-    pub client_id: i32,
-    /// ALSA Sequencer port ID within the client.
-    pub port_id: i32,
-    /// Human-readable ALSA client name.
-    pub client_name: String,
-    /// Human-readable ALSA port name.
+    /// Stable backend port identifier (e.g. `"hw:1,0,0"` for RawMIDI, `"20:0"` for `snd_seq`).
+    pub id: String,
+    /// Human-readable hardware/card/client name (e.g. `"WIDI Uhost"`).
+    pub card_name: String,
+    /// Human-readable device/subdevice port name (e.g. `"WIDI Uhost MIDI 1"`).
     pub port_name: String,
-    /// Whether the port supports MIDI input/subscription.
+    /// Whether the port supports MIDI input.
     pub can_read: bool,
-    /// Whether the port supports MIDI output/publishing.
+    /// Whether the port supports MIDI output.
     pub can_write: bool,
 }
 

@@ -12,6 +12,7 @@ struct MockLinkSession {
     tempo_commits: Vec<(i64, f64)>,
     phase_nudges_us: Vec<(i64, i64)>,
     request_beats: Vec<(f64, i64)>,
+    forced_beats: Vec<(f64, i64)>,
     play_changes: Vec<(bool, i64)>,
 }
 
@@ -26,6 +27,7 @@ impl MockLinkSession {
             tempo_commits: Vec::new(),
             phase_nudges_us: Vec::new(),
             request_beats: Vec::new(),
+            forced_beats: Vec::new(),
             play_changes: Vec::new(),
         }
     }
@@ -83,6 +85,7 @@ impl LinkSession for MockLinkSession {
 
     fn force_beat_at_time(&mut self, beat: f64, time_us: i64, quantum: f64) {
         let prev_time = self.time_at_beat(beat, quantum);
+        self.forced_beats.push((beat, time_us));
         self.phase_nudges_us.push((time_us, time_us - prev_time));
         self.beat_at_origin = beat;
         self.beat_origin_us = time_us;
@@ -580,15 +583,15 @@ fn midi_to_link_transport_start_continue_stop_and_bounded_phase_convergence() {
         let mut engine = SyncEngine::new(midi_to_link_config());
         let mut link = MockLinkSession::new(120.0);
 
-        // Pre-seed Link with an initial phase offset relative to incoming MIDI clock at t = 0.
-        link.force_beat_at_time(0.0, -phase_offset_ms * 1_000, 4.0);
-        link.phase_nudges_us.clear();
-
-        // Start (0xFA) when start_stop_sync = true sets Link playing & requests beat 0.
-        // Add 1 peer first so request_beat_at_time does NOT wipe our test phase offset!
+        // With 1 peer connected, Start forces beat 0 and starts transport immediately.
         link.peers = 1;
         engine.on_midi_event(MidiEvent::Start, 0, &mut link);
         assert!(link.is_playing());
+        assert!(link.phase_at_time(0, 4.0).abs() < 1e-6);
+
+        // Inject an initial Link phase offset relative to incoming MIDI clock at t = 0.
+        link.force_beat_at_time(0.0, -phase_offset_ms * 1_000, 4.0);
+        link.phase_nudges_us.clear();
 
         let tick_ns = 60_000_000_000.0 / (24.0 * 120.0);
         // Feed 30 seconds (60 beats) so 25 ms error converges at <= 1.0 ms/beat into ±4.0 ms deadband.
@@ -760,12 +763,40 @@ fn commands_quantum_manual_tempo_resync_and_idempotent_start_stop_sync() {
     }
     assert_eq!(engine.snapshot().lock_state, LockState::Locked);
 
-    let reqs_before = link.request_beats.len();
+    link.peers = 1;
+    let forced_before = link.forced_beats.len();
     let _ = engine.apply_command(RtCommand::ResyncDownbeat, clk_ns, &mut link);
     for k in 96..=125 {
         let ts = t + ((k as f64) * tick_135_ns).round() as i64;
         engine.on_midi_event(MidiEvent::Clock, ts, &mut link);
     }
-    assert_eq!(link.request_beats.len(), reqs_before + 1);
-    assert_eq!(link.request_beats.last().unwrap().0, 0.0);
+    assert_eq!(link.forced_beats.len(), forced_before + 1);
+    assert_eq!(link.forced_beats.last().unwrap().0, 0.0);
+}
+
+#[test]
+fn midi_to_link_start_forces_downbeat_with_peers_without_preroll() {
+    let mut engine = SyncEngine::new(midi_to_link_config());
+    let mut link = MockLinkSession::new(120.0);
+    link.peers = 2;
+
+    // At 120 BPM (500_000 us/beat), t = 1_150_000 us is beat 2.3 (mid-bar, far from beat 4.0).
+    let start_us = 1_150_000_i64;
+    assert!((link.phase_at_time(start_us, 4.0) - 2.3).abs() < 1e-6);
+
+    engine.on_midi_event(MidiEvent::Start, start_us * 1_000, &mut link);
+
+    assert!(link.is_playing());
+    assert_eq!(link.play_changes.last(), Some(&(true, start_us - 1_000)));
+    assert!(
+        link.phase_at_time(start_us, 4.0).abs() < 1e-6,
+        "expected downbeat 0.0 forced at Start instant, got phase={}",
+        link.phase_at_time(start_us, 4.0)
+    );
+
+    // Simulate a remote Link peer launching via requestBeatAtStartPlayingTime(0, 4.0) with +400 us
+    // GhostXForm clock-rounding skew: because startStopTime is 1 ms before `start_us`, the peer's
+    // nextPhaseMatch snaps cleanly to `start_us` instead of rolling forward by a full 4-beat bar.
+    link.request_beat_at_time(0.0, (start_us - 1_000) + 400, 4.0);
+    assert_eq!(link.time_at_beat(0.0, 4.0), start_us);
 }
