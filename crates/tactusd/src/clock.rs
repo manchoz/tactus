@@ -156,6 +156,7 @@ fn read_clock_ns(clock_id: libc::clockid_t) -> i64 {
         tv_sec: 0,
         tv_nsec: 0,
     };
+    // SAFETY: `&raw mut ts` points to a valid, aligned stack `libc::timespec` out-parameter.
     let rc = unsafe { libc::clock_gettime(clock_id, &raw mut ts) };
     if rc != 0 {
         return 0;

@@ -1,4 +1,12 @@
 //! Shared command, RT-safe telemetry, async application state, and configuration types.
+//!
+//! Enforces the RT/Async type boundary across `tactus-sync-core`, `tactusd`, WebSocket JSON,
+//! and `arduino-router` RPC:
+//! - **RT-safe `Copy` types** ([`RtCommand`], [`TelemetrySnapshot`], [`Direction`], [`LockState`]):
+//!   fixed-size, zero-allocation values passed across lock-free `rtrb` SPSC ring buffers.
+//! - **Async control-plane types** ([`EngineCommand`], [`AppState`], [`TactusConfig`]):
+//!   heap-backed state and configuration managed on the `tokio` control plane and serialized to
+//!   JSON or TOML. [`RtCommand::try_from`] rejects async-only variants like `SelectMidiPorts`.
 
 pub mod command;
 pub mod config;

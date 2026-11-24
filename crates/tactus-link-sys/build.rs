@@ -1,3 +1,13 @@
+//! Build script for `tactus-link-sys` (Ableton Link C99 `abl_link` FFI bindings).
+//!
+//! Resolution order (strictly offline; never runs `git` or downloads sources):
+//! 1. `ABL_LINK_LIB_DIR`: explicit prebuilt library directory (Yocto offline BitBake build).
+//!    Optional overrides: `ABL_LINK_LIB_NAME` (default `abl_link`), `ABL_LINK_LINK_KIND`
+//!    (`static` or `dylib`, auto-detected from `lib<name>.a`).
+//! 2. `pkg-config`: probes `abl-link` and `abl_link` in the active sysroot/distro environment.
+//! 3. Vendored C++ build: compiles `vendor/ableton-link` (or `ABL_LINK_VENDOR_DIR`) via `cc::Build`
+//!    with bundled standalone Asio headers (`ASIO_STANDALONE=1`).
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -69,6 +69,8 @@ pub fn spawn_mcu_bridge(
     )))
 }
 
+// --- Session & Reconnect Loop ---
+
 async fn run_mcu_bridge_loop(
     socket_path: String,
     handle: ControlHandle,
@@ -457,6 +459,8 @@ async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
     }
 }
 
+// --- Telemetry Diffing & Downbeat Detection ---
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct TelemetryTracker {
     last_sent_bpm: f64,
@@ -538,6 +542,8 @@ fn append_telemetry_notification(method: &str, snap: &TelemetrySnapshot, out: &m
     };
     let _ = encode_rpc_message(&notification, out);
 }
+
+// --- Inbound MCU Command Debouncing & Translation ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum McuCommandKind {
@@ -680,6 +686,8 @@ fn translate_mcu_command(
         _ => Err("unknown RPC method"),
     }
 }
+
+// --- MessagePack-RPC Codec ---
 
 #[derive(Debug, Clone, PartialEq)]
 enum MsgPackValue {
@@ -1257,6 +1265,8 @@ fn encode_ext(kind: i8, data: &[u8], out: &mut Vec<u8>) -> Result<(), &'static s
     out.extend_from_slice(data);
     Ok(())
 }
+
+// --- Tests ---
 
 #[cfg(test)]
 mod tests {

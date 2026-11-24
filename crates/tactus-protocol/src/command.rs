@@ -1,3 +1,5 @@
+//! Control-plane commands (`EngineCommand`) and their strictly `Copy` RT subset (`RtCommand`).
+
 use serde::{Deserialize, Serialize};
 
 /// Active synchronization direction between Ableton Link and MIDI Clock.

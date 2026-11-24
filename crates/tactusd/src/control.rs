@@ -1,4 +1,9 @@
 //! Async `tokio` control plane: state hub, MIDI hotplug coordinator, FD reaper, web UI, and config sync.
+//!
+//! `StateHub` owns the canonical `AppState` (`watch::Sender`), routes commands between WebSocket/MCU
+//! clients and the RT `rtrb` ring, monitors `NETLINK_KOBJECT_UEVENT` (+ 5 s fallback rescan) for
+//! USB/BLE MIDI hotplug, reaps returned FDs from the RT thread before opening exclusive RawMIDI
+//! subdevices, and drives debounced atomic persistence to `/var/lib/tactus/config.toml`.
 
 use std::os::fd::RawFd;
 use std::path::PathBuf;
@@ -34,23 +39,34 @@ const WEB_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const RT_DETACH_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const RT_DETACH_MAX_POLLS: usize = 50;
 
-/// Public control-plane handle shared with M4 (`axum`) and future M5 (`arduino-router`) tasks.
+/// Public control-plane handle shared with M4 (`axum` Web UI) and M5 (`crate::mcu`) tasks.
 #[derive(Clone)]
 pub struct ControlHandle {
+    /// Broadcast watch receiver publishing the latest combined [`AppState`].
     pub state_rx: watch::Receiver<AppState>,
+    /// Bounded command channel forwarding control-plane commands into `StateHub`.
     pub cmd_tx: mpsc::Sender<EngineCommand>,
 }
 
 /// Owned endpoints needed by [`run_control_plane`].
 pub struct ControlPlaneArgs {
+    /// Initial validated configuration loaded at daemon startup.
     pub config: TactusConfig,
+    /// Target path for atomic `/var/lib/tactus/config.toml` persistence.
     pub config_path: PathBuf,
+    /// MIDI backend used on the async control plane for port enumeration and opening.
     pub backend: Arc<dyn MidiBackend>,
+    /// SPSC producer sending [`RtMessage`] commands and FD swaps to `rt-sync`.
     pub rt_cmd_tx: Producer<RtMessage>,
+    /// SPSC consumer receiving [`TelemetrySnapshot`] updates from `rt-sync`.
     pub tel_rx: Consumer<TelemetrySnapshot>,
+    /// SPSC consumer receiving displaced or errored MIDI FDs from `rt-sync`.
     pub fd_ret_rx: Consumer<FdReturn>,
+    /// Cross-thread wakeup sender interrupting `rt-sync`'s `poll()`.
     pub wake_tx: WakeSender,
+    /// Cross-thread wakeup receiver notifying `tokio` when `rt-sync` pushes updates.
     pub rt_notify_rx: WakeReceiver,
+    /// Join handle for the spawned `rt-sync` thread, joined cleanly during shutdown.
     pub rt_handle: JoinHandle<()>,
 }
 
@@ -121,6 +137,9 @@ impl StateHub {
         false
     }
 
+    // INVARIANT: ALSA RawMIDI subdevice opens are exclusive (`EBUSY`). Before opening new ports,
+    // send `AttachMidi(EMPTY)`, await `FdReturn::Replaced` (matching `prev_gen`) or
+    // `DetachedOnError` from the RT thread, and close every returned FD via `close_fd_set`.
     async fn detach_active_midi_and_close(&mut self) -> bool {
         if self.attached_input.is_none() && self.attached_outputs.is_empty() {
             return true;
@@ -229,6 +248,9 @@ impl StateHub {
             return;
         }
 
+        // INVARIANT: Always detach and close prior FDs *before* calling `open_ports()` (exclusive
+        // RawMIDI opens fail with `EBUSY` otherwise), and publish `selected_midi_input` /
+        // `selected_midi_outputs` strictly from FDs that actually opened and attached below.
         if !self.detach_active_midi_and_close().await {
             self.publish_midi_state(Some(ports));
             return;

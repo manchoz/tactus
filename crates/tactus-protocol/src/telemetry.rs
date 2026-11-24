@@ -1,3 +1,5 @@
+//! Strictly `Copy` real-time telemetry snapshot (`TelemetrySnapshot`) and lock-state enum.
+
 use serde::{Deserialize, Serialize};
 
 use crate::Direction;

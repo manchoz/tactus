@@ -188,6 +188,8 @@ fn enumerate_card_ports(card: u32, out: &mut Vec<MidiPortInfo>) -> io::Result<()
     let ctl_fd = open_c_path(&ctl_path, libc::O_RDONLY | libc::O_CLOEXEC)?;
 
     let mut card_info = SndCtlCardInfo::default();
+    // SAFETY: `ctl_fd` is an open ALSA control device FD and `&raw mut card_info` matches the
+    // `SNDRV_CTL_IOCTL_CARD_INFO` `SndCtlCardInfo` ABI layout.
     let rc = unsafe {
         libc::ioctl(
             ctl_fd.as_raw_fd(),
@@ -209,6 +211,8 @@ fn enumerate_card_ports(card: u32, out: &mut Vec<MidiPortInfo>) -> io::Result<()
 
     let mut dev: i32 = -1;
     loop {
+        // SAFETY: `ctl_fd` is an open ALSA control device FD and `&raw mut dev` points to a
+        // stack `c_int` matching `SNDRV_CTL_IOCTL_RAWMIDI_NEXT_DEVICE`.
         let rc = unsafe {
             libc::ioctl(
                 ctl_fd.as_raw_fd(),
@@ -290,6 +294,8 @@ fn probe_rawmidi_info(
         stream,
         ..SndRawmidiInfo::default()
     };
+    // SAFETY: `ctl_fd` is an open ALSA control device FD and `&raw mut info` points to a valid
+    // `SndRawmidiInfo` matching `SNDRV_CTL_IOCTL_RAWMIDI_INFO`.
     let rc = unsafe {
         libc::ioctl(
             ctl_fd,
@@ -367,6 +373,8 @@ fn open_rawmidi_subdevice(addr: HwAddr, access_flags: libc::c_int) -> io::Result
     let ctl_fd = open_c_path(&ctl_path, libc::O_RDONLY | libc::O_CLOEXEC)?;
 
     let preferred = addr.subdevice as libc::c_int;
+    // SAFETY: `ctl_fd` is an open ALSA control device FD and `&raw const preferred` points to a
+    // valid `c_int` matching `SNDRV_CTL_IOCTL_RAWMIDI_PREFER_SUBDEVICE`.
     let rc = unsafe {
         libc::ioctl(
             ctl_fd.as_raw_fd(),
@@ -400,9 +408,11 @@ fn open_rawmidi_subdevice(addr: HwAddr, access_flags: libc::c_int) -> io::Result
 fn open_c_path(path: &str, flags: libc::c_int) -> io::Result<OwnedFd> {
     let c_path = CString::new(path)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interior NUL in device path"))?;
+    // SAFETY: `c_path` is a NUL-terminated `CString` valid for the duration of `libc::open`.
     let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: `fd >= 0` is a newly opened descriptor with no other owner.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }

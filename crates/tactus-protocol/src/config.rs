@@ -1,3 +1,5 @@
+//! Persistent `/var/lib/tactus/config.toml` schema, defaults, normalization, and validation.
+
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -33,7 +35,9 @@ pub fn normalize_output_matches(patterns: Vec<String>) -> Vec<String> {
 /// Error returned when a [`TactusConfig`] fails bounds or invariant validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigError {
+    /// Dotted TOML field path that failed validation (e.g. `"sync.quantum"`).
     pub field: &'static str,
+    /// Human-readable description of the violated bound or invariant.
     pub message: &'static str,
 }
 
@@ -55,9 +59,13 @@ impl std::error::Error for ConfigError {}
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TactusConfig {
+    /// Synchronization engine parameters (`[sync]`).
     pub sync: SyncConfig,
+    /// ALSA MIDI port matching configuration (`[midi]`).
     pub midi: MidiConfig,
+    /// Embedded Web UI HTTP/WebSocket server configuration (`[web]`).
     pub web: WebConfig,
+    /// Optional STM32U585 Zephyr RPC bridge configuration (`[mcu_bridge]`).
     pub mcu_bridge: McuBridgeConfig,
 }
 
@@ -72,19 +80,33 @@ impl TactusConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SyncConfig {
+    /// Active sync direction (`link_to_midi` or `midi_to_link`).
     pub direction: Direction,
+    /// Synchronize MIDI `Start (0xFA)`/`Stop (0xFC)` with Ableton Link transport.
     pub start_stop_sync: bool,
+    /// Relay incoming MIDI Clock/transport directly to outputs (excluding input FD) in `MidiToLink`.
     pub clock_thru: bool,
+    /// Ableton Link bar/phrase quantum in beats (finite, `> 0.0`; default `4.0`).
     pub quantum: f64,
+    /// Startup Ableton Link session tempo in BPM (`20.0..=999.0`; default `120.0`).
     pub initial_bpm: f64,
+    /// Round committed `MidiToLink` BPM estimates to whole integers (`20.0..=999.0`).
     pub round_bpm: bool,
+    /// Signed MIDI Clock latency compensation in milliseconds (`-50.0..=50.0`; default `0.0`).
     pub midi_offset_ms: f32,
+    /// Long OLS tempo window in seconds (`>= fast_window_secs` and `<= 30.0`; default `10.0`).
     pub ols_window_secs: f64,
+    /// Fast OLS step-detection window in seconds (finite, `> 0.0`; default `1.5`).
     pub fast_window_secs: f64,
+    /// Minimum BPM delta required to update Link tempo when locked (`>= 0.0`; default `0.05`).
     pub bpm_deadband: f64,
+    /// Fast-vs-long BPM divergence threshold in BPM to trigger step-change tracking (`> 0.0`; default `1.5`).
     pub step_change_bpm: f64,
+    /// Consecutive beats of divergence required before committing a step tempo jump (`>= 1`; default `3`).
     pub step_change_beats: u32,
+    /// Phase error deadband in milliseconds below which phase nudges are suppressed (`>= 0.0`; default `4.0`).
     pub phase_deadband_ms: f32,
+    /// Maximum phase correction nudge applied per quarter-note beat in milliseconds (`> 0.0`; default `1.0`).
     pub max_phase_nudge_ms: f32,
 }
 
@@ -180,7 +202,9 @@ impl SyncConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "RawMidiConfig")]
 pub struct MidiConfig {
+    /// Exact port ID or case-insensitive substring rule selecting the MIDI input port.
     pub input_port_match: String,
+    /// Ordered match rules (up to [`MAX_MIDI_OUTPUTS`]) selecting MIDI output fan-out endpoints.
     pub output_port_matches: Vec<String>,
 }
 
@@ -221,6 +245,7 @@ impl Default for MidiConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WebConfig {
+    /// Socket address to bind the embedded HTTP/WebSocket server (default `"0.0.0.0:80"`).
     pub listen_addr: String,
 }
 
@@ -236,7 +261,9 @@ impl Default for WebConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct McuBridgeConfig {
+    /// Enable the optional `Arduino_RouterBridge` Unix-socket client (default `false`).
     pub enabled: bool,
+    /// Path to the `arduino-router` MessagePack-RPC Unix socket (default `"/var/run/arduino-router.sock"`).
     pub socket_path: String,
 }
 

@@ -1,4 +1,10 @@
 //! Real-time sync engine thread (`SCHED_FIFO`, `mlockall`, Core 3, zero allocations).
+//!
+//! Contract inside the loop: zero heap allocations, zero mutexes, zero blocking I/O, and zero
+//! `tokio` calls. `poll()` waits simultaneously on `wake_rx` (async commands / FD swaps),
+//! Linux `timerfd` (`CLOCK_MONOTONIC`, bridged from `SyncEngine`'s `CLOCK_MONOTONIC_RAW` domain
+//! via `ClockBridge`), and the active RawMIDI `in_fd`. Descriptor ownership returns back to the
+//! async reaper through `FdReturnOutbox` so `close()` never executes on the RT thread.
 
 use std::io;
 use std::sync::mpsc as std_mpsc;
@@ -46,10 +52,15 @@ pub enum FdReturn {
 
 /// SPSC ring endpoints owned by the RT thread.
 pub struct RtLoopChannels {
+    /// Inbound commands, FD hot-swaps, and shutdown signal from the async control plane.
     pub cmd_rx: Consumer<RtMessage>,
+    /// Outbound strictly `Copy` telemetry snapshots to the async control plane.
     pub tel_tx: Producer<TelemetrySnapshot>,
+    /// Outbound returned MIDI descriptors for safe asynchronous `close()`.
     pub fd_ret_tx: Producer<FdReturn>,
+    /// Wakeup receiver polled by the RT loop when async pushes to `cmd_rx`.
     pub wake_rx: WakeReceiver,
+    /// Wakeup sender signaled when RT pushes telemetry or returned FDs.
     pub rt_notify_tx: WakeSender,
 }
 
@@ -263,6 +274,10 @@ type PlatformTimer = Option<crate::rt_os::TimerFd>;
 #[cfg(not(target_os = "linux"))]
 type PlatformTimer = Option<()>;
 
+// INVARIANT: Never drop an `FdReturn` — doing so would leak an open ALSA RawMIDI FD and keep
+// the subdevice locked (`EBUSY`). Backed by a 256-slot `rtrb` ring plus this single stack retry
+// slot; while `pending` is occupied, the RT loop leaves incoming `AttachMidi` messages in `cmd_rx`
+// and schedules a 5 ms retry wakeup until `fd_ret_tx` drains.
 struct FdReturnOutbox<'a> {
     tx: &'a mut Producer<FdReturn>,
     notify_tx: &'a WakeSender,
@@ -312,6 +327,8 @@ impl<'a> FdReturnOutbox<'a> {
             FdReturn::DetachedOnError { fds: next, .. },
         ) = (&mut self.pending, ret)
         {
+            // Merge same-generation `DetachedOnError` FDs into the single stack retry slot so
+            // simultaneous read/write errors on different endpoints never drop a descriptor.
             if existing.generation == next.generation {
                 if next.in_fd >= 0 && existing.in_fd < 0 {
                     existing.in_fd = next.in_fd;
@@ -431,6 +448,8 @@ fn run_rt_loop_with_timer<D: RtLinkDriver>(
         let poll_timeout_ms: libc::c_int =
             compute_poll_timeout_ms(driver.now_link_ns(), next_wakeup_raw_ns);
 
+        // SAFETY: `pfds[..nfds]` holds valid `pollfd` entries (`nfds <= pfds.len() == 3`) with
+        // open descriptors owned by `ch.wake_rx`, `timer`, and `active_fds.in_fd`.
         let ready = unsafe { libc::poll(pfds.as_mut_ptr(), nfds as libc::nfds_t, poll_timeout_ms) };
         if ready < 0 {
             if last_errno() == libc::EINTR {
@@ -595,6 +614,7 @@ fn read_midi_input<S: LinkSession>(
     }
     let mut buf = [0u8; 64];
     for _ in 0..MAX_READ_CHUNKS_PER_WAKE {
+        // SAFETY: `in_fd >= 0` is an open non-blocking MIDI FD and `buf` provides `buf.len()` bytes.
         let n = unsafe { libc::read(in_fd, buf.as_mut_ptr().cast(), buf.len()) };
         if n > 0 {
             for &byte in &buf[..n as usize] {
@@ -622,6 +642,10 @@ fn read_midi_input<S: LinkSession>(
     None
 }
 
+// Write outgoing MIDI real-time bytes across all attached output FDs (`MAX_MIDI_OUTPUTS = 8`).
+// INVARIANT: `exclude_input && out_fd == active_fds.in_fd` skips the active input FD on
+// full-duplex RawMIDI devices during `MidiToLink` Clock Thru to prevent clock feedback loops.
+// Output errors isolate and detach only the failing output FD rather than dropping healthy ports.
 fn write_midi_batch(
     active_fds: &mut MidiFdSet,
     batch: &MidiOutputBatch,
@@ -649,6 +673,7 @@ fn write_midi_batch(
         let mut offset = 0;
         let mut detached = false;
         while offset < len {
+            // SAFETY: `out_fd >= 0` is an open non-blocking MIDI FD and `bytes[offset..len]` is valid.
             let n =
                 unsafe { libc::write(out_fd, bytes[offset..len].as_ptr().cast(), len - offset) };
             if n > 0 {

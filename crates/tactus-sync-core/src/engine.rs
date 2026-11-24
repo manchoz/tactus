@@ -13,7 +13,10 @@ use crate::scheduler::LinkToMidiScheduler;
 pub struct PollResult {
     /// Zero or more scheduled MIDI events due up to `now_ns`.
     pub midi_out: MidiOutputBatch,
-    /// Next monotonic deadline (`CLOCK_MONOTONIC` nanoseconds) for the RT sleep timer.
+    /// Next monotonic deadline (engine monotonic clock nanoseconds) for the RT sleep timer.
+    ///
+    /// Note: on Linux, `tactusd` runs `SyncEngine` in `CLOCK_MONOTONIC_RAW` to match `abl_link`
+    /// and bridges this deadline to `CLOCK_MONOTONIC` before arming `timerfd`.
     pub next_deadline_ns: Option<i64>,
 }
 

@@ -1,3 +1,5 @@
+//! Async control-plane application state (`AppState`) and discovered MIDI port metadata.
+
 use serde::{Deserialize, Serialize};
 
 use crate::TelemetrySnapshot;

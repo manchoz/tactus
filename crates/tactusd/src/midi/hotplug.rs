@@ -27,6 +27,7 @@ mod imp {
     impl UeventMonitor {
         /// Bind a `NETLINK_KOBJECT_UEVENT` broadcast listener (requires no root privileges).
         pub fn new() -> io::Result<Self> {
+            // SAFETY: Standard libc `socket(AF_NETLINK)` call with valid kernel uevent flags.
             let sock = unsafe {
                 libc::socket(
                     libc::AF_NETLINK,
@@ -37,13 +38,17 @@ mod imp {
             if sock < 0 {
                 return Err(io::Error::last_os_error());
             }
+            // SAFETY: `sock >= 0` is a freshly created, unowned netlink socket FD.
             let owned = unsafe { OwnedFd::from_raw_fd(sock) };
 
+            // SAFETY: `libc::sockaddr_nl` is a plain C POD struct where all-zero is a valid baseline.
             let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
             addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
             addr.nl_pid = 0;
             addr.nl_groups = 1; // kernel uevent multicast group
 
+            // SAFETY: `owned` is an open netlink socket and `&raw const addr` points to a valid
+            // `sockaddr_nl` whose exact byte size is passed to `bind`.
             let bind_rc = unsafe {
                 libc::bind(
                     owned.as_raw_fd(),
@@ -69,6 +74,8 @@ mod imp {
                     let mut saw_sound = false;
                     let mut buf = [0u8; 4096];
                     loop {
+                        // SAFETY: `inner` holds an open non-blocking netlink FD and `buf` is a
+                        // valid stack buffer of `buf.len()` writable bytes.
                         let n = unsafe {
                             libc::recv(
                                 inner.get_ref().as_raw_fd(),

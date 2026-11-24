@@ -20,7 +20,7 @@ pub const MAX_VALID_BPM: f64 = 999.0;
 pub struct ClockSample {
     /// Monotonically increasing tick index inside the active acquisition window.
     pub tick_index: u64,
-    /// Monotonic arrival timestamp (`CLOCK_MONOTONIC` nanoseconds).
+    /// Monotonic arrival timestamp (engine monotonic clock nanoseconds; `CLOCK_MONOTONIC_RAW` on Linux).
     pub timestamp_ns: i64,
 }
 

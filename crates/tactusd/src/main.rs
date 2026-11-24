@@ -1,4 +1,12 @@
 //! Tactus appliance daemon (`tactusd`) — RT sync engine, RawMIDI hotplug, atomic config, and Web UI.
+//!
+//! Thread and core partitioning:
+//! - **Core `3` (`rt-sync`)**: dedicated `SCHED_FIFO` (prio 75), `mlockall`-locked real-time thread
+//!   running `SyncEngine` + `abl_link` audio session capture/commit + RawMIDI I/O with zero heap
+//!   allocations, mutexes, or `tokio` calls.
+//! - **Remaining cores (`main`, `tokio`, `abl_link` Asio)**: async control plane handling MIDI port
+//!   enumeration/hotplug (`udev` netlink), exclusive RawMIDI open/close lifecycle, atomic
+//!   `/var/lib/tactus/config.toml` persistence, `axum` HTTP/WS UI, and optional `mcu` bridge RPC.
 
 mod clock;
 mod config_store;
@@ -145,6 +153,9 @@ fn main() -> ExitCode {
         config.sync.midi_offset_ms
     );
 
+    // INVARIANT: Pin non-RT threads off `RT_PREFERRED_CORE` *before* `spawn_rt_thread()` creates
+    // `AblLinkDriver` (which spawns Link's background Asio thread) and *before* building the
+    // `tokio` runtime, so all non-RT child threads inherit the excluded CPU affinity mask.
     match rt_os::pin_non_rt_threads(RT_PREFERRED_CORE) {
         Ok(cores) if cores > 0 => {
             log_info!(

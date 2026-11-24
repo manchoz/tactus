@@ -1,4 +1,10 @@
 //! Embedded mobile Web UI HTTP & WebSocket server (`axum` on `tokio`).
+//!
+//! Standalone iOS Home Screen PWAs keep an isolated WebKit cache and remain suspended across
+//! `tactusd` upgrades, so HTML/CSS/JS/manifest responses enforce `Cache-Control: no-store` and
+//! embed a `?v=<ui_hash>` FNV-1a digest over *all* assets (including icons) alongside `/healthz`
+//! hash-mismatch auto-reload in `app.js`. WebSocket sockets enable `TCP_NODELAY` so beat-crossing
+//! telemetry pushes reach clients without Nagle delay.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -66,6 +72,8 @@ fn try_acquire_ws_slot(counter: &Arc<AtomicUsize>) -> Option<WsClientGuard> {
     None
 }
 
+// INVARIANT: Hash *every* embedded Web UI asset (including SVG/PNG icons) so any UI or icon
+// update changes `ui_asset_hash()` for `?v=<hash>` URLs and `/healthz` auto-reload on iOS PWAs.
 fn ui_asset_hash() -> &'static str {
     static HASH: OnceLock<String> = OnceLock::new();
     HASH.get_or_init(|| {
@@ -91,6 +99,7 @@ fn ui_asset_hash() -> &'static str {
     })
 }
 
+// Rewrite asset references in `index.html` with `?v=<ui_hash>` and inject `<meta name="tactus-ui-hash">`.
 fn rendered_index_html() -> &'static [u8] {
     static RENDERED: OnceLock<Vec<u8>> = OnceLock::new();
     RENDERED.get_or_init(|| {
@@ -119,6 +128,7 @@ fn rendered_index_html() -> &'static [u8] {
     })
 }
 
+// Version icon paths inside `/manifest.webmanifest` with `?v=<ui_hash>` for Home Screen launches.
 fn rendered_manifest_json() -> &'static [u8] {
     static RENDERED: OnceLock<Vec<u8>> = OnceLock::new();
     RENDERED.get_or_init(|| {
@@ -133,6 +143,7 @@ fn rendered_manifest_json() -> &'static [u8] {
     })
 }
 
+// Serve core Web UI shell assets with `no-store` so iOS standalone WebKit never serves stale code.
 fn no_store_asset(content_type: &'static str, body: &'static [u8]) -> Response {
     (
         [
@@ -236,6 +247,7 @@ pub async fn spawn_web_server(
         .map_or_else(|_| listen_addr.to_string(), |a| a.to_string());
     log_info!("web UI listening on http://{bound_addr}");
 
+    // Keep `TCP_NODELAY` enabled so small WebSocket beat-crossing frames flush immediately.
     let listener = listener.tap_io(|tcp_stream| {
         if let Err(err) = tcp_stream.set_nodelay(true) {
             log_warn!("failed to set TCP_NODELAY on web client socket: {err}");

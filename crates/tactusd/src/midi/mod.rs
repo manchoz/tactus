@@ -19,9 +19,13 @@ pub use tactus_protocol::MAX_MIDI_OUTPUTS;
 /// via [`close_fd_set`] so shared descriptors are never double-closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MidiFdSet {
+    /// Non-blocking MIDI input descriptor, or `-1` when unattached.
     pub in_fd: RawFd,
+    /// Fixed-capacity array of non-blocking MIDI output descriptors (`-1` when unused).
     pub out_fds: [RawFd; MAX_MIDI_OUTPUTS],
+    /// Number of valid entries in `out_fds[..out_count]`.
     pub out_count: u8,
+    /// Monotonic attachment generation counter assigned by the async control plane.
     pub generation: u64,
 }
 
@@ -138,6 +142,7 @@ fn collect_unique_fds(fds: MidiFdSet) -> ([RawFd; MAX_MIDI_OUTPUTS + 1], usize) 
 pub fn close_fd_set(fds: MidiFdSet) {
     let (unique, len) = collect_unique_fds(fds);
     for &fd in &unique[..len] {
+        // SAFETY: `collect_unique_fds` deduplicated active FDs, so each open descriptor is closed once.
         unsafe {
             libc::close(fd);
         }
