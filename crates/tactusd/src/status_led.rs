@@ -1,9 +1,9 @@
 //! Async Linux `LED1` (`unoq:user-{red,green,blue}1`) connectivity & fault status indicator.
 //!
 //! Runs exclusively on the `tokio` control plane (never inside the RT loop) and yields
-//! whenever `/run/tactus/fault` exists so `tactus-led-fault.service` owns the fast-blinking red
-//! alarm even if `tactusd` is restarting. On non-Linux hosts or boards lacking `unoq:user-*1`,
-//! this module cleanly no-ops.
+//! whenever any `/run/tactus/fault.*` sentinel exists so `tactus-led-fault@.service` owns the
+//! fast-blinking red alarm even if another unit restarts. On non-Linux hosts or boards lacking
+//! `unoq:user-*1`, this module cleanly no-ops.
 
 #[cfg(any(target_os = "linux", test))]
 use std::fs;
@@ -31,7 +31,11 @@ const LED_GREEN_PATH: &str = "/sys/class/leds/unoq:user-green1";
 const LED_BLUE_PATH: &str = "/sys/class/leds/unoq:user-blue1";
 
 #[cfg(target_os = "linux")]
-const FAULT_SENTINEL_PATH: &str = "/run/tactus/fault";
+const FAULT_SENTINEL_PATHS: [&str; 3] = [
+    "/run/tactus/fault.tactus-ap.service",
+    "/run/tactus/fault.tactus-dhcp.service",
+    "/run/tactus/fault.tactusd.service",
+];
 #[cfg(target_os = "linux")]
 const AP_READY_SENTINEL_PATH: &str = "/run/tactus/ap-ready";
 #[cfg(target_os = "linux")]
@@ -84,8 +88,12 @@ pub fn spawn_status_led(
     state_rx: watch::Receiver<AppState>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Option<JoinHandle<()>> {
-    let channels = LedChannels::unoq_default();
-    if !channels.exists() {
+    let channels: LedChannels = [
+        PathBuf::from(LED_RED_PATH),
+        PathBuf::from(LED_GREEN_PATH),
+        PathBuf::from(LED_BLUE_PATH),
+    ];
+    if !channels.iter().all(|dir| dir.is_dir()) {
         return None;
     }
     Some(tokio::spawn(run_status_led_loop(
@@ -104,29 +112,7 @@ pub fn spawn_status_led(
 }
 
 #[cfg(any(target_os = "linux", test))]
-#[derive(Debug, Clone)]
-struct LedChannels {
-    red: PathBuf,
-    green: PathBuf,
-    blue: PathBuf,
-}
-
-#[cfg(any(target_os = "linux", test))]
-impl LedChannels {
-    #[cfg(target_os = "linux")]
-    fn unoq_default() -> Self {
-        Self {
-            red: PathBuf::from(LED_RED_PATH),
-            green: PathBuf::from(LED_GREEN_PATH),
-            blue: PathBuf::from(LED_BLUE_PATH),
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn exists(&self) -> bool {
-        self.red.is_dir() && self.green.is_dir() && self.blue.is_dir()
-    }
-}
+type LedChannels = [PathBuf; 3];
 
 #[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,29 +152,18 @@ fn write_channel(dir: &Path, output: ChannelOutput) -> io::Result<()> {
 
 #[cfg(any(target_os = "linux", test))]
 fn apply_mode(channels: &LedChannels, mode: StatusLedMode) -> io::Result<()> {
-    let Some([red_out, green_out, blue_out]) = mode_outputs(mode) else {
+    let Some(outputs) = mode_outputs(mode) else {
         return Ok(());
     };
-    write_channel(&channels.red, red_out)?;
-    write_channel(&channels.green, green_out)?;
-    write_channel(&channels.blue, blue_out)?;
+    for (dir, output) in channels.iter().zip(outputs) {
+        write_channel(dir, output)?;
+    }
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-struct Sentinels {
-    fault_active: bool,
-    ap_expected: bool,
-    ap_ready: bool,
-}
-
-#[cfg(target_os = "linux")]
-fn read_sentinels() -> Sentinels {
-    Sentinels {
-        fault_active: Path::new(FAULT_SENTINEL_PATH).exists(),
-        ap_expected: Path::new(AP_WANTS_SYMLINK_PATH).exists(),
-        ap_ready: Path::new(AP_READY_SENTINEL_PATH).exists(),
-    }
+#[cfg(any(target_os = "linux", test))]
+fn red_has_timer_trigger(red_dir: &Path) -> bool {
+    fs::read_to_string(red_dir.join("trigger")).is_ok_and(|s| s.contains("[timer]"))
 }
 
 #[cfg(target_os = "linux")]
@@ -209,9 +184,19 @@ async fn run_status_led_loop(
 
         let mode = {
             let state = state_rx.borrow_and_update().clone();
-            let s = read_sentinels();
-            compute_status_led_mode(&state, s.fault_active, s.ap_expected, s.ap_ready)
+            let fault_active = FAULT_SENTINEL_PATHS.iter().any(|p| Path::new(p).exists());
+            let ap_expected = Path::new(AP_WANTS_SYMLINK_PATH).exists();
+            let ap_ready = Path::new(AP_READY_SENTINEL_PATH).exists();
+            compute_status_led_mode(&state, fault_active, ap_expected, ap_ready)
         };
+
+        // Re-apply if a transient fault blinked red and cleared between polls.
+        if mode != StatusLedMode::FaultYield
+            && last_applied == Some(mode)
+            && red_has_timer_trigger(&channels[0])
+        {
+            last_applied = None;
+        }
 
         if last_applied != Some(mode) {
             match apply_mode(&channels, mode) {
@@ -260,15 +245,27 @@ mod tests {
             std::process::id(),
             nanos
         ));
-        let red = root.join("unoq:user-red1");
-        let green = root.join("unoq:user-green1");
-        let blue = root.join("unoq:user-blue1");
-        for dir in [&red, &green, &blue] {
+        let channels = [
+            root.join("unoq:user-red1"),
+            root.join("unoq:user-green1"),
+            root.join("unoq:user-blue1"),
+        ];
+        for dir in &channels {
             fs::create_dir_all(dir).expect("create led dir");
             fs::write(dir.join("trigger"), "init\n").expect("seed trigger");
             fs::write(dir.join("brightness"), "9\n").expect("seed brightness");
         }
-        (root, LedChannels { red, green, blue })
+        (root, channels)
+    }
+
+    fn assert_led_state(channels: &LedChannels, expected: [(&str, &str); 3]) {
+        for (dir, (exp_trig, exp_bright)) in channels.iter().zip(expected) {
+            assert_eq!(fs::read_to_string(dir.join("trigger")).unwrap(), exp_trig);
+            assert_eq!(
+                fs::read_to_string(dir.join("brightness")).unwrap(),
+                exp_bright
+            );
+        }
     }
 
     #[test]
@@ -325,89 +322,47 @@ mod tests {
         let (root, channels) = make_temp_led_channels();
 
         apply_mode(&channels, StatusLedMode::Booting).expect("booting");
-        assert_eq!(
-            fs::read_to_string(channels.red.join("trigger")).unwrap(),
-            "none\n"
-        );
-        assert_eq!(
-            fs::read_to_string(channels.red.join("brightness")).unwrap(),
-            "0\n"
-        );
-        assert_eq!(
-            fs::read_to_string(channels.green.join("trigger")).unwrap(),
-            "none\n"
-        );
-        assert_eq!(
-            fs::read_to_string(channels.green.join("brightness")).unwrap(),
-            "0\n"
-        );
-        assert_eq!(
-            fs::read_to_string(channels.blue.join("trigger")).unwrap(),
-            "timer\n"
+        assert_led_state(
+            &channels,
+            [("none\n", "0\n"), ("none\n", "0\n"), ("timer\n", "9\n")],
         );
 
         apply_mode(&channels, StatusLedMode::ApReadyIdle).expect("ap ready");
-        assert_eq!(
-            fs::read_to_string(channels.blue.join("trigger")).unwrap(),
-            "none\n"
-        );
-        assert_eq!(
-            fs::read_to_string(channels.blue.join("brightness")).unwrap(),
-            "1\n"
+        assert_led_state(
+            &channels,
+            [("none\n", "0\n"), ("none\n", "0\n"), ("none\n", "1\n")],
         );
 
         apply_mode(&channels, StatusLedMode::MidiOnly).expect("midi only");
-        assert_eq!(
-            fs::read_to_string(channels.red.join("brightness")).unwrap(),
-            "1\n"
-        );
-        assert_eq!(
-            fs::read_to_string(channels.green.join("brightness")).unwrap(),
-            "1\n"
-        );
-        assert_eq!(
-            fs::read_to_string(channels.blue.join("brightness")).unwrap(),
-            "0\n"
+        assert_led_state(
+            &channels,
+            [("none\n", "1\n"), ("none\n", "1\n"), ("none\n", "0\n")],
         );
 
         apply_mode(&channels, StatusLedMode::LinkOnly).expect("link only");
-        assert_eq!(
-            fs::read_to_string(channels.red.join("brightness")).unwrap(),
-            "0\n"
-        );
-        assert_eq!(
-            fs::read_to_string(channels.green.join("brightness")).unwrap(),
-            "1\n"
-        );
-        assert_eq!(
-            fs::read_to_string(channels.blue.join("brightness")).unwrap(),
-            "0\n"
+        assert_led_state(
+            &channels,
+            [("none\n", "0\n"), ("none\n", "1\n"), ("none\n", "0\n")],
         );
 
         apply_mode(&channels, StatusLedMode::LinkAndMidi).expect("link and midi");
-        assert_eq!(
-            fs::read_to_string(channels.red.join("brightness")).unwrap(),
-            "0\n"
-        );
-        assert_eq!(
-            fs::read_to_string(channels.green.join("brightness")).unwrap(),
-            "1\n"
-        );
-        assert_eq!(
-            fs::read_to_string(channels.blue.join("brightness")).unwrap(),
-            "1\n"
+        assert_led_state(
+            &channels,
+            [("none\n", "0\n"), ("none\n", "1\n"), ("none\n", "1\n")],
         );
 
-        // Sentinel values must remain untouched when FaultYield is applied.
-        fs::write(channels.red.join("trigger"), "timer\n").unwrap();
-        fs::write(channels.red.join("brightness"), "1\n").unwrap();
+        // Sentinel values must remain untouched when FaultYield is applied,
+        // and active kernel [timer] is detected for fast recovery.
+        fs::write(channels[0].join("trigger"), "none [timer] heartbeat\n").unwrap();
+        fs::write(channels[0].join("brightness"), "1\n").unwrap();
+        assert!(red_has_timer_trigger(&channels[0]));
         apply_mode(&channels, StatusLedMode::FaultYield).expect("fault yield");
         assert_eq!(
-            fs::read_to_string(channels.red.join("trigger")).unwrap(),
-            "timer\n"
+            fs::read_to_string(channels[0].join("trigger")).unwrap(),
+            "none [timer] heartbeat\n"
         );
         assert_eq!(
-            fs::read_to_string(channels.red.join("brightness")).unwrap(),
+            fs::read_to_string(channels[0].join("brightness")).unwrap(),
             "1\n"
         );
 

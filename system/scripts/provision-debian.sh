@@ -210,6 +210,7 @@ rollback_ap() {
   log "Rolling back AP configuration and restoring wlan0 to NetworkManager..."
   systemctl disable --now tactus-dhcp.service tactus-ap.service 2>/dev/null || true
   rm -f /etc/NetworkManager/conf.d/99-tactus-unmanaged.conf
+  systemctl enable --now wpa_supplicant.service 2>/dev/null || true
   if systemctl is-active --quiet NetworkManager.service; then
     nmcli general reload || systemctl reload NetworkManager.service || true
     nmcli device set wlan0 managed yes 2>/dev/null || true
@@ -430,7 +431,8 @@ install_system_files() {
   install -m 0644 "${SYSTEM_DIR}/systemd/tactus-ap.service" /etc/systemd/system/tactus-ap.service
   install -m 0644 "${SYSTEM_DIR}/systemd/tactus-dhcp.service" /etc/systemd/system/tactus-dhcp.service
   install -m 0644 "${SYSTEM_DIR}/systemd/tactusd.service" /etc/systemd/system/tactusd.service
-  install -m 0644 "${SYSTEM_DIR}/systemd/tactus-led-fault.service" /etc/systemd/system/tactus-led-fault.service
+  rm -f /etc/systemd/system/tactus-led-fault.service
+  install -m 0644 "${SYSTEM_DIR}/systemd/tactus-led-fault@.service" /etc/systemd/system/tactus-led-fault@.service
 
   install -d -m 0755 /etc/systemd/system.conf.d /etc/tmpfiles.d
   install -m 0644 "${SYSTEM_DIR}/systemd/system-boot-tactus.conf" /etc/systemd/system.conf.d/99-tactus-boot.conf

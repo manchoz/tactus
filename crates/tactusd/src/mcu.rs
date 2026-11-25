@@ -512,7 +512,8 @@ impl TelemetryTracker {
 
         let cur_beat = beat_index(snap.beat_phase);
         let downbeat_wrapped = snap.is_playing
-            && ((cur_beat == 0 && self.prev_beat != Some(0))
+            && cur_beat == 0
+            && (self.prev_beat != Some(0)
                 || self.prev_phase.is_some_and(|p| snap.beat_phase + 0.5 < p));
         let beat = if downbeat_wrapped {
             Some(BeatEvent::Downbeat)
@@ -1590,6 +1591,27 @@ mod tests {
             TelemetryEmit {
                 state: false,
                 beat: Some(BeatEvent::Downbeat),
+            }
+        );
+
+        // Shrinking quantum mid-bar (e.g. 6/4 -> 4/4, phase 5.2 -> 1.2) drops phase
+        // without landing on beat 0, so it must emit tactus/beat(1) instead of downbeat.
+        let shrink_init = TelemetrySnapshot {
+            quantum: 6.0,
+            is_playing: true,
+            beat_phase: 5.2,
+            ..init
+        };
+        let mut shrink_tracker = TelemetryTracker::new(shrink_init);
+        assert_eq!(
+            shrink_tracker.evaluate(TelemetrySnapshot {
+                quantum: 4.0,
+                beat_phase: 1.2,
+                ..shrink_init
+            }),
+            TelemetryEmit {
+                state: false,
+                beat: Some(BeatEvent::Beat(1)),
             }
         );
 

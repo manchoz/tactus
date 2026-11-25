@@ -131,6 +131,7 @@ void on_tactus_beat(int beat_index, int bpm_tenths, int direction, int lock_stat
       s_downbeat_active = true;
       s_beat_active = false;
     } else {
+      s_downbeat_active = false;
       s_beat_start_ms = millis();
       s_beat_active = true;
     }
