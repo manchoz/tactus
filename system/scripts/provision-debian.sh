@@ -624,7 +624,7 @@ activate_ap() {
   fi
 
   log "Enabling and starting tactus-ap.service and tactus-dhcp.service..."
-  systemctl enable tactus-ap.service tactus-dhcp.service
+  systemctl reenable tactus-ap.service tactus-dhcp.service
   systemctl restart tactus-ap.service
   systemctl restart tactus-dhcp.service
 

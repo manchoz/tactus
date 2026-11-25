@@ -1,14 +1,19 @@
 [Unit]
 Description=Tactus WiFi Access Point (hostapd)
-After=NetworkManager.service sys-subsystem-net-devices-wlan0.device
-Wants=avahi-daemon.service tactus-dhcp.service
+BindsTo=sys-subsystem-net-devices-wlan0.device
+After=NetworkManager.service systemd-rfkill.service sys-subsystem-net-devices-wlan0.device
+Wants=avahi-daemon.service
+Upholds=tactus-dhcp.service
 Before=tactus-dhcp.service tactusd.service
+StartLimitIntervalSec=60s
+StartLimitBurst=5
 
 [Service]
 Type=simple
 RuntimeDirectory=tactus
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes
+ExecStartPre=-/usr/sbin/rfkill unblock wifi
 ExecStartPre=/usr/sbin/iw reg set IT
 ExecStartPre=/usr/sbin/ip link set wlan0 up
 ExecStartPre=/usr/sbin/ip addr replace 10.42.0.1/24 dev wlan0
@@ -20,4 +25,4 @@ Restart=on-failure
 RestartSec=3
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=multi-user.target sys-subsystem-net-devices-wlan0.device
