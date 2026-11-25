@@ -2,7 +2,8 @@
 //!
 //! Enforces `AGENTS.md` Invariant #6: ZERO 24 PPQN MIDI Clock traffic crosses `/var/run/arduino-router.sock`.
 //! Emits `tactus/state` only on connect and discrete state/`>= 0.1 BPM` changes, emits `tactus/downbeat`
-//! only on bar downbeat wraps while playing, and forwards debounced MCU input commands to `ControlHandle`.
+//! on bar downbeat wraps while playing, emits `tactus/beat` on non-downbeat integer beat crossings
+//! while playing, and forwards debounced MCU input commands to `ControlHandle`.
 
 use std::time::Duration;
 
@@ -29,6 +30,7 @@ const BPM_CHANGE_THRESHOLD: f64 = 0.1 - 1e-9;
 const METHOD_REGISTER: &str = "$/register";
 const METHOD_STATE: &str = "tactus/state";
 const METHOD_DOWNBEAT: &str = "tactus/downbeat";
+const METHOD_BEAT: &str = "tactus/beat";
 
 const CMD_TOGGLE_DIRECTION: &str = "tactus/cmd/toggle_direction";
 const CMD_SET_DIRECTION: &str = "tactus/cmd/set_direction";
@@ -234,14 +236,20 @@ async fn run_bridge_session_inner(
                     return SessionOutcome::Disconnected { established: true };
                 }
                 let snap = state_rx.borrow_and_update().telemetry;
-                let (emit_state, emit_downbeat) = tracker.evaluate(snap);
-                if emit_state || emit_downbeat {
+                let emit = tracker.evaluate(snap);
+                if emit.state || emit.beat.is_some() {
                     out_buf.clear();
-                    if emit_state {
+                    if emit.state {
                         append_telemetry_notification(METHOD_STATE, &snap, &mut out_buf);
                     }
-                    if emit_downbeat {
-                        append_telemetry_notification(METHOD_DOWNBEAT, &snap, &mut out_buf);
+                    match emit.beat {
+                        Some(BeatEvent::Downbeat) => {
+                            append_telemetry_notification(METHOD_DOWNBEAT, &snap, &mut out_buf);
+                        }
+                        Some(BeatEvent::Beat(beat_idx)) => {
+                            append_beat_notification(beat_idx, &snap, &mut out_buf);
+                        }
+                        None => {}
                     }
                     match write_all_or_shutdown(&mut stream, &out_buf, &mut shutdown_rx).await {
                         WriteStatus::Ok => {}
@@ -459,7 +467,19 @@ async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
     }
 }
 
-// --- Telemetry Diffing & Downbeat Detection ---
+// --- Telemetry Diffing & Beat / Downbeat Detection ---
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BeatEvent {
+    Downbeat,
+    Beat(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TelemetryEmit {
+    state: bool,
+    beat: Option<BeatEvent>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct TelemetryTracker {
@@ -483,8 +503,8 @@ impl TelemetryTracker {
         }
     }
 
-    /// Evaluate a telemetry snapshot and return `(emit_state, emit_downbeat)`.
-    fn evaluate(&mut self, snap: TelemetrySnapshot) -> (bool, bool) {
+    /// Evaluate a telemetry snapshot and return discrete state / beat RPC events to emit.
+    fn evaluate(&mut self, snap: TelemetrySnapshot) -> TelemetryEmit {
         let state_changed = snap.is_playing != self.last_sent_playing
             || snap.direction != self.last_sent_direction
             || snap.lock_state != self.last_sent_lock_state
@@ -494,6 +514,13 @@ impl TelemetryTracker {
         let downbeat_wrapped = snap.is_playing
             && ((cur_beat == 0 && self.prev_beat != Some(0))
                 || self.prev_phase.is_some_and(|p| snap.beat_phase + 0.5 < p));
+        let beat = if downbeat_wrapped {
+            Some(BeatEvent::Downbeat)
+        } else if snap.is_playing && self.prev_beat.is_some_and(|prev| cur_beat != prev) {
+            Some(BeatEvent::Beat(cur_beat))
+        } else {
+            None
+        };
 
         self.prev_beat = Some(cur_beat);
         self.prev_phase = Some(snap.beat_phase);
@@ -505,7 +532,10 @@ impl TelemetryTracker {
             self.last_sent_playing = snap.is_playing;
         }
 
-        (state_changed, downbeat_wrapped)
+        TelemetryEmit {
+            state: state_changed,
+            beat,
+        }
     }
 }
 
@@ -530,15 +560,35 @@ const fn lock_state_to_i32(lock: LockState) -> i32 {
 }
 
 fn append_telemetry_notification(method: &str, snap: &TelemetrySnapshot, out: &mut Vec<u8>) {
+    append_telemetry_notification_with_beat(method, None, snap, out);
+}
+
+fn append_beat_notification(beat_idx: u32, snap: &TelemetrySnapshot, out: &mut Vec<u8>) {
+    append_telemetry_notification_with_beat(METHOD_BEAT, Some(beat_idx), snap, out);
+}
+
+fn append_telemetry_notification_with_beat(
+    method: &str,
+    beat_idx: Option<u32>,
+    snap: &TelemetrySnapshot,
+    out: &mut Vec<u8>,
+) {
     let bpm_tenths = (snap.bpm_link * 10.0).round() as i32;
+    let mut params = Vec::with_capacity(5);
+    if let Some(idx) = beat_idx {
+        params.push(MsgPackValue::Int(i64::from(idx)));
+    }
+    params.push(MsgPackValue::Int(i64::from(bpm_tenths)));
+    params.push(MsgPackValue::Int(i64::from(direction_to_i32(
+        snap.direction,
+    ))));
+    params.push(MsgPackValue::Int(i64::from(lock_state_to_i32(
+        snap.lock_state,
+    ))));
+    params.push(MsgPackValue::Bool(snap.is_playing));
     let notification = RpcMessage::Notification {
         method: method.to_string(),
-        params: vec![
-            MsgPackValue::Int(i64::from(bpm_tenths)),
-            MsgPackValue::Int(i64::from(direction_to_i32(snap.direction))),
-            MsgPackValue::Int(i64::from(lock_state_to_i32(snap.lock_state))),
-            MsgPackValue::Bool(snap.is_playing),
-        ],
+        params,
     };
     let _ = encode_rpc_message(&notification, out);
 }
@@ -1469,14 +1519,22 @@ mod tests {
         };
         let mut tracker = TelemetryTracker::new(init);
 
-        // 23 sub-beat ticks inside beat 0..beat 3 produce zero frames.
+        // 24 PPQN sub-beat ticks emit nothing; only integer beat crossings (1, 2, 3) emit tactus/beat.
         for step in 1..96 {
             let phase = (f64::from(step) / 24.0) % 4.0;
             let mut snap = init;
             snap.beat_phase = phase;
+            let expected_beat = if step % 24 == 0 {
+                Some(BeatEvent::Beat(step / 24))
+            } else {
+                None
+            };
             assert_eq!(
                 tracker.evaluate(snap),
-                (false, false),
+                TelemetryEmit {
+                    state: false,
+                    beat: expected_beat,
+                },
                 "step={step} phase={phase}"
             );
         }
@@ -1484,18 +1542,36 @@ mod tests {
         // Downbeat wrap from 3.958 -> 0.0 triggers downbeat only.
         let mut wrap = init;
         wrap.beat_phase = 0.0;
-        assert_eq!(tracker.evaluate(wrap), (false, true));
+        assert_eq!(
+            tracker.evaluate(wrap),
+            TelemetryEmit {
+                state: false,
+                beat: Some(BeatEvent::Downbeat),
+            }
+        );
 
         // Sub-beat jitter < 0.1 BPM emits nothing; exact 0.1 BPM step emits state.
         let mut jitter = wrap;
         jitter.beat_phase = 0.25;
         jitter.bpm_link = 120.09;
-        assert_eq!(tracker.evaluate(jitter), (false, false));
+        assert_eq!(
+            tracker.evaluate(jitter),
+            TelemetryEmit {
+                state: false,
+                beat: None,
+            }
+        );
 
         let mut step_up = jitter;
         step_up.beat_phase = 0.50;
         step_up.bpm_link = 120.1;
-        assert_eq!(tracker.evaluate(step_up), (true, false));
+        assert_eq!(
+            tracker.evaluate(step_up),
+            TelemetryEmit {
+                state: true,
+                beat: None,
+            }
+        );
 
         // quantum == 1.0 wrap triggers via phase drop even though cur_beat stays 0.
         let q1_init = TelemetrySnapshot {
@@ -1509,21 +1585,72 @@ mod tests {
             beat_phase: 0.02,
             ..q1_init
         };
-        assert_eq!(q1_tracker.evaluate(q1_wrap), (false, true));
+        assert_eq!(
+            q1_tracker.evaluate(q1_wrap),
+            TelemetryEmit {
+                state: false,
+                beat: Some(BeatEvent::Downbeat),
+            }
+        );
 
-        // Stopped transport wrap never triggers downbeat.
+        // Stopped transport never triggers beat or downbeat.
         let stopped_init = TelemetrySnapshot {
             is_playing: false,
-            beat_phase: 3.9,
+            beat_phase: 0.9,
             ..init
         };
         let mut stopped_tracker = TelemetryTracker::new(stopped_init);
         assert_eq!(
             stopped_tracker.evaluate(TelemetrySnapshot {
+                beat_phase: 1.0,
+                ..stopped_init
+            }),
+            TelemetryEmit {
+                state: false,
+                beat: None,
+            }
+        );
+        assert_eq!(
+            stopped_tracker.evaluate(TelemetrySnapshot {
+                beat_phase: 3.9,
+                ..stopped_init
+            }),
+            TelemetryEmit {
+                state: false,
+                beat: None,
+            }
+        );
+        assert_eq!(
+            stopped_tracker.evaluate(TelemetrySnapshot {
                 beat_phase: 0.0,
                 ..stopped_init
             }),
-            (false, false)
+            TelemetryEmit {
+                state: false,
+                beat: None,
+            }
+        );
+
+        // Simultaneous beat crossing + state change emits both.
+        let both_beat_init = TelemetrySnapshot {
+            is_playing: true,
+            beat_phase: 0.9,
+            bpm_link: 120.0,
+            lock_state: LockState::Acquiring,
+            ..init
+        };
+        let mut both_beat_tracker = TelemetryTracker::new(both_beat_init);
+        assert_eq!(
+            both_beat_tracker.evaluate(TelemetrySnapshot {
+                beat_phase: 1.02,
+                bpm_link: 120.2,
+                lock_state: LockState::Locked,
+                ..both_beat_init
+            }),
+            TelemetryEmit {
+                state: true,
+                beat: Some(BeatEvent::Beat(1)),
+            }
         );
 
         // Simultaneous downbeat wrap + state change updates last_sent and emits both.
@@ -1542,7 +1669,10 @@ mod tests {
                 lock_state: LockState::Locked,
                 ..both_init
             }),
-            (true, true)
+            TelemetryEmit {
+                state: true,
+                beat: Some(BeatEvent::Downbeat),
+            }
         );
         // Following sub-beat tick with identical updated state emits zero frames.
         assert_eq!(
@@ -1552,7 +1682,10 @@ mod tests {
                 lock_state: LockState::Locked,
                 ..both_init
             }),
-            (false, false)
+            TelemetryEmit {
+                state: false,
+                beat: None,
+            }
         );
     }
 
@@ -1602,7 +1735,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subbeat_ticks_emit_zero_frames_and_downbeat_wrap_emits_once() {
+    async fn subbeat_ticks_emit_zero_frames_and_beat_and_downbeat_emit_once() {
         let init = TelemetrySnapshot {
             bpm_link: 120.0,
             direction: Direction::LinkToMidi,
@@ -1615,14 +1748,32 @@ mod tests {
         let mut tb = spawn_test_bridge(init, Duration::ZERO).await;
         let _ = consume_handshake(&mut tb).await;
 
-        // Simulate 24 sub-beat ticks across a beat (0.0 -> 0.96 -> 1.0 -> 3.96).
+        // Simulate 24 sub-beat ticks across beat 0 (0.04..0.96) -> zero RPC frames.
         for tick in 1..24 {
             let phase = f64::from(tick) / 24.0;
             tb.state_tx.send_modify(|s| s.telemetry.beat_phase = phase);
             time::sleep(Duration::from_millis(2)).await;
         }
+
+        // Cross beats 1, 2, 3: each emits exactly one tactus/beat, while sub-beats emit nothing.
         for beat in 1..4 {
-            for sub in [0.0, 0.25, 0.5, 0.75, 0.96] {
+            tb.state_tx
+                .send_modify(|s| s.telemetry.beat_phase = f64::from(beat));
+            let frame = read_rpc_frame(&mut tb.peer, &mut tb.read_buf).await;
+            assert_eq!(
+                frame,
+                RpcMessage::Notification {
+                    method: METHOD_BEAT.to_string(),
+                    params: vec![
+                        MsgPackValue::Int(i64::from(beat)),
+                        MsgPackValue::Int(1200),
+                        MsgPackValue::Int(0),
+                        MsgPackValue::Int(2),
+                        MsgPackValue::Bool(true),
+                    ],
+                }
+            );
+            for sub in [0.25, 0.5, 0.75, 0.96] {
                 tb.state_tx
                     .send_modify(|s| s.telemetry.beat_phase = f64::from(beat) + sub);
                 time::sleep(Duration::from_millis(2)).await;

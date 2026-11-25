@@ -1,38 +1,48 @@
 # `tactus-zephyr` — UNO Q STM32U585 LED Matrix Companion
 
-Optional Milestone M5 microcontroller firmware for the Arduino UNO Q STM32U585 (Zephyr OS). It connects to `tactusd` on the Linux MPU via `Arduino_RouterBridge` (`/var/run/arduino-router.sock`) and drives the onboard 8×13 LED matrix with 3-bit grayscale (`0..7`).
+Optional Milestone M5 microcontroller firmware for the Arduino UNO Q STM32U585 (Zephyr OS). It connects to `tactusd` on the Linux MPU via `Arduino_RouterBridge` (`/var/run/arduino-router.sock`) and drives both the onboard 8×13 LED matrix (`0..7`) and the onboard hardware-PWM RGB LED (`LED3_R/G/B`).
 
-> **Rate Boundary (`AGENTS.md` Invariant #6):** Only discrete state changes and bar-downbeat pulses are sent over the router bridge—never 24 PPQN (`0xF8`) MIDI Clock ticks.
+> **Rate Boundary (`AGENTS.md` Invariant #6):** Only discrete state changes, integer beat pulses (`tactus/beat`), and bar-downbeat pulses (`tactus/downbeat`) are sent over the router bridge—never 24 PPQN (`0xF8`) MIDI Clock ticks.
 
 ---
 
-## 8×13 LED Matrix Layout
+## 8×13 LED Matrix & RGB `LED3` Layout
 
 The matrix is indexed row-major as `frame[row * 13 + col]` (`row = 0..7`, `col = 0..12`, 104 LEDs total) with `setGrayscaleBits(3)` (`0` = off, `7` = max).
 
 ```text
 col:   0  1  2  3  4  5  6  7  8  9 10 11 12
 r0:  [ B  B  B  B  B  B  B  B  B  B  B  B  B ]   Outer border (38 LEDs):
-r1:  [ B  .  .  .  .  .  .  >  .  .  .  .  B ]     Downbeat flash (7 -> 0 over 140 ms)
-r2:  [ B  .  .  .  .  .  .  .  >  .  .  .  B ]     + subtle corner markers (1) while playing
+r1:  [ B  .  .  .  .  .  .  >  .  .  .  .  B ]     Downbeat flash (7 -> 0 over 180 ms)
+r2:  [ B  .  .  .  .  .  .  .  >  .  .  .  B ]     + corner pulse on Beats 2..N (1 -> 5 -> 1 over 120 ms)
 r3:  [ B  .  .  =  =  =  =  =  =  >  .  .  B ]   Center 5x7 arrow:
 r4:  [ B  .  .  .  .  .  .  .  >  .  .  .  B ]     Link -> MIDI (right) | MIDI -> Link (left)
-r5:  [ B  .  .  .  .  .  .  >  .  .  .  .  B ]
+r5:  [ B  .  .  .  .  .  .  .  >  .  .  .  B ]
 r6:  [ B  .  L  L  .  .  .  .  .  P  P  .  B ]   Status strip: Lock/Link (L) & Play/Stop (P)
 r7:  [ B  B  B  B  B  B  B  B  B  B  B  B  B ]
 ```
 
-### Visual Legend
+### Visual Legend (8×13 Matrix)
 
 | Element | Coordinates | Visual State |
 | :--- | :--- | :--- |
 | **Standby (waiting for `tactusd`)** | `(r3, c5..7)` | Gentle breathing 3-pixel center bar (`1..5`) until first `tactus/state` arrives |
-| **Direction Arrow (`Link -> MIDI`)** | `r1..5, c3..9` | Right arrow (`->`): `3` stopped, `5` playing, punches to `7` on downbeat |
-| **Direction Arrow (`MIDI -> Link`)** | `r1..5, c3..9` | Left arrow (`<-`): `3` stopped, `5` playing, punches to `7` on downbeat |
+| **Direction Arrow (`Link -> MIDI`)** | `r1..5, c3..9` | Right arrow (`->`): `3` stopped, `5` playing, `+1` (`6`) on Beats 2..N, punches to `7` on downbeat |
+| **Direction Arrow (`MIDI -> Link`)** | `r1..5, c3..9` | Left arrow (`<-`): `3` stopped, `5` playing, `+1` (`6`) on Beats 2..N, punches to `7` on downbeat |
 | **Lock Status (`MidiToLink`)** | `(r6, c2..3)` | `Unlocked`: dim 1-px dot `(r6, c2)=1` · `Acquiring`: pulsing `1..6` (`800 ms`) · `Locked`: solid `6` |
 | **Clock Ready (`LinkToMidi`)** | `(r6, c2..3)` | Solid `4` when stopped, solid `6` when playing |
 | **Transport (`Stopped` vs `Playing`)** | `(r6, c9..10)` + corners | `Stopped`: dim single pip `(r6, c10)=1`, corners `0` · `Playing`: bright `5` bar `(r6, c9..10)`, corners `1` |
-| **Downbeat Heartbeat Pulse** | Perimeter (`r0, r7, c0, c12`) + arrow | Flashes to `7` on `tactus/downbeat` and decays smoothly `7 -> 0` over `140 ms` |
+| **Downbeat Pulse (Beat 1)** | Perimeter (`r0, r7, c0, c12`) + arrow | Flashes to `7` on `tactus/downbeat` and decays smoothly `7 -> 0` over `180 ms` |
+| **Beat Pulse (Beats 2..N)** | 4 corners + arrow/play | Pulses corners `1 -> 5 -> 1` and nudges arrow/play `5 -> 6 -> 5` over `120 ms` on `tactus/beat` |
+
+### Visual Legend (Onboard PWM RGB `LED3`)
+
+| State | Color & Pulse Behavior |
+| :--- | :--- |
+| **Standby (waiting for `tactusd`)** | Soft breathing blue (`1600 ms` triangle) |
+| **Stopped** | Subtle steady teal (`Link -> MIDI`), dim amber (`Unlocked`), breathing amber (`Acquiring`, `800 ms`), or calm emerald (`Locked`) |
+| **Playing — Beat 1 (`tactus/downbeat`)** | Bright warm gold/white flash decaying quadratically over `180 ms` to a low direction-colored floor |
+| **Playing — Beats 2..N (`tactus/beat`)** | Medium-bright cyan (`Link -> MIDI`), emerald (`MIDI -> Link` locked), or amber (`Acquiring`/`Unlocked`) pulse decaying over `120 ms` |
 
 ---
 
@@ -47,7 +57,8 @@ Registered on the MCU via `Bridge.provide_safe(method, fn)`:
 | Method | Signature / Payload | Meaning |
 | :--- | :--- | :--- |
 | `"tactus/state"` | `(int bpm_tenths, int direction, int lock_state, bool is_playing)` | Pushed on connect and on discrete state/lock/direction/play changes or `>= 0.1 BPM` changes (`bpm_tenths = round(bpm_link * 10)`) |
-| `"tactus/downbeat"` | `(int bpm_tenths, int direction, int lock_state, bool is_playing)` | Pushed once per bar downbeat wrap while `is_playing == true` |
+| `"tactus/downbeat"` | `(int bpm_tenths, int direction, int lock_state, bool is_playing)` | Pushed once per bar downbeat wrap (Beat 1) while `is_playing == true` |
+| `"tactus/beat"` | `(int beat_index, int bpm_tenths, int direction, int lock_state, bool is_playing)` | Pushed on each non-downbeat integer beat crossing (`beat_index >= 1`) while `is_playing == true` |
 
 Field encodings:
 - `direction`: `0` = `LinkToMidi`, `1` = `MidiToLink`
