@@ -27,6 +27,7 @@ use crate::midi::hotplug::UeventMonitor;
 use crate::midi::{close_fd_set, match_output_ports, match_port, MidiBackend, MidiFdSet};
 use crate::rt::{FdReturn, RtMessage, WakeSender};
 use crate::rt_os::{AsyncWakeReceiver, WakeReceiver};
+use crate::status_led;
 use crate::web;
 
 #[cfg(target_os = "linux")]
@@ -560,7 +561,13 @@ pub async fn run_control_plane(args: ControlPlaneArgs) {
         shutdown_rx.clone(),
     )
     .await;
-    let mcu_handle = mcu::spawn_mcu_bridge(&args.config.mcu_bridge, control_handle, shutdown_rx);
+    let mcu_handle = mcu::spawn_mcu_bridge(
+        &args.config.mcu_bridge,
+        control_handle.clone(),
+        shutdown_rx.clone(),
+    );
+    let led_handle =
+        status_led::spawn_status_led(control_handle.state_rx.clone(), shutdown_rx.clone());
 
     let uevent = match UeventMonitor::new() {
         Ok(mon) => Some(mon),
@@ -662,33 +669,11 @@ pub async fn run_control_plane(args: ControlPlaneArgs) {
     }
 
     let _ = shutdown_tx.send(true);
-    let stop_web = async {
-        if let Some(handle) = web_handle {
-            if tokio::time::timeout(WEB_SHUTDOWN_TIMEOUT, handle)
-                .await
-                .is_err()
-            {
-                log_warn!(
-                    "web UI server did not stop within {:?}; continuing shutdown",
-                    WEB_SHUTDOWN_TIMEOUT
-                );
-            }
-        }
-    };
-    let stop_mcu = async {
-        if let Some(handle) = mcu_handle {
-            if tokio::time::timeout(WEB_SHUTDOWN_TIMEOUT, handle)
-                .await
-                .is_err()
-            {
-                log_warn!(
-                    "MCU bridge task did not stop within {:?}; continuing shutdown",
-                    WEB_SHUTDOWN_TIMEOUT
-                );
-            }
-        }
-    };
-    tokio::join!(stop_web, stop_mcu);
+    tokio::join!(
+        stop_optional_task("web UI server", web_handle),
+        stop_optional_task("MCU bridge task", mcu_handle),
+        stop_optional_task("status LED task", led_handle),
+    );
 
     hub.persister.shutdown().await;
 
@@ -710,6 +695,20 @@ pub async fn run_control_plane(args: ControlPlaneArgs) {
     let _ = hub.drain_rt_returns();
     hub.drain_telemetry();
     log_info!("shutdown complete");
+}
+
+async fn stop_optional_task(name: &str, handle: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(handle) = handle {
+        if tokio::time::timeout(WEB_SHUTDOWN_TIMEOUT, handle)
+            .await
+            .is_err()
+        {
+            log_warn!(
+                "{name} did not stop within {:?}; continuing shutdown",
+                WEB_SHUTDOWN_TIMEOUT
+            );
+        }
+    }
 }
 
 async fn wait_rt_notify_opt(notify: Option<&AsyncWakeReceiver>) -> std::io::Result<()> {

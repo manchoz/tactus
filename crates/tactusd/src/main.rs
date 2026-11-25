@@ -16,6 +16,7 @@ mod mcu;
 mod midi;
 mod rt;
 mod rt_os;
+mod status_led;
 mod web;
 
 use std::env;

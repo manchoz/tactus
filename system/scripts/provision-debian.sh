@@ -283,6 +283,9 @@ ensure_tactus_user() {
   if getent group arduino-router >/dev/null 2>&1; then
     usermod -aG arduino-router tactus
   fi
+  if getent group gpiod >/dev/null 2>&1; then
+    usermod -aG gpiod tactus
+  fi
   install -d -o tactus -g tactus -m 0750 /var/lib/tactus
 }
 
@@ -427,10 +430,12 @@ install_system_files() {
   install -m 0644 "${SYSTEM_DIR}/systemd/tactus-ap.service" /etc/systemd/system/tactus-ap.service
   install -m 0644 "${SYSTEM_DIR}/systemd/tactus-dhcp.service" /etc/systemd/system/tactus-dhcp.service
   install -m 0644 "${SYSTEM_DIR}/systemd/tactusd.service" /etc/systemd/system/tactusd.service
+  install -m 0644 "${SYSTEM_DIR}/systemd/tactus-led-fault.service" /etc/systemd/system/tactus-led-fault.service
 
   install -d -m 0755 /etc/systemd/system.conf.d /etc/tmpfiles.d
   install -m 0644 "${SYSTEM_DIR}/systemd/system-boot-tactus.conf" /etc/systemd/system.conf.d/99-tactus-boot.conf
   install -m 0644 "${SYSTEM_DIR}/tmpfiles/99-tactus-thp.conf" /etc/tmpfiles.d/99-tactus-thp.conf
+  install -m 0644 "${SYSTEM_DIR}/tmpfiles/99-tactus-led1-boot.conf" /etc/tmpfiles.d/99-tactus-led1-boot.conf
   systemd-tmpfiles --create /etc/tmpfiles.d/99-tactus-thp.conf 2>/dev/null || true
 
   if command -v modinfo >/dev/null 2>&1 && modinfo -n ath10k_snoc >/dev/null 2>&1; then

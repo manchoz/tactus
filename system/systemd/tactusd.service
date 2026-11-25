@@ -2,6 +2,7 @@
 Description=Tactus MIDI / Ableton Link Sync Daemon
 After=network.target arduino-router.service
 Wants=arduino-router.service tactus-ap.service
+OnFailure=tactus-led-fault.service
 
 [Service]
 Type=simple
@@ -12,13 +13,14 @@ StateDirectoryMode=0750
 RuntimeDirectory=tactus
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes
+ExecStartPre=+-/bin/rm -f /run/tactus/fault
 ExecStart=/usr/local/bin/tactusd --config /var/lib/tactus/config.toml
 AmbientCapabilities=CAP_SYS_NICE CAP_IPC_LOCK CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_SYS_NICE CAP_IPC_LOCK CAP_NET_BIND_SERVICE
 LimitRTPRIO=95
 LimitMEMLOCK=infinity
 ProtectSystem=strict
-ReadWritePaths=/var/lib/tactus /run/tactus -/run/arduino-router.sock
+ReadWritePaths=/var/lib/tactus /run/tactus -/run/arduino-router.sock -/sys/class/leds/unoq:user-red1 -/sys/class/leds/unoq:user-green1 -/sys/class/leds/unoq:user-blue1
 PrivateTmp=true
 Restart=always
 RestartSec=2
