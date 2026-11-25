@@ -428,6 +428,24 @@ install_system_files() {
   install -m 0644 "${SYSTEM_DIR}/systemd/tactus-dhcp.service" /etc/systemd/system/tactus-dhcp.service
   install -m 0644 "${SYSTEM_DIR}/systemd/tactusd.service" /etc/systemd/system/tactusd.service
 
+  install -d -m 0755 /etc/systemd/system.conf.d /etc/tmpfiles.d
+  install -m 0644 "${SYSTEM_DIR}/systemd/system-boot-tactus.conf" /etc/systemd/system.conf.d/99-tactus-boot.conf
+  install -m 0644 "${SYSTEM_DIR}/tmpfiles/99-tactus-thp.conf" /etc/tmpfiles.d/99-tactus-thp.conf
+  systemd-tmpfiles --create /etc/tmpfiles.d/99-tactus-thp.conf 2>/dev/null || true
+
+  if command -v modinfo >/dev/null 2>&1 && modinfo -n ath10k_snoc >/dev/null 2>&1; then
+    install -d -m 0755 /etc/modules-load.d
+    install -m 0644 "${SYSTEM_DIR}/modules-load/99-tactus-wifi.conf" /etc/modules-load.d/99-tactus-wifi.conf
+  fi
+  if systemctl list-unit-files rmtfs.service --no-legend 2>/dev/null | grep -q rmtfs.service; then
+    install -d -m 0755 /etc/systemd/system/rmtfs.service.d
+    install -m 0644 "${SYSTEM_DIR}/systemd/rmtfs-early.conf" /etc/systemd/system/rmtfs.service.d/10-tactus-early.conf
+  fi
+  if systemctl list-unit-files tqftpserv.service --no-legend 2>/dev/null | grep -q tqftpserv.service; then
+    install -d -m 0755 /etc/systemd/system/tqftpserv.service.d
+    install -m 0644 "${SYSTEM_DIR}/systemd/tqftpserv-early.conf" /etc/systemd/system/tqftpserv.service.d/10-tactus-early.conf
+  fi
+
   if [[ ! -f /var/lib/tactus/config.toml ]]; then
     log "Seeding default /var/lib/tactus/config.toml..."
     install -o tactus -g tactus -m 0640 "${SYSTEM_DIR}/config/config.toml" /var/lib/tactus/config.toml
@@ -537,6 +555,15 @@ trim_services() {
     man-db.timer
     dpkg-db-backup.timer
     e2scrub_all.timer
+    remoteproc_audio_fixup.service
+    debos-grow-rootfs.service
+    networking.service
+    NetworkManager-wait-online.service
+    wpa_supplicant.service
+    wtmpdb-update-boot.service
+    cron.service
+    key_events.service
+    e2scrub_reap.service
   )
   local unit
   for unit in "${units[@]}"; do
@@ -545,11 +572,15 @@ trim_services() {
     fi
   done
 
-  # Stop and mask D-Bus-activated desktop daemons so USB-MIDI hotplug cannot respawn them.
+  # Stop and mask D-Bus-activated desktop daemons and x86/unused vendor daemons
+  # so USB-MIDI hotplug or D-Bus activation cannot respawn them.
   local masked_units=(
     fwupd.service
     udisks2.service
     upower.service
+    blueman-mechanism.service
+    thermald.service
+    urm.service
   )
   for unit in "${masked_units[@]}"; do
     if systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep -q "$unit"; then

@@ -81,8 +81,8 @@ Provisioned boards keep `_arduino._tcp` disabled, so `arduino-cli upload -l netw
 - **Avoid:** on-board `arduino-cli upload` (fails with `remoteocd` or non-`gpiod` OpenOCD) and legacy `/usr/local/bin/arduino-flash` (writes `0x80F0000` instead of UNO Q's `0x08100000` `user_sketch` partition). See `mcu/tactus-zephyr/README.md` if temporarily re-enabling `_arduino._tcp` for App Lab.
 
 ## 6. Service Trimming Guardrails (`provision-debian.sh`)
-- **Masked / disabled:** desktop/USB-probing daemons (`fwupd.service`, `udisks2.service`, `upower.service`) and background timers (`fwupd-refresh.timer`, `apt-daily*.timer`, `man-db.timer`, `dpkg-db-backup.timer`, `e2scrub_all.timer`).
-- **Keep intact:** `arduino-burn-bootloader-unoq.service` (flag-guarded no-op after first boot; preserves manual `arduino-cli burn-bootloader`), `arduino-router.service`, `/opt/openocd`, `NetworkManager.service`, and Qualcomm SoC daemons (`rmtfs`, `tqftpserv`, `thermald`, `urm`).
+- **Masked / disabled:** desktop/USB-probing daemons (`fwupd.service`, `udisks2.service`, `upower.service`, `blueman-mechanism.service`), x86-only `thermald.service` (no ARM64 zones; kernel `step_wise` thermal zones handle QRB2210/WCN3990 throttling), `urm.service` (THP disabled directly via `/etc/tmpfiles.d/99-tactus-thp.conf`), unused boot/legacy units (`remoteproc_audio_fixup.service`, `debos-grow-rootfs.service`, `networking.service`, `NetworkManager-wait-online.service`, `wpa_supplicant.service`, `wtmpdb-update-boot.service`, `cron.service`, `key_events.service`, `e2scrub_reap.service`), and background timers (`fwupd-refresh.timer`, `apt-daily*.timer`, `man-db.timer`, `dpkg-db-backup.timer`, `e2scrub_all.timer`).
+- **Keep intact:** `arduino-burn-bootloader-unoq.service` (flag-guarded no-op after first boot; preserves manual `arduino-cli burn-bootloader`), `arduino-router.service`, `/opt/openocd`, `NetworkManager.service`, and WiFi modem daemons (`rmtfs.service`, `tqftpserv.service` — started early via drop-ins for WCN3990 firmware/NVRAM).
 
 ## 7. UNO Q Hardware Quick Reference
 - **OS / Kernel:** Debian 13 (`trixie`), `7.2.11-arduino1+`, `aarch64` (4 cores, QRB2210), glibc `2.41`.

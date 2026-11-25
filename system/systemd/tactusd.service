@@ -1,7 +1,7 @@
 [Unit]
 Description=Tactus MIDI / Ableton Link Sync Daemon
-After=network-online.target tactus-ap.service tactus-dhcp.service sound.target
-Wants=tactus-ap.service
+After=network.target arduino-router.service
+Wants=arduino-router.service tactus-ap.service
 
 [Service]
 Type=simple

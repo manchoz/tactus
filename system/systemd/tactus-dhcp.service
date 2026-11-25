@@ -3,7 +3,6 @@ Description=Tactus WiFi AP DHCP Server (DHCP-only dnsmasq)
 BindsTo=tactus-ap.service
 PartOf=tactus-ap.service
 After=tactus-ap.service
-Before=tactusd.service
 
 [Service]
 Type=simple
