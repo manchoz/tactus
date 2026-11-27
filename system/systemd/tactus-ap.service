@@ -18,7 +18,7 @@ ExecStartPre=-/usr/sbin/rfkill unblock wifi
 ExecStartPre=/usr/sbin/iw reg set IT
 ExecStartPre=/usr/sbin/ip link set wlan0 up
 ExecStartPre=/usr/sbin/ip addr replace 10.42.0.1/24 dev wlan0
-ExecStartPre=/bin/sh -c 'if /usr/sbin/iw list | /usr/bin/grep "5180.0 MHz" | /usr/bin/grep -q "no IR"; then src=/etc/hostapd/tactus-ap-2g.conf; else src=/etc/hostapd/tactus-ap.conf; fi; echo "tactus-ap: using $$src"; /usr/bin/install -m 0600 "$$src" /run/tactus/hostapd.conf'
+ExecStartPre=/bin/sh -c 'src=/etc/hostapd/tactus-ap-2g.conf; i=0; while [ "$$i" -lt 6 ]; do if /usr/sbin/iw list | /usr/bin/grep "5180.0 MHz" | /usr/bin/grep -qvE "no IR|disabled"; then src=/etc/hostapd/tactus-ap.conf; break; fi; i=$$((i + 1)); sleep 0.5; done; echo "tactus-ap: using $$src"; /usr/bin/install -m 0600 "$$src" /run/tactus/hostapd.conf'
 ExecStart=/usr/sbin/hostapd /run/tactus/hostapd.conf
 ExecStartPost=/bin/sh -c 'ready=0; i=0; while [ "$i" -lt 50 ]; do /usr/sbin/iw dev wlan0 info 2>/dev/null | grep -q "type AP" && { ready=1; break; }; i=$((i + 1)); sleep 0.1; done; [ "$ready" -eq 1 ] || exit 1; /usr/sbin/ip addr replace 10.42.0.1/24 dev wlan0 || exit 1; /usr/sbin/iw dev wlan0 set power_save off 2>/dev/null || true; /bin/touch /run/tactus/ap-ready; /bin/rm -f /run/tactus/fault.tactus-ap.service'
 ExecStopPost=-/bin/rm -f /run/tactus/ap-ready

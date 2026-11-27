@@ -64,43 +64,19 @@ echo "[unoq-kernel] building image $IMAGE"
 container build --tag "$IMAGE" --file "$REPO_ROOT/system/kernel/Containerfile" "$REPO_ROOT/system/kernel"
 
 echo "[unoq-kernel] building kernel (ref=$KERNEL_REF, cpus=$CPUS, memory=$MEMORY)"
+# system/kernel (build.sh + tactus-5ghz.config) is shared with the GitHub workflow.
 container run --rm \
     --cpus "$CPUS" --memory "$MEMORY" \
     --volume "$VOLUME:/work" \
-    --volume "$REPO_ROOT/system/kernel:/fragments:ro" \
+    --volume "$REPO_ROOT/system/kernel:/kernel:ro" \
     --volume "$OUT_DIR:/out" \
+    --env WORK=/work \
+    --env OUT=/out \
     --env KERNEL_REPO="$KERNEL_REPO" \
     --env KERNEL_REF="$KERNEL_REF" \
     --env DEB_IMAGES_REPO="$DEB_IMAGES_REPO" \
     --env DEB_IMAGES_REF="$DEB_IMAGES_REF" \
-    "$IMAGE" bash -euo pipefail -c '
-        cd /work
-        # drop packages from previous runs so only the fresh build is exported
-        rm -f ./*.deb ./*.changes ./*.buildinfo
-        rm -rf arduino-deb-images
-        git clone --depth=1 --branch "$DEB_IMAGES_REF" "$DEB_IMAGES_REPO" arduino-deb-images
-        # build-linux-deb.py clones into ./linux; reuse an existing tree via --local-dir.
-        if [ -d linux/.git ]; then
-            git -C linux fetch --depth=1 origin "$KERNEL_REF"
-            git -C linux checkout -f FETCH_HEAD
-            src_args=(--local-dir linux)
-        else
-            src_args=(--repo "$KERNEL_REPO" --ref "$KERNEL_REF")
-        fi
-        mapfile -t base_configs < <(ls arduino-deb-images/kernel-configs/*.config | sort)
-        python3 arduino-deb-images/scripts/build-linux-deb.py \
-            "${src_args[@]}" "${base_configs[@]}" /fragments/tactus-5ghz.config
-        grep -q "^CONFIG_LOCALVERSION=\"-arduino1-tactus\"$" linux/.config
-        grep -q "^CONFIG_CFG80211_CERTIFICATION_ONUS=y$" linux/.config
-        grep -q "^CONFIG_ATH_REG_DYNAMIC_USER_REG_HINTS=y$" linux/.config
-        rm -f /out/*.deb /out/*.changes
-        for f in linux-image-*.deb; do
-            case "$f" in *-dbg_*) continue ;; esac
-            cp -v "$f" /out/
-        done
-        cp -v ./*.changes /out/ 2>/dev/null || true
-        cp -v linux/.config /out/kernel.config
-    '
+    "$IMAGE" bash /kernel/build.sh
 
 echo "[unoq-kernel] done. Outputs in $OUT_DIR:"
 ls -lh "$OUT_DIR"
