@@ -1,0 +1,98 @@
+name: Build UNO Q 5 GHz Kernel (.deb)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: Linux kernel git repository
+        required: true
+        default: https://github.com/arduino/linux-qcom
+        type: string
+      kernel_ref:
+        description: Linux kernel git branch or tag
+        required: true
+        default: qcom-v7.2.11-arduino
+        type: string
+      deb_images_repo:
+        description: Arduino Debian images repository
+        required: true
+        default: https://github.com/arduino/arduino-deb-images
+        type: string
+      deb_images_ref:
+        description: Arduino Debian images git branch or tag
+        required: true
+        default: arduino
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-unoq-kernel:
+    name: Build arm64 Kernel Debian Package
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - name: Checkout Tactus repository
+        uses: actions/checkout@v4
+
+      - name: Install Debian arm64 kernel cross-build dependencies
+        run: |
+          set -euo pipefail
+          dpkg --add-architecture arm64
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates \
+            git \
+            crossbuild-essential-arm64 \
+            make \
+            flex \
+            bison \
+            bc \
+            libdw-dev \
+            libelf-dev \
+            libssl-dev \
+            libssl-dev:arm64 \
+            dpkg-dev \
+            debhelper \
+            kmod \
+            python3 \
+            rsync \
+            coreutils \
+            cpio \
+            xz-utils
+
+      - name: Clone arduino-deb-images
+        run: |
+          set -euo pipefail
+          git clone --depth=1 --branch "${{ inputs.deb_images_ref }}" \
+            "${{ inputs.deb_images_repo }}" arduino-deb-images
+
+      - name: Build UNO Q 5 GHz kernel .deb
+        run: |
+          set -euo pipefail
+          mapfile -t base_configs < <(ls arduino-deb-images/kernel-configs/*.config | sort)
+          python3 arduino-deb-images/scripts/build-linux-deb.py \
+            --repo "${{ inputs.kernel_repo }}" \
+            --ref "${{ inputs.kernel_ref }}" \
+            "${base_configs[@]}" \
+            system/kernel/tactus-5ghz.config
+
+      - name: Verify merged .config and list packages
+        run: |
+          set -euo pipefail
+          grep -q '^CONFIG_LOCALVERSION="-arduino1-tactus"$' linux/.config
+          grep -q '^CONFIG_CFG80211_CERTIFICATION_ONUS=y$' linux/.config
+          grep -q '^CONFIG_ATH_REG_DYNAMIC_USER_REG_HINTS=y$' linux/.config
+          ls -lh *.deb *.changes
+
+      - name: Upload kernel .deb artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: unoq-kernel-5ghz-deb
+          path: |
+            linux-image-*.deb
+            !linux-image-*-dbg_*.deb
+            *.changes
+            linux/.config
+          if-no-files-found: error
