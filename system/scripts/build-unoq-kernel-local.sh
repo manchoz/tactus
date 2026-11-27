@@ -75,6 +75,8 @@ container run --rm \
     --env DEB_IMAGES_REF="$DEB_IMAGES_REF" \
     "$IMAGE" bash -euo pipefail -c '
         cd /work
+        # drop packages from previous runs so only the fresh build is exported
+        rm -f ./*.deb ./*.changes ./*.buildinfo
         rm -rf arduino-deb-images
         git clone --depth=1 --branch "$DEB_IMAGES_REF" "$DEB_IMAGES_REPO" arduino-deb-images
         # build-linux-deb.py clones into ./linux; reuse an existing tree via --local-dir.
