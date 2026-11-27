@@ -1,0 +1,42 @@
+[package]
+name = "arduino-router"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+description = "Async MessagePack-RPC client, streaming codec, and virtual serial monitor for Arduino Router (Arduino_RouterBridge / Arduino_RPClite)"
+repository = "https://github.com/manchoz/tactus"
+documentation = "https://docs.rs/arduino-router"
+readme = "README.md"
+keywords = ["arduino", "msgpack", "rpc", "arduino-router", "embedded"]
+categories = ["network-programming", "asynchronous", "hardware-support"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = ["tokio"]
+tokio = ["dep:tokio"]
+serde = ["dep:serde"]
+tracing = ["dep:tracing"]
+
+[dependencies]
+serde = { version = "1", optional = true }
+tokio = { version = "1", features = ["macros", "net", "io-util", "sync", "time", "rt"], optional = true }
+tracing = { version = "0.1", optional = true }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time"] }
+
+[[example]]
+name = "basic_client"
+required-features = ["tokio"]
+
+[[example]]
+name = "provide_handler"
+required-features = ["tokio"]
+
+[[example]]
+name = "monitor"
+required-features = ["tokio"]

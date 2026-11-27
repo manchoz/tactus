@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/arduino-router",
     "crates/tactus-protocol",
     "crates/tactus-link-sys",
     "crates/tactus-sync-core",

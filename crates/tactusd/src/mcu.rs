@@ -5,13 +5,17 @@
 //! on bar downbeat wraps while playing, emits `tactus/beat` on non-downbeat integer beat crossings
 //! while playing, and forwards debounced MCU input commands to `ControlHandle`.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use arduino_router::{
+    Client, ClientConfig, CodecLimits, LifecycleEvent, ManagedClient, ReconnectPolicy, RpcError,
+    Value,
+};
 use tactus_protocol::{Direction, EngineCommand, LockState, McuBridgeConfig, TelemetrySnapshot};
 use tactus_sync_core::{MAX_VALID_BPM, MIN_VALID_BPM};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{self, Instant};
 
@@ -27,7 +31,6 @@ const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 const CMD_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 const BPM_CHANGE_THRESHOLD: f64 = 0.1 - 1e-9;
 
-const METHOD_REGISTER: &str = "$/register";
 const METHOD_STATE: &str = "tactus/state";
 const METHOD_DOWNBEAT: &str = "tactus/downbeat";
 const METHOD_BEAT: &str = "tactus/beat";
@@ -71,6 +74,18 @@ pub fn spawn_mcu_bridge(
     )))
 }
 
+fn mcu_client_config() -> ClientConfig {
+    ClientConfig {
+        limits: CodecLimits {
+            max_frame_bytes: MAX_FRAME_BYTES,
+            max_decode_depth: MAX_DECODE_DEPTH,
+        },
+        write_timeout: SOCKET_WRITE_TIMEOUT,
+        max_concurrent_handlers: 1,
+        ..ClientConfig::default()
+    }
+}
+
 // --- Session & Reconnect Loop ---
 
 async fn run_mcu_bridge_loop(
@@ -78,25 +93,75 @@ async fn run_mcu_bridge_loop(
     handle: ControlHandle,
     shutdown_rx: watch::Receiver<bool>,
 ) {
+    let connect_path = socket_path.clone();
     run_mcu_bridge_with_connector(
         &socket_path,
-        || UnixStream::connect(&socket_path),
+        move || {
+            let p = connect_path.clone();
+            async move { UnixStream::connect(p).await }
+        },
         handle,
         shutdown_rx,
+        DEFAULT_COMMAND_DEBOUNCE,
     )
     .await;
 }
 
+async fn sync_initial_state(
+    client: Option<Client>,
+    state_rx: &mut watch::Receiver<tactus_protocol::AppState>,
+    tracker: &mut TelemetryTracker,
+) -> Option<Client> {
+    let client = client?;
+    let snap = state_rx.borrow_and_update().telemetry;
+    *tracker = TelemetryTracker::new(snap);
+    if let Err(err) = emit_state_notification(&client, &snap).await {
+        log_warn!("MCU bridge initial state write failed: {err}");
+        None
+    } else {
+        Some(client)
+    }
+}
+
 async fn run_mcu_bridge_with_connector<F, Fut>(
     socket_label: &str,
-    mut connect: F,
+    connect: F,
     handle: ControlHandle,
     mut shutdown_rx: watch::Receiver<bool>,
+    debounce: Duration,
 ) where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = std::io::Result<UnixStream>>,
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = std::io::Result<UnixStream>> + Send + 'static,
 {
-    let mut backoff = INITIAL_RECONNECT_BACKOFF;
+    if *shutdown_rx.borrow_and_update() {
+        log_info!("MCU bridge stopped");
+        return;
+    }
+
+    let debouncer = Arc::new(Mutex::new(CommandDebouncer::new(debounce)));
+    let mut builder = ManagedClient::builder_with_connector(connect)
+        .client_config(mcu_client_config())
+        .reconnect_policy(ReconnectPolicy {
+            initial_backoff: INITIAL_RECONNECT_BACKOFF,
+            max_backoff: MAX_RECONNECT_BACKOFF,
+            multiplier: 2,
+        });
+
+    for &method in &INCOMING_CMD_METHODS {
+        let h = handle.clone();
+        let d = Arc::clone(&debouncer);
+        builder = builder.provide_raw(method, move |params| {
+            let h = h.clone();
+            let d = Arc::clone(&d);
+            async move { handle_mcu_rpc(method, params, &h, &d).await }
+        });
+    }
+
+    let managed = builder.spawn();
+    let mut events = managed.subscribe_events();
+    let mut state_rx = handle.state_rx.clone();
+    let mut tracker = TelemetryTracker::new(state_rx.borrow_and_update().telemetry);
+    let mut active_client: Option<Client> = None;
     let mut connect_err_logged = false;
 
     loop {
@@ -104,314 +169,89 @@ async fn run_mcu_bridge_with_connector<F, Fut>(
             break;
         }
 
-        let connect_res = tokio::select! {
-            biased;
-            () = wait_shutdown(&mut shutdown_rx) => break,
-            res = connect() => res,
-        };
-
-        match connect_res {
-            Ok(stream) => {
-                connect_err_logged = false;
-                log_info!("MCU bridge connected to `{socket_label}`");
-                let outcome = run_bridge_session_inner(
-                    stream,
-                    handle.clone(),
-                    shutdown_rx.clone(),
-                    DEFAULT_COMMAND_DEBOUNCE,
-                )
-                .await;
-                match outcome {
-                    SessionOutcome::Shutdown => break,
-                    SessionOutcome::Disconnected { established } => {
-                        if established {
-                            backoff = INITIAL_RECONNECT_BACKOFF;
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                if !connect_err_logged {
-                    log_warn!(
-                        "MCU bridge failed connecting to `{socket_label}` ({err}); retrying with backoff"
-                    );
-                    connect_err_logged = true;
-                }
-            }
-        }
-
         tokio::select! {
             biased;
             () = wait_shutdown(&mut shutdown_rx) => break,
-            () = time::sleep(backoff) => {}
+            ev = events.recv() => {
+                match ev {
+                    Ok(LifecycleEvent::Connected) => {
+                        connect_err_logged = false;
+                        log_info!("MCU bridge connected to `{socket_label}`");
+                        active_client = sync_initial_state(
+                            managed.current_client(),
+                            &mut state_rx,
+                            &mut tracker,
+                        )
+                        .await;
+                    }
+                    Ok(LifecycleEvent::Disconnected { .. }) => {
+                        active_client = None;
+                        log_info!("MCU bridge peer closed connection");
+                    }
+                    Ok(LifecycleEvent::ConnectFailed { error, .. }) => {
+                        active_client = None;
+                        if !connect_err_logged {
+                            log_warn!(
+                                "MCU bridge failed connecting to `{socket_label}` ({error}); retrying with backoff"
+                            );
+                            connect_err_logged = true;
+                        }
+                    }
+                    Ok(LifecycleEvent::RegisterFailed { method, error }) => {
+                        log_warn!("MCU bridge $/register `{method}` failed: {error}");
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        active_client = sync_initial_state(
+                            managed.current_client(),
+                            &mut state_rx,
+                            &mut tracker,
+                        )
+                        .await;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            changed = state_rx.changed(), if active_client.is_some() => {
+                if changed.is_err() {
+                    break;
+                }
+                if let Some(ref client) = active_client {
+                    let snap = state_rx.borrow_and_update().telemetry;
+                    let emit = tracker.evaluate(snap);
+                    if let Err(err) = emit_telemetry_events(client, emit, &snap).await {
+                        log_warn!("MCU bridge telemetry write failed: {err}");
+                        active_client = None;
+                    }
+                }
+            }
         }
-        backoff = next_backoff(backoff);
     }
 
+    managed.shutdown().await;
     log_info!("MCU bridge stopped");
 }
 
-const fn next_backoff(current: Duration) -> Duration {
-    let doubled = current.saturating_mul(2);
-    if doubled.as_millis() > MAX_RECONNECT_BACKOFF.as_millis() {
-        MAX_RECONNECT_BACKOFF
-    } else {
-        doubled
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionOutcome {
-    Shutdown,
-    Disconnected { established: bool },
-}
-
-/// Run a single connected MessagePack-RPC bridge session until disconnect or shutdown.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn run_bridge_session(
-    stream: UnixStream,
-    handle: ControlHandle,
-    shutdown_rx: watch::Receiver<bool>,
-    debounce: Duration,
-) {
-    let _ = run_bridge_session_inner(stream, handle, shutdown_rx, debounce).await;
-}
-
-async fn run_bridge_session_inner(
-    mut stream: UnixStream,
-    handle: ControlHandle,
-    mut shutdown_rx: watch::Receiver<bool>,
-    debounce: Duration,
-) -> SessionOutcome {
-    if *shutdown_rx.borrow_and_update() {
-        return SessionOutcome::Shutdown;
-    }
-
-    let mut state_rx = handle.state_rx.clone();
-    let initial_snap = state_rx.borrow_and_update().telemetry;
-    let mut tracker = TelemetryTracker::new(initial_snap);
-    let mut debouncer = CommandDebouncer::new(debounce);
-
-    let mut out_buf = Vec::with_capacity(512);
-    for (idx, method) in INCOMING_CMD_METHODS.iter().enumerate() {
-        let req = RpcMessage::Request {
-            msgid: (idx as u32) + 1,
-            method: METHOD_REGISTER.to_string(),
-            params: vec![MsgPackValue::Str((*method).to_string())],
-        };
-        if let Err(err) = encode_rpc_message(&req, &mut out_buf) {
-            log_warn!("MCU bridge failed encoding register request for `{method}`: {err}");
-            return SessionOutcome::Disconnected { established: false };
-        }
-    }
-    append_telemetry_notification(METHOD_STATE, &initial_snap, &mut out_buf);
-
-    match write_all_or_shutdown(&mut stream, &out_buf, &mut shutdown_rx).await {
-        WriteStatus::Ok => {}
-        WriteStatus::Shutdown => return SessionOutcome::Shutdown,
-        WriteStatus::Failed(err) => {
-            log_warn!("MCU bridge initial handshake write failed: {err}");
-            return SessionOutcome::Disconnected { established: false };
-        }
-    }
-
-    let mut read_buf = Vec::with_capacity(1024);
-    let mut tmp = [0u8; 4096];
-
-    loop {
-        let avail = MAX_FRAME_BYTES.saturating_sub(read_buf.len());
-        if avail == 0 {
-            log_warn!("MCU bridge frame exceeded {MAX_FRAME_BYTES} byte limit; closing session");
-            return SessionOutcome::Disconnected { established: true };
-        }
-        let read_cap = avail.min(tmp.len());
-
-        tokio::select! {
-            biased;
-            () = wait_shutdown(&mut shutdown_rx) => {
-                return SessionOutcome::Shutdown;
-            }
-            changed = state_rx.changed() => {
-                if changed.is_err() {
-                    return SessionOutcome::Disconnected { established: true };
-                }
-                let snap = state_rx.borrow_and_update().telemetry;
-                let emit = tracker.evaluate(snap);
-                if emit.state || emit.beat.is_some() {
-                    out_buf.clear();
-                    if emit.state {
-                        append_telemetry_notification(METHOD_STATE, &snap, &mut out_buf);
-                    }
-                    match emit.beat {
-                        Some(BeatEvent::Downbeat) => {
-                            append_telemetry_notification(METHOD_DOWNBEAT, &snap, &mut out_buf);
-                        }
-                        Some(BeatEvent::Beat(beat_idx)) => {
-                            append_beat_notification(beat_idx, &snap, &mut out_buf);
-                        }
-                        None => {}
-                    }
-                    match write_all_or_shutdown(&mut stream, &out_buf, &mut shutdown_rx).await {
-                        WriteStatus::Ok => {}
-                        WriteStatus::Shutdown => return SessionOutcome::Shutdown,
-                        WriteStatus::Failed(err) => {
-                            log_warn!("MCU bridge telemetry write failed: {err}");
-                            return SessionOutcome::Disconnected { established: true };
-                        }
-                    }
-                }
-            }
-            read_res = stream.read(&mut tmp[..read_cap]) => {
-                match read_res {
-                    Ok(0) => {
-                        log_info!("MCU bridge peer closed connection");
-                        return SessionOutcome::Disconnected { established: true };
-                    }
-                    Ok(n) => {
-                        read_buf.extend_from_slice(&tmp[..n]);
-                        match process_read_buffer(
-                            &mut read_buf,
-                            &mut out_buf,
-                            &mut stream,
-                            &handle,
-                            &mut shutdown_rx,
-                            &mut debouncer,
-                        ).await {
-                            BufferAction::Continue => {}
-                            BufferAction::Shutdown => return SessionOutcome::Shutdown,
-                            BufferAction::Disconnect => {
-                                return SessionOutcome::Disconnected { established: true };
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        log_warn!("MCU bridge socket read failed: {err}");
-                        return SessionOutcome::Disconnected { established: true };
-                    }
-                }
-            }
-        }
-    }
-}
-
-enum BufferAction {
-    Continue,
-    Shutdown,
-    Disconnect,
-}
-
-async fn process_read_buffer(
-    read_buf: &mut Vec<u8>,
-    out_buf: &mut Vec<u8>,
-    stream: &mut UnixStream,
+async fn handle_mcu_rpc(
+    method: &'static str,
+    params: Vec<Value>,
     handle: &ControlHandle,
-    shutdown_rx: &mut watch::Receiver<bool>,
-    debouncer: &mut CommandDebouncer,
-) -> BufferAction {
-    loop {
-        match decode_rpc_frame(read_buf) {
-            Ok((msg, consumed)) => {
-                read_buf.drain(..consumed);
-                match handle_rpc_message(msg, out_buf, stream, handle, shutdown_rx, debouncer).await
-                {
-                    BufferAction::Continue => {}
-                    other => return other,
-                }
-            }
-            Err(DecodeError::Incomplete) => {
-                if read_buf.len() >= MAX_FRAME_BYTES {
-                    log_warn!(
-                        "MCU bridge incomplete frame exceeded {MAX_FRAME_BYTES} byte limit; closing session"
-                    );
-                    return BufferAction::Disconnect;
-                }
-                return BufferAction::Continue;
-            }
-            Err(DecodeError::Oversized) => {
-                log_warn!("MCU bridge received oversized frame; closing session");
-                return BufferAction::Disconnect;
-            }
-            Err(DecodeError::Malformed(reason)) => {
-                log_warn!("MCU bridge received malformed RPC frame ({reason}); closing session");
-                return BufferAction::Disconnect;
-            }
-        }
-    }
-}
-
-async fn handle_rpc_message(
-    msg: RpcMessage,
-    out_buf: &mut Vec<u8>,
-    stream: &mut UnixStream,
-    handle: &ControlHandle,
-    shutdown_rx: &mut watch::Receiver<bool>,
-    debouncer: &mut CommandDebouncer,
-) -> BufferAction {
-    match msg {
-        RpcMessage::Response { msgid, error, .. } => {
-            if !matches!(error, MsgPackValue::Nil) {
-                log_warn!("MCU bridge RPC response error (msgid={msgid}): {error:?}");
-            }
-            BufferAction::Continue
-        }
-        RpcMessage::Notification { method, params } => {
-            let snap = handle.state_rx.borrow().telemetry;
-            match translate_mcu_command(&method, &params, &snap) {
-                Ok((kind, cmd)) => {
-                    if debouncer.allow(kind, Instant::now())
-                        && !forward_engine_command(handle, cmd).await
-                    {
-                        return BufferAction::Disconnect;
-                    }
-                }
-                Err(reason) => {
-                    log_warn!("ignoring MCU notification `{method}`: {reason}");
-                }
-            }
-            BufferAction::Continue
-        }
-        RpcMessage::Request {
-            msgid,
-            method,
-            params,
-        } => {
-            let snap = handle.state_rx.borrow().telemetry;
-            let resp = match translate_mcu_command(&method, &params, &snap) {
-                Ok((kind, cmd)) => {
-                    if debouncer.allow(kind, Instant::now())
-                        && !forward_engine_command(handle, cmd).await
-                    {
-                        return BufferAction::Disconnect;
-                    }
-                    RpcMessage::Response {
-                        msgid,
-                        error: MsgPackValue::Nil,
-                        result: MsgPackValue::Bool(true),
-                    }
-                }
-                Err(reason) => {
-                    log_warn!("rejecting MCU RPC request `{method}` (msgid={msgid}): {reason}");
-                    RpcMessage::Response {
-                        msgid,
-                        error: MsgPackValue::Str(reason.to_string()),
-                        result: MsgPackValue::Nil,
-                    }
-                }
+    debouncer: &Mutex<CommandDebouncer>,
+) -> Result<Value, RpcError> {
+    let snap = handle.state_rx.borrow().telemetry;
+    match translate_mcu_command(method, &params, &snap) {
+        Ok((kind, cmd)) => {
+            let allowed = {
+                let mut guard = debouncer.lock().expect("debouncer mutex poisoned");
+                guard.allow(kind, Instant::now())
             };
-
-            out_buf.clear();
-            if let Err(err) = encode_rpc_message(&resp, out_buf) {
-                log_warn!("MCU bridge failed encoding RPC response: {err}");
-                return BufferAction::Disconnect;
+            if allowed && !forward_engine_command(handle, cmd).await {
+                return Err(RpcError::generic("control plane closed"));
             }
-            match write_all_or_shutdown(stream, out_buf, shutdown_rx).await {
-                WriteStatus::Ok => BufferAction::Continue,
-                WriteStatus::Shutdown => BufferAction::Shutdown,
-                WriteStatus::Failed(err) => {
-                    log_warn!("MCU bridge response write failed: {err}");
-                    BufferAction::Disconnect
-                }
-            }
+            Ok(Value::Bool(true))
+        }
+        Err(reason) => {
+            log_warn!("rejecting MCU RPC `{method}`: {reason}");
+            Err(RpcError::malformed_call(reason))
         }
     }
 }
@@ -423,35 +263,6 @@ async fn forward_engine_command(handle: &ControlHandle, cmd: EngineCommand) -> b
         Err(_) => {
             log_warn!("dropping MCU command: control channel saturated");
             true
-        }
-    }
-}
-
-enum WriteStatus {
-    Ok,
-    Shutdown,
-    Failed(std::io::Error),
-}
-
-async fn write_all_or_shutdown(
-    stream: &mut UnixStream,
-    bytes: &[u8],
-    shutdown_rx: &mut watch::Receiver<bool>,
-) -> WriteStatus {
-    if *shutdown_rx.borrow_and_update() {
-        return WriteStatus::Shutdown;
-    }
-
-    tokio::select! {
-        biased;
-        () = wait_shutdown(shutdown_rx) => WriteStatus::Shutdown,
-        res = time::timeout(SOCKET_WRITE_TIMEOUT, stream.write_all(bytes)) => match res {
-            Ok(Ok(())) => WriteStatus::Ok,
-            Ok(Err(err)) => WriteStatus::Failed(err),
-            Err(_) => WriteStatus::Failed(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "socket write timed out",
-            )),
         }
     }
 }
@@ -560,38 +371,50 @@ const fn lock_state_to_i32(lock: LockState) -> i32 {
     }
 }
 
-fn append_telemetry_notification(method: &str, snap: &TelemetrySnapshot, out: &mut Vec<u8>) {
-    append_telemetry_notification_with_beat(method, None, snap, out);
-}
-
-fn append_beat_notification(beat_idx: u32, snap: &TelemetrySnapshot, out: &mut Vec<u8>) {
-    append_telemetry_notification_with_beat(METHOD_BEAT, Some(beat_idx), snap, out);
-}
-
-fn append_telemetry_notification_with_beat(
-    method: &str,
-    beat_idx: Option<u32>,
-    snap: &TelemetrySnapshot,
-    out: &mut Vec<u8>,
-) {
+fn build_telemetry_params(beat_idx: Option<u32>, snap: &TelemetrySnapshot) -> Vec<Value> {
     let bpm_tenths = (snap.bpm_link * 10.0).round() as i32;
     let mut params = Vec::with_capacity(5);
     if let Some(idx) = beat_idx {
-        params.push(MsgPackValue::Int(i64::from(idx)));
+        params.push(Value::Int(i64::from(idx)));
     }
-    params.push(MsgPackValue::Int(i64::from(bpm_tenths)));
-    params.push(MsgPackValue::Int(i64::from(direction_to_i32(
-        snap.direction,
-    ))));
-    params.push(MsgPackValue::Int(i64::from(lock_state_to_i32(
-        snap.lock_state,
-    ))));
-    params.push(MsgPackValue::Bool(snap.is_playing));
-    let notification = RpcMessage::Notification {
-        method: method.to_string(),
-        params,
-    };
-    let _ = encode_rpc_message(&notification, out);
+    params.push(Value::Int(i64::from(bpm_tenths)));
+    params.push(Value::Int(i64::from(direction_to_i32(snap.direction))));
+    params.push(Value::Int(i64::from(lock_state_to_i32(snap.lock_state))));
+    params.push(Value::Bool(snap.is_playing));
+    params
+}
+
+async fn emit_state_notification(
+    client: &Client,
+    snap: &TelemetrySnapshot,
+) -> arduino_router::Result<()> {
+    client
+        .notify_raw(METHOD_STATE, build_telemetry_params(None, snap))
+        .await
+}
+
+async fn emit_telemetry_events(
+    client: &Client,
+    emit: TelemetryEmit,
+    snap: &TelemetrySnapshot,
+) -> arduino_router::Result<()> {
+    if emit.state {
+        emit_state_notification(client, snap).await?;
+    }
+    match emit.beat {
+        Some(BeatEvent::Downbeat) => {
+            client
+                .notify_raw(METHOD_DOWNBEAT, build_telemetry_params(None, snap))
+                .await?;
+        }
+        Some(BeatEvent::Beat(beat_idx)) => {
+            client
+                .notify_raw(METHOD_BEAT, build_telemetry_params(Some(beat_idx), snap))
+                .await?;
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 // --- Inbound MCU Command Debouncing & Translation ---
@@ -637,7 +460,7 @@ impl CommandDebouncer {
 
 fn translate_mcu_command(
     method: &str,
-    params: &[MsgPackValue],
+    params: &[Value],
     snap: &TelemetrySnapshot,
 ) -> Result<(McuCommandKind, EngineCommand), &'static str> {
     match method {
@@ -659,10 +482,10 @@ fn translate_mcu_command(
                 return Err("set_direction expects 1 parameter");
             }
             let dir = match &params[0] {
-                MsgPackValue::Int(0) | MsgPackValue::Uint(0) => Direction::LinkToMidi,
-                MsgPackValue::Int(1) | MsgPackValue::Uint(1) => Direction::MidiToLink,
-                MsgPackValue::Str(s) if s == "link_to_midi" => Direction::LinkToMidi,
-                MsgPackValue::Str(s) if s == "midi_to_link" => Direction::MidiToLink,
+                Value::Int(0) | Value::Uint(0) => Direction::LinkToMidi,
+                Value::Int(1) | Value::Uint(1) => Direction::MidiToLink,
+                Value::Str(s) if s == "link_to_midi" => Direction::LinkToMidi,
+                Value::Str(s) if s == "midi_to_link" => Direction::MidiToLink,
                 _ => return Err("invalid direction parameter"),
             };
             Ok((
@@ -692,7 +515,7 @@ fn translate_mcu_command(
             if params.len() != 1 {
                 return Err("set_playing expects 1 boolean parameter");
             }
-            let MsgPackValue::Bool(playing) = params[0] else {
+            let Value::Bool(playing) = params[0] else {
                 return Err("invalid playing parameter");
             };
             Ok((
@@ -738,585 +561,6 @@ fn translate_mcu_command(
     }
 }
 
-// --- MessagePack-RPC Codec ---
-
-#[derive(Debug, Clone, PartialEq)]
-enum MsgPackValue {
-    Nil,
-    Bool(bool),
-    Int(i64),
-    Uint(u64),
-    Float(f64),
-    Str(String),
-    Bin(Vec<u8>),
-    Array(Vec<MsgPackValue>),
-    Map(Vec<(MsgPackValue, MsgPackValue)>),
-    Ext { kind: i8, data: Vec<u8> },
-}
-
-impl MsgPackValue {
-    fn as_i64(&self) -> Option<i64> {
-        match *self {
-            Self::Int(i) => Some(i),
-            Self::Uint(u) => i64::try_from(u).ok(),
-            _ => None,
-        }
-    }
-
-    fn as_u32(&self) -> Option<u32> {
-        match *self {
-            Self::Int(i) => u32::try_from(i).ok(),
-            Self::Uint(u) => u32::try_from(u).ok(),
-            _ => None,
-        }
-    }
-
-    fn as_f64(&self) -> Option<f64> {
-        match *self {
-            Self::Float(f) => Some(f),
-            Self::Int(i) => Some(i as f64),
-            Self::Uint(u) => Some(u as f64),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum RpcMessage {
-    Request {
-        msgid: u32,
-        method: String,
-        params: Vec<MsgPackValue>,
-    },
-    Response {
-        msgid: u32,
-        error: MsgPackValue,
-        result: MsgPackValue,
-    },
-    Notification {
-        method: String,
-        params: Vec<MsgPackValue>,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DecodeError {
-    Incomplete,
-    Oversized,
-    Malformed(&'static str),
-}
-
-struct Cursor<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Cursor<'a> {
-    const fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
-    }
-
-    fn take_u8(&mut self) -> Result<u8, DecodeError> {
-        if self.pos >= self.buf.len() {
-            return Err(DecodeError::Incomplete);
-        }
-        let b = self.buf[self.pos];
-        self.pos += 1;
-        Ok(b)
-    }
-
-    fn take_bytes(&mut self, len: usize) -> Result<&'a [u8], DecodeError> {
-        let end = self.pos.checked_add(len).ok_or(DecodeError::Oversized)?;
-        if end > self.buf.len() {
-            return Err(DecodeError::Incomplete);
-        }
-        let slice = &self.buf[self.pos..end];
-        self.pos = end;
-        Ok(slice)
-    }
-
-    fn take_u16_be(&mut self) -> Result<u16, DecodeError> {
-        let bytes = self.take_bytes(2)?;
-        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
-    }
-
-    fn take_u32_be(&mut self) -> Result<u32, DecodeError> {
-        let bytes = self.take_bytes(4)?;
-        Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-    }
-
-    fn take_u64_be(&mut self) -> Result<u64, DecodeError> {
-        let bytes = self.take_bytes(8)?;
-        Ok(u64::from_be_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]))
-    }
-}
-
-fn decode_one(buf: &[u8]) -> Result<(MsgPackValue, usize), DecodeError> {
-    let mut cursor = Cursor::new(buf);
-    let value = decode_value(&mut cursor, 0)?;
-    Ok((value, cursor.pos))
-}
-
-fn decode_value(cursor: &mut Cursor<'_>, depth: usize) -> Result<MsgPackValue, DecodeError> {
-    if depth >= MAX_DECODE_DEPTH {
-        return Err(DecodeError::Malformed("nesting depth exceeded"));
-    }
-
-    let tag = cursor.take_u8()?;
-    match tag {
-        0x00..=0x7f => Ok(MsgPackValue::Int(i64::from(tag))),
-        0x80..=0x8f => decode_map(cursor, usize::from(tag & 0x0f), depth),
-        0x90..=0x9f => decode_array(cursor, usize::from(tag & 0x0f), depth),
-        0xa0..=0xbf => decode_str(cursor, usize::from(tag & 0x1f)),
-        0xc0 => Ok(MsgPackValue::Nil),
-        0xc1 => Err(DecodeError::Malformed("reserved tag 0xc1")),
-        0xc2 => Ok(MsgPackValue::Bool(false)),
-        0xc3 => Ok(MsgPackValue::Bool(true)),
-        0xc4 => {
-            let len = usize::from(cursor.take_u8()?);
-            decode_bin(cursor, len)
-        }
-        0xc5 => {
-            let len = usize::from(cursor.take_u16_be()?);
-            decode_bin(cursor, len)
-        }
-        0xc6 => {
-            let len = cursor.take_u32_be()? as usize;
-            decode_bin(cursor, len)
-        }
-        0xc7 => {
-            let len = usize::from(cursor.take_u8()?);
-            decode_ext(cursor, len)
-        }
-        0xc8 => {
-            let len = usize::from(cursor.take_u16_be()?);
-            decode_ext(cursor, len)
-        }
-        0xc9 => {
-            let len = cursor.take_u32_be()? as usize;
-            decode_ext(cursor, len)
-        }
-        0xca => {
-            let bytes = cursor.take_bytes(4)?;
-            let bits = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-            Ok(MsgPackValue::Float(f64::from(f32::from_bits(bits))))
-        }
-        0xcb => {
-            let bits = cursor.take_u64_be()?;
-            Ok(MsgPackValue::Float(f64::from_bits(bits)))
-        }
-        0xcc => Ok(MsgPackValue::Int(i64::from(cursor.take_u8()?))),
-        0xcd => Ok(MsgPackValue::Int(i64::from(cursor.take_u16_be()?))),
-        0xce => Ok(MsgPackValue::Int(i64::from(cursor.take_u32_be()?))),
-        0xcf => {
-            let val = cursor.take_u64_be()?;
-            Ok(match i64::try_from(val) {
-                Ok(i) => MsgPackValue::Int(i),
-                Err(_) => MsgPackValue::Uint(val),
-            })
-        }
-        0xd0 => Ok(MsgPackValue::Int(i64::from(cursor.take_u8()? as i8))),
-        0xd1 => {
-            let bytes = cursor.take_bytes(2)?;
-            Ok(MsgPackValue::Int(i64::from(i16::from_be_bytes([
-                bytes[0], bytes[1],
-            ]))))
-        }
-        0xd2 => {
-            let bytes = cursor.take_bytes(4)?;
-            Ok(MsgPackValue::Int(i64::from(i32::from_be_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-            ]))))
-        }
-        0xd3 => {
-            let bytes = cursor.take_bytes(8)?;
-            Ok(MsgPackValue::Int(i64::from_be_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-            ])))
-        }
-        0xd4 => decode_ext(cursor, 1),
-        0xd5 => decode_ext(cursor, 2),
-        0xd6 => decode_ext(cursor, 4),
-        0xd7 => decode_ext(cursor, 8),
-        0xd8 => decode_ext(cursor, 16),
-        0xd9 => {
-            let len = usize::from(cursor.take_u8()?);
-            decode_str(cursor, len)
-        }
-        0xda => {
-            let len = usize::from(cursor.take_u16_be()?);
-            decode_str(cursor, len)
-        }
-        0xdb => {
-            let len = cursor.take_u32_be()? as usize;
-            decode_str(cursor, len)
-        }
-        0xdc => {
-            let count = usize::from(cursor.take_u16_be()?);
-            decode_array(cursor, count, depth)
-        }
-        0xdd => {
-            let count = cursor.take_u32_be()? as usize;
-            decode_array(cursor, count, depth)
-        }
-        0xde => {
-            let count = usize::from(cursor.take_u16_be()?);
-            decode_map(cursor, count, depth)
-        }
-        0xdf => {
-            let count = cursor.take_u32_be()? as usize;
-            decode_map(cursor, count, depth)
-        }
-        0xe0..=0xff => Ok(MsgPackValue::Int(i64::from(tag as i8))),
-    }
-}
-
-fn decode_str(cursor: &mut Cursor<'_>, len: usize) -> Result<MsgPackValue, DecodeError> {
-    if len > MAX_FRAME_BYTES {
-        return Err(DecodeError::Oversized);
-    }
-    let bytes = cursor.take_bytes(len)?;
-    let s = std::str::from_utf8(bytes)
-        .map_err(|_| DecodeError::Malformed("invalid UTF-8 string"))?
-        .to_string();
-    Ok(MsgPackValue::Str(s))
-}
-
-fn decode_bin(cursor: &mut Cursor<'_>, len: usize) -> Result<MsgPackValue, DecodeError> {
-    if len > MAX_FRAME_BYTES {
-        return Err(DecodeError::Oversized);
-    }
-    let bytes = cursor.take_bytes(len)?;
-    Ok(MsgPackValue::Bin(bytes.to_vec()))
-}
-
-fn decode_ext(cursor: &mut Cursor<'_>, len: usize) -> Result<MsgPackValue, DecodeError> {
-    if len > MAX_FRAME_BYTES {
-        return Err(DecodeError::Oversized);
-    }
-    let kind = cursor.take_u8()? as i8;
-    let data = cursor.take_bytes(len)?;
-    Ok(MsgPackValue::Ext {
-        kind,
-        data: data.to_vec(),
-    })
-}
-
-fn decode_array(
-    cursor: &mut Cursor<'_>,
-    count: usize,
-    depth: usize,
-) -> Result<MsgPackValue, DecodeError> {
-    if count > MAX_FRAME_BYTES {
-        return Err(DecodeError::Oversized);
-    }
-    let mut items = Vec::with_capacity(count.min(64));
-    for _ in 0..count {
-        items.push(decode_value(cursor, depth + 1)?);
-    }
-    Ok(MsgPackValue::Array(items))
-}
-
-fn decode_map(
-    cursor: &mut Cursor<'_>,
-    count: usize,
-    depth: usize,
-) -> Result<MsgPackValue, DecodeError> {
-    if count > MAX_FRAME_BYTES / 2 {
-        return Err(DecodeError::Oversized);
-    }
-    let mut entries = Vec::with_capacity(count.min(64));
-    for _ in 0..count {
-        let key = decode_value(cursor, depth + 1)?;
-        let val = decode_value(cursor, depth + 1)?;
-        entries.push((key, val));
-    }
-    Ok(MsgPackValue::Map(entries))
-}
-
-fn decode_rpc_frame(buf: &[u8]) -> Result<(RpcMessage, usize), DecodeError> {
-    let (value, consumed) = decode_one(buf)?;
-    let MsgPackValue::Array(items) = value else {
-        return Err(DecodeError::Malformed("RPC frame must be an array"));
-    };
-    let mut iter = items.into_iter();
-    let Some(kind_val) = iter.next() else {
-        return Err(DecodeError::Malformed("empty RPC frame"));
-    };
-
-    match kind_val.as_i64() {
-        Some(0) => {
-            let (Some(msgid_val), Some(method_val), Some(params_val), None) =
-                (iter.next(), iter.next(), iter.next(), iter.next())
-            else {
-                return Err(DecodeError::Malformed("invalid RPC request arity"));
-            };
-            let msgid = msgid_val
-                .as_u32()
-                .ok_or(DecodeError::Malformed("invalid RPC request msgid"))?;
-            let MsgPackValue::Str(method) = method_val else {
-                return Err(DecodeError::Malformed("RPC request method must be string"));
-            };
-            let MsgPackValue::Array(params) = params_val else {
-                return Err(DecodeError::Malformed("RPC request params must be array"));
-            };
-            Ok((
-                RpcMessage::Request {
-                    msgid,
-                    method,
-                    params,
-                },
-                consumed,
-            ))
-        }
-        Some(1) => {
-            let (Some(msgid_val), Some(error), Some(result), None) =
-                (iter.next(), iter.next(), iter.next(), iter.next())
-            else {
-                return Err(DecodeError::Malformed("invalid RPC response arity"));
-            };
-            let msgid = msgid_val
-                .as_u32()
-                .ok_or(DecodeError::Malformed("invalid RPC response msgid"))?;
-            Ok((
-                RpcMessage::Response {
-                    msgid,
-                    error,
-                    result,
-                },
-                consumed,
-            ))
-        }
-        Some(2) => {
-            let (Some(method_val), Some(params_val), None) =
-                (iter.next(), iter.next(), iter.next())
-            else {
-                return Err(DecodeError::Malformed("invalid RPC notification arity"));
-            };
-            let MsgPackValue::Str(method) = method_val else {
-                return Err(DecodeError::Malformed(
-                    "RPC notification method must be string",
-                ));
-            };
-            let MsgPackValue::Array(params) = params_val else {
-                return Err(DecodeError::Malformed(
-                    "RPC notification params must be array",
-                ));
-            };
-            Ok((RpcMessage::Notification { method, params }, consumed))
-        }
-        _ => Err(DecodeError::Malformed("unknown RPC message type")),
-    }
-}
-
-fn encode_rpc_message(msg: &RpcMessage, out: &mut Vec<u8>) -> Result<(), &'static str> {
-    match msg {
-        RpcMessage::Request {
-            msgid,
-            method,
-            params,
-        } => {
-            out.push(0x94);
-            out.push(0x00);
-            encode_uint(u64::from(*msgid), out);
-            encode_str(method, out)?;
-            encode_array_header(params.len(), out)?;
-            for item in params {
-                encode_value(item, out)?;
-            }
-            Ok(())
-        }
-        RpcMessage::Response {
-            msgid,
-            error,
-            result,
-        } => {
-            out.push(0x94);
-            out.push(0x01);
-            encode_uint(u64::from(*msgid), out);
-            encode_value(error, out)?;
-            encode_value(result, out)?;
-            Ok(())
-        }
-        RpcMessage::Notification { method, params } => {
-            out.push(0x93);
-            out.push(0x02);
-            encode_str(method, out)?;
-            encode_array_header(params.len(), out)?;
-            for item in params {
-                encode_value(item, out)?;
-            }
-            Ok(())
-        }
-    }
-}
-
-fn encode_value(val: &MsgPackValue, out: &mut Vec<u8>) -> Result<(), &'static str> {
-    match val {
-        MsgPackValue::Nil => out.push(0xc0),
-        MsgPackValue::Bool(b) => out.push(if *b { 0xc3 } else { 0xc2 }),
-        MsgPackValue::Int(i) => encode_int(*i, out),
-        MsgPackValue::Uint(u) => encode_uint(*u, out),
-        MsgPackValue::Float(f) => {
-            out.push(0xcb);
-            out.extend_from_slice(&f.to_be_bytes());
-        }
-        MsgPackValue::Str(s) => encode_str(s, out)?,
-        MsgPackValue::Bin(b) => encode_bin(b, out)?,
-        MsgPackValue::Array(items) => {
-            encode_array_header(items.len(), out)?;
-            for item in items {
-                encode_value(item, out)?;
-            }
-        }
-        MsgPackValue::Map(entries) => {
-            encode_map_header(entries.len(), out)?;
-            for (k, v) in entries {
-                encode_value(k, out)?;
-                encode_value(v, out)?;
-            }
-        }
-        MsgPackValue::Ext { kind, data } => encode_ext(*kind, data, out)?,
-    }
-    Ok(())
-}
-
-fn encode_uint(v: u64, out: &mut Vec<u8>) {
-    if v <= 0x7f {
-        out.push(v as u8);
-    } else if v <= u64::from(u8::MAX) {
-        out.push(0xcc);
-        out.push(v as u8);
-    } else if v <= u64::from(u16::MAX) {
-        out.push(0xcd);
-        out.extend_from_slice(&(v as u16).to_be_bytes());
-    } else if v <= u64::from(u32::MAX) {
-        out.push(0xce);
-        out.extend_from_slice(&(v as u32).to_be_bytes());
-    } else {
-        out.push(0xcf);
-        out.extend_from_slice(&v.to_be_bytes());
-    }
-}
-
-fn encode_int(v: i64, out: &mut Vec<u8>) {
-    if v >= 0 {
-        encode_uint(v as u64, out);
-    } else if v >= -32 {
-        out.push((v as i8) as u8);
-    } else if v >= i64::from(i8::MIN) {
-        out.push(0xd0);
-        out.push((v as i8) as u8);
-    } else if v >= i64::from(i16::MIN) {
-        out.push(0xd1);
-        out.extend_from_slice(&(v as i16).to_be_bytes());
-    } else if v >= i64::from(i32::MIN) {
-        out.push(0xd2);
-        out.extend_from_slice(&(v as i32).to_be_bytes());
-    } else {
-        out.push(0xd3);
-        out.extend_from_slice(&v.to_be_bytes());
-    }
-}
-
-fn encode_str(s: &str, out: &mut Vec<u8>) -> Result<(), &'static str> {
-    let len = s.len();
-    if len <= 31 {
-        out.push(0xa0 | (len as u8));
-    } else if let Ok(l) = u8::try_from(len) {
-        out.push(0xd9);
-        out.push(l);
-    } else if let Ok(l) = u16::try_from(len) {
-        out.push(0xda);
-        out.extend_from_slice(&l.to_be_bytes());
-    } else if let Ok(l) = u32::try_from(len) {
-        out.push(0xdb);
-        out.extend_from_slice(&l.to_be_bytes());
-    } else {
-        return Err("string exceeds MessagePack max length");
-    }
-    out.extend_from_slice(s.as_bytes());
-    Ok(())
-}
-
-fn encode_bin(bytes: &[u8], out: &mut Vec<u8>) -> Result<(), &'static str> {
-    let len = bytes.len();
-    if let Ok(l) = u8::try_from(len) {
-        out.push(0xc4);
-        out.push(l);
-    } else if let Ok(l) = u16::try_from(len) {
-        out.push(0xc5);
-        out.extend_from_slice(&l.to_be_bytes());
-    } else if let Ok(l) = u32::try_from(len) {
-        out.push(0xc6);
-        out.extend_from_slice(&l.to_be_bytes());
-    } else {
-        return Err("binary exceeds MessagePack max length");
-    }
-    out.extend_from_slice(bytes);
-    Ok(())
-}
-
-fn encode_array_header(len: usize, out: &mut Vec<u8>) -> Result<(), &'static str> {
-    if len <= 15 {
-        out.push(0x90 | (len as u8));
-    } else if let Ok(l) = u16::try_from(len) {
-        out.push(0xdc);
-        out.extend_from_slice(&l.to_be_bytes());
-    } else if let Ok(l) = u32::try_from(len) {
-        out.push(0xdd);
-        out.extend_from_slice(&l.to_be_bytes());
-    } else {
-        return Err("array exceeds MessagePack max length");
-    }
-    Ok(())
-}
-
-fn encode_map_header(len: usize, out: &mut Vec<u8>) -> Result<(), &'static str> {
-    if len <= 15 {
-        out.push(0x80 | (len as u8));
-    } else if let Ok(l) = u16::try_from(len) {
-        out.push(0xde);
-        out.extend_from_slice(&l.to_be_bytes());
-    } else if let Ok(l) = u32::try_from(len) {
-        out.push(0xdf);
-        out.extend_from_slice(&l.to_be_bytes());
-    } else {
-        return Err("map exceeds MessagePack max length");
-    }
-    Ok(())
-}
-
-fn encode_ext(kind: i8, data: &[u8], out: &mut Vec<u8>) -> Result<(), &'static str> {
-    let len = data.len();
-    match len {
-        1 => out.push(0xd4),
-        2 => out.push(0xd5),
-        4 => out.push(0xd6),
-        8 => out.push(0xd7),
-        16 => out.push(0xd8),
-        _ => {
-            if let Ok(l) = u8::try_from(len) {
-                out.push(0xc7);
-                out.push(l);
-            } else if let Ok(l) = u16::try_from(len) {
-                out.push(0xc8);
-                out.extend_from_slice(&l.to_be_bytes());
-            } else if let Ok(l) = u32::try_from(len) {
-                out.push(0xc9);
-                out.extend_from_slice(&l.to_be_bytes());
-            } else {
-                return Err("ext exceeds MessagePack max length");
-            }
-        }
-    }
-    out.push(kind as u8);
-    out.extend_from_slice(data);
-    Ok(())
-}
-
 // --- Tests ---
 
 #[cfg(test)]
@@ -1324,7 +568,12 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    use arduino_router::{
+        decode_frame, encode_frame, DecodeError, ErrorCode, ReconnectPolicy, RpcMessage,
+        METHOD_REGISTER,
+    };
     use tactus_protocol::AppState;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::mpsc;
 
     use super::*;
@@ -1349,8 +598,23 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle_arg = ControlHandle { state_rx, cmd_tx };
 
-        let handle = tokio::spawn(run_bridge_session(
-            server,
+        let server_slot = Arc::new(Mutex::new(Some(server)));
+        let handle = tokio::spawn(run_mcu_bridge_with_connector(
+            "test-pair",
+            move || {
+                let slot = Arc::clone(&server_slot);
+                async move {
+                    slot.lock()
+                        .expect("server slot poisoned")
+                        .take()
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::NotConnected,
+                                "test stream already consumed",
+                            )
+                        })
+                }
+            },
             handle_arg,
             shutdown_rx,
             debounce,
@@ -1368,8 +632,12 @@ mod tests {
 
     async fn read_rpc_frame(peer: &mut UnixStream, buf: &mut Vec<u8>) -> RpcMessage {
         let mut tmp = [0u8; 1024];
+        let limits = CodecLimits {
+            max_frame_bytes: MAX_FRAME_BYTES,
+            max_decode_depth: MAX_DECODE_DEPTH,
+        };
         loop {
-            match decode_rpc_frame(buf) {
+            match decode_frame(buf, limits) {
                 Ok((msg, consumed)) => {
                     buf.drain(..consumed);
                     return msg;
@@ -1389,7 +657,7 @@ mod tests {
 
     async fn send_rpc(peer: &mut UnixStream, msg: &RpcMessage) {
         let mut encoded = Vec::new();
-        encode_rpc_message(msg, &mut encoded).expect("encode rpc message");
+        encode_frame(msg, &mut encoded).expect("encode rpc message");
         peer.write_all(&encoded).await.expect("write rpc message");
     }
 
@@ -1406,105 +674,25 @@ mod tests {
                     assert_eq!(msgid, (expected_idx as u32) + 1);
                     assert_eq!(method, METHOD_REGISTER);
                     assert_eq!(params.len(), 1);
-                    let MsgPackValue::Str(cmd_name) = &params[0] else {
+                    let Value::Str(cmd_name) = &params[0] else {
                         panic!("expected string method parameter");
                     };
                     registered.push(cmd_name.clone());
+                    send_rpc(
+                        &mut tb.peer,
+                        &RpcMessage::Response {
+                            msgid,
+                            error: Value::Nil,
+                            result: Value::Bool(true),
+                        },
+                    )
+                    .await;
                 }
                 other => panic!("expected $/register request, got {other:?}"),
             }
         }
         let initial_state = read_rpc_frame(&mut tb.peer, &mut tb.read_buf).await;
         (registered, initial_state)
-    }
-
-    #[test]
-    fn msgpack_value_round_trips_all_primitives_and_partial_buffers() {
-        let values = vec![
-            MsgPackValue::Nil,
-            MsgPackValue::Bool(false),
-            MsgPackValue::Bool(true),
-            MsgPackValue::Int(0),
-            MsgPackValue::Int(127),
-            MsgPackValue::Int(128),
-            MsgPackValue::Int(255),
-            MsgPackValue::Int(256),
-            MsgPackValue::Int(65_535),
-            MsgPackValue::Int(65_536),
-            MsgPackValue::Int(i64::from(i32::MAX)),
-            MsgPackValue::Int(i64::MAX),
-            MsgPackValue::Uint(u64::MAX),
-            MsgPackValue::Int(-1),
-            MsgPackValue::Int(-32),
-            MsgPackValue::Int(-33),
-            MsgPackValue::Int(-128),
-            MsgPackValue::Int(-129),
-            MsgPackValue::Int(-32_768),
-            MsgPackValue::Int(-32_769),
-            MsgPackValue::Int(i64::from(i32::MIN)),
-            MsgPackValue::Int(i64::MIN),
-            MsgPackValue::Float(120.5),
-            MsgPackValue::Float(-0.25),
-            MsgPackValue::Str(String::new()),
-            MsgPackValue::Str("tactus/state".to_string()),
-            MsgPackValue::Str("x".repeat(40)),
-            MsgPackValue::Str("y".repeat(300)),
-            MsgPackValue::Bin(vec![0xF8, 0xFA, 0xFC]),
-            MsgPackValue::Array(vec![
-                MsgPackValue::Int(1200),
-                MsgPackValue::Int(0),
-                MsgPackValue::Int(2),
-                MsgPackValue::Bool(true),
-            ]),
-            MsgPackValue::Map(vec![(
-                MsgPackValue::Str("bpm".to_string()),
-                MsgPackValue::Float(128.25),
-            )]),
-            MsgPackValue::Ext {
-                kind: 7,
-                data: vec![1, 2, 3, 4],
-            },
-        ];
-
-        for val in values {
-            let mut buf = Vec::new();
-            encode_value(&val, &mut buf).expect("encode value");
-
-            // Every strict prefix must report Incomplete.
-            for prefix_len in 0..buf.len() {
-                assert_eq!(
-                    decode_one(&buf[..prefix_len]),
-                    Err(DecodeError::Incomplete),
-                    "prefix {prefix_len}/{} for {val:?}",
-                    buf.len()
-                );
-            }
-
-            // Extra trailing bytes stay unconsumed.
-            let mut with_tail = buf.clone();
-            with_tail.extend_from_slice(&[0x01, 0x02]);
-            let (decoded, consumed) = decode_one(&with_tail).expect("decode full value");
-            assert_eq!(consumed, buf.len());
-            assert_eq!(decoded, val);
-        }
-
-        // float32 tag (0xca) decodes cleanly to Float(f64).
-        let mut f32_bytes = vec![0xca];
-        f32_bytes.extend_from_slice(&125.5_f32.to_be_bytes());
-        assert_eq!(decode_one(&f32_bytes), Ok((MsgPackValue::Float(125.5), 5)));
-
-        // Reserved tag 0xc1 and oversized declarations are rejected.
-        assert!(matches!(
-            decode_one(&[0xc1]),
-            Err(DecodeError::Malformed(_))
-        ));
-        let mut huge_str = vec![0xdb];
-        huge_str.extend_from_slice(&((MAX_FRAME_BYTES as u32) + 1).to_be_bytes());
-        assert_eq!(decode_one(&huge_str), Err(DecodeError::Oversized));
-
-        let mut huge_arr = vec![0xdd];
-        huge_arr.extend_from_slice(&((MAX_FRAME_BYTES as u32) + 1).to_be_bytes());
-        assert_eq!(decode_one(&huge_arr), Err(DecodeError::Oversized));
     }
 
     #[test]
@@ -1723,31 +911,32 @@ mod tests {
         let mut tb = spawn_test_bridge(init, Duration::ZERO).await;
 
         let (registered, initial_state) = consume_handshake(&mut tb).await;
-        let expected: Vec<String> = INCOMING_CMD_METHODS
+        let mut expected: Vec<String> = INCOMING_CMD_METHODS
             .iter()
             .map(|s| (*s).to_string())
             .collect();
+        expected.sort();
         assert_eq!(registered, expected);
         assert_eq!(
             initial_state,
             RpcMessage::Notification {
                 method: METHOD_STATE.to_string(),
                 params: vec![
-                    MsgPackValue::Int(1246),
-                    MsgPackValue::Int(1),
-                    MsgPackValue::Int(1),
-                    MsgPackValue::Bool(true),
+                    Value::Int(1246),
+                    Value::Int(1),
+                    Value::Int(1),
+                    Value::Bool(true),
                 ],
             }
         );
 
-        // $/register responses are cleanly ignored.
+        // Unmatched response frames are cleanly ignored.
         send_rpc(
             &mut tb.peer,
             &RpcMessage::Response {
                 msgid: 1,
-                error: MsgPackValue::Nil,
-                result: MsgPackValue::Bool(true),
+                error: Value::Nil,
+                result: Value::Bool(true),
             },
         )
         .await;
@@ -1787,11 +976,11 @@ mod tests {
                 RpcMessage::Notification {
                     method: METHOD_BEAT.to_string(),
                     params: vec![
-                        MsgPackValue::Int(i64::from(beat)),
-                        MsgPackValue::Int(1200),
-                        MsgPackValue::Int(0),
-                        MsgPackValue::Int(2),
-                        MsgPackValue::Bool(true),
+                        Value::Int(i64::from(beat)),
+                        Value::Int(1200),
+                        Value::Int(0),
+                        Value::Int(2),
+                        Value::Bool(true),
                     ],
                 }
             );
@@ -1810,10 +999,10 @@ mod tests {
             RpcMessage::Notification {
                 method: METHOD_DOWNBEAT.to_string(),
                 params: vec![
-                    MsgPackValue::Int(1200),
-                    MsgPackValue::Int(0),
-                    MsgPackValue::Int(2),
-                    MsgPackValue::Bool(true),
+                    Value::Int(1200),
+                    Value::Int(0),
+                    Value::Int(2),
+                    Value::Bool(true),
                 ],
             }
         );
@@ -1848,10 +1037,10 @@ mod tests {
             RpcMessage::Notification {
                 method: METHOD_STATE.to_string(),
                 params: vec![
-                    MsgPackValue::Int(1201),
-                    MsgPackValue::Int(0),
-                    MsgPackValue::Int(0),
-                    MsgPackValue::Bool(false),
+                    Value::Int(1201),
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::Bool(false),
                 ],
             }
         );
@@ -1863,10 +1052,10 @@ mod tests {
             RpcMessage::Notification {
                 method: METHOD_STATE.to_string(),
                 params: vec![
-                    MsgPackValue::Int(1201),
-                    MsgPackValue::Int(0),
-                    MsgPackValue::Int(0),
-                    MsgPackValue::Bool(true),
+                    Value::Int(1201),
+                    Value::Int(0),
+                    Value::Int(0),
+                    Value::Bool(true),
                 ],
             }
         );
@@ -1879,10 +1068,10 @@ mod tests {
             RpcMessage::Notification {
                 method: METHOD_STATE.to_string(),
                 params: vec![
-                    MsgPackValue::Int(1201),
-                    MsgPackValue::Int(1),
-                    MsgPackValue::Int(0),
-                    MsgPackValue::Bool(true),
+                    Value::Int(1201),
+                    Value::Int(1),
+                    Value::Int(0),
+                    Value::Bool(true),
                 ],
             }
         );
@@ -1895,10 +1084,10 @@ mod tests {
             RpcMessage::Notification {
                 method: METHOD_STATE.to_string(),
                 params: vec![
-                    MsgPackValue::Int(1201),
-                    MsgPackValue::Int(1),
-                    MsgPackValue::Int(2),
-                    MsgPackValue::Bool(true),
+                    Value::Int(1201),
+                    Value::Int(1),
+                    Value::Int(2),
+                    Value::Bool(true),
                 ],
             }
         );
@@ -1957,8 +1146,8 @@ mod tests {
             read_rpc_frame(&mut tb.peer, &mut tb.read_buf).await,
             RpcMessage::Response {
                 msgid: 42,
-                error: MsgPackValue::Nil,
-                result: MsgPackValue::Bool(true),
+                error: Value::Nil,
+                result: Value::Bool(true),
             }
         );
 
@@ -1966,11 +1155,11 @@ mod tests {
         time::sleep(Duration::from_millis(90)).await;
 
         let mut partial = Vec::new();
-        encode_rpc_message(
+        encode_frame(
             &RpcMessage::Request {
                 msgid: 43,
                 method: CMD_SET_DIRECTION.to_string(),
-                params: vec![MsgPackValue::Str("link_to_midi".to_string())],
+                params: vec![Value::Str("link_to_midi".to_string())],
             },
             &mut partial,
         )
@@ -1986,8 +1175,8 @@ mod tests {
             read_rpc_frame(&mut tb.peer, &mut tb.read_buf).await,
             RpcMessage::Response {
                 msgid: 43,
-                error: MsgPackValue::Nil,
-                result: MsgPackValue::Bool(true),
+                error: Value::Nil,
+                result: Value::Bool(true),
             }
         );
 
@@ -2009,7 +1198,7 @@ mod tests {
             &mut tb.peer,
             &RpcMessage::Notification {
                 method: CMD_SET_PLAYING.to_string(),
-                params: vec![MsgPackValue::Bool(false)],
+                params: vec![Value::Bool(false)],
             },
         )
         .await;
@@ -2022,7 +1211,7 @@ mod tests {
             &mut tb.peer,
             &RpcMessage::Notification {
                 method: CMD_ADJUST_BPM.to_string(),
-                params: vec![MsgPackValue::Int(-150)],
+                params: vec![Value::Int(-150)],
             },
         )
         .await;
@@ -2036,7 +1225,7 @@ mod tests {
             &RpcMessage::Request {
                 msgid: 44,
                 method: CMD_SET_BPM.to_string(),
-                params: vec![MsgPackValue::Float(132.5)],
+                params: vec![Value::F64(132.5)],
             },
         )
         .await;
@@ -2048,29 +1237,33 @@ mod tests {
             read_rpc_frame(&mut tb.peer, &mut tb.read_buf).await,
             RpcMessage::Response {
                 msgid: 44,
-                error: MsgPackValue::Nil,
-                result: MsgPackValue::Bool(true),
+                error: Value::Nil,
+                result: Value::Bool(true),
             }
         );
 
-        // Out-of-bounds set_bpm request gets an error response and emits no EngineCommand,
-        // and does not poison debounce for a subsequent valid set_bpm.
+        // Out-of-bounds set_bpm request gets a conformant [253, msg] error response and emits no
+        // EngineCommand, without poisoning debounce for a subsequent valid set_bpm.
         time::sleep(Duration::from_millis(90)).await;
         send_rpc(
             &mut tb.peer,
             &RpcMessage::Request {
                 msgid: 45,
                 method: CMD_SET_BPM.to_string(),
-                params: vec![MsgPackValue::Float(1000.0)],
+                params: vec![Value::F64(1000.0)],
             },
         )
         .await;
         match read_rpc_frame(&mut tb.peer, &mut tb.read_buf).await {
             RpcMessage::Response {
                 msgid: 45,
-                error: MsgPackValue::Str(msg),
-                result: MsgPackValue::Nil,
-            } => assert!(msg.contains("range")),
+                error,
+                result: Value::Nil,
+            } => {
+                let rpc_err = RpcError::from_wire(error);
+                assert_eq!(rpc_err.code, ErrorCode::MalformedCall);
+                assert!(rpc_err.message.contains("range"));
+            }
             other => panic!("expected error response, got {other:?}"),
         }
         assert!(tb.cmd_rx.try_recv().is_err());
@@ -2079,7 +1272,7 @@ mod tests {
             &mut tb.peer,
             &RpcMessage::Notification {
                 method: CMD_SET_BPM.to_string(),
-                params: vec![MsgPackValue::Int(140)],
+                params: vec![Value::Int(140)],
             },
         )
         .await;
@@ -2098,9 +1291,16 @@ mod tests {
         let mut tb = spawn_test_bridge(TelemetrySnapshot::default(), Duration::ZERO).await;
         let _ = consume_handshake(&mut tb).await;
         tb.peer.write_all(&[0xc1]).await.expect("write malformed");
+        let mut tmp = [0u8; 8];
+        let eof1 = time::timeout(Duration::from_secs(2), tb.peer.read(&mut tmp))
+            .await
+            .expect("peer sees EOF on malformed frame")
+            .expect("read eof1");
+        assert_eq!(eof1, 0);
+        let _ = tb.shutdown_tx.send(true);
         time::timeout(Duration::from_secs(2), tb.handle)
             .await
-            .expect("session exits on malformed frame")
+            .expect("bridge exits on shutdown")
             .expect("session join");
 
         // Incomplete frame larger than MAX_FRAME_BYTES (16 KiB) closes session cleanly.
@@ -2113,28 +1313,39 @@ mod tests {
             .write_all(&oversized_hdr)
             .await
             .expect("write oversized header");
+        let eof2 = time::timeout(Duration::from_secs(2), tb2.peer.read(&mut tmp))
+            .await
+            .expect("peer sees EOF on oversized frame")
+            .expect("read eof2");
+        assert_eq!(eof2, 0);
+        let _ = tb2.shutdown_tx.send(true);
         time::timeout(Duration::from_secs(2), tb2.handle)
             .await
-            .expect("session exits on oversized frame")
+            .expect("bridge exits on shutdown")
             .expect("session join");
     }
 
     #[tokio::test]
     async fn exits_cleanly_on_peer_eof_backoff_reconnect_and_spawn_enabled_flag() {
         // Verify backoff schedule progression: 250ms -> 500ms -> 1s -> 2s -> 4s -> 5s cap.
-        let mut b = INITIAL_RECONNECT_BACKOFF;
+        let policy = ReconnectPolicy {
+            initial_backoff: INITIAL_RECONNECT_BACKOFF,
+            max_backoff: MAX_RECONNECT_BACKOFF,
+            multiplier: 2,
+        };
+        let mut b = policy.initial_backoff;
         assert_eq!(b, Duration::from_millis(250));
-        b = next_backoff(b);
+        b = policy.next_backoff(b);
         assert_eq!(b, Duration::from_millis(500));
-        b = next_backoff(b);
+        b = policy.next_backoff(b);
         assert_eq!(b, Duration::from_secs(1));
-        b = next_backoff(b);
+        b = policy.next_backoff(b);
         assert_eq!(b, Duration::from_secs(2));
-        b = next_backoff(b);
+        b = policy.next_backoff(b);
         assert_eq!(b, Duration::from_secs(4));
-        b = next_backoff(b);
+        b = policy.next_backoff(b);
         assert_eq!(b, Duration::from_secs(5));
-        assert_eq!(next_backoff(b), Duration::from_secs(5));
+        assert_eq!(policy.next_backoff(b), Duration::from_secs(5));
 
         let (_state_tx, state_rx) = watch::channel(AppState::default());
         let (cmd_tx, _cmd_rx) = mpsc::channel(8);
@@ -2162,14 +1373,6 @@ mod tests {
             .expect("spawned bridge stops promptly on shutdown")
             .expect("join spawned bridge");
 
-        // Peer EOF stops run_bridge_session cleanly.
-        let tb = spawn_test_bridge(TelemetrySnapshot::default(), Duration::ZERO).await;
-        drop(tb.peer);
-        time::timeout(Duration::from_secs(2), tb.handle)
-            .await
-            .expect("session exits promptly on EOF")
-            .expect("session join");
-
         // Reconnect loop handles initial connect failure, connects, survives peer EOF, reconnects, and shuts down.
         let (shutdown_tx2, shutdown_rx2) = watch::channel(false);
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -2195,6 +1398,7 @@ mod tests {
             },
             control,
             shutdown_rx2,
+            DEFAULT_COMMAND_DEBOUNCE,
         ));
 
         // First successful session after initial ENOENT backoff.
