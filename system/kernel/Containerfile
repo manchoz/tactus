@@ -1,0 +1,33 @@
+# Local UNO Q kernel .deb build environment (Apple `container` / Docker compatible).
+# Mirrors .github/workflows/build-unoq-kernel.yml (debian:trixie, same packages).
+FROM debian:trixie
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN dpkg --add-architecture arm64 \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        git \
+        build-essential \
+        crossbuild-essential-arm64 \
+        make \
+        flex \
+        bison \
+        bc \
+        libdw-dev \
+        libelf-dev \
+        libssl-dev \
+        libssl-dev:arm64 \
+        dpkg-dev \
+        debhelper \
+        kmod \
+        python3 \
+        rsync \
+        coreutils \
+        cpio \
+        xz-utils \
+        lsb-release \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work
