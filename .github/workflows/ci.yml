@@ -35,6 +35,17 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace
 
+      - name: Check and test arduino-router feature matrix and docs
+        run: |
+          cargo clippy -p arduino-router --all-features --all-targets -- -D warnings
+          cargo check -p arduino-router --no-default-features
+          cargo check -p arduino-router --no-default-features --features serde
+          cargo test -p arduino-router --no-default-features
+          cargo test -p arduino-router --all-features
+          RUSTDOCFLAGS="-D warnings" cargo doc -p arduino-router --no-default-features --no-deps
+          RUSTDOCFLAGS="-D warnings" cargo doc -p arduino-router --no-deps
+          RUSTDOCFLAGS="-D warnings" cargo doc -p arduino-router --all-features --no-deps
+
       - name: Check embedded Web UI JavaScript syntax
         run: node --check crates/tactusd/web/app.js
 

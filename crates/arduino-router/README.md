@@ -1,5 +1,10 @@
 # arduino-router
 
+[![Crates.io](https://img.shields.io/crates/v/arduino-router.svg)](https://crates.io/crates/arduino-router)
+[![Docs.rs](https://docs.rs/arduino-router/badge.svg)](https://docs.rs/arduino-router)
+[![CI](https://github.com/manchoz/tactus/actions/workflows/ci.yml/badge.svg)](https://github.com/manchoz/tactus/actions/workflows/ci.yml)
+[![License](https://img.shields.io/crates/l/arduino-router.svg)](https://crates.io/crates/arduino-router)
+
 Async Rust client, streaming MessagePack-RPC codec, and virtual serial monitor stream conforming to:
 
 - [`arduino/arduino-router`](https://github.com/arduino/arduino-router) (star-topology MessagePack-RPC daemon, `$/` router methods, `ErrCode` codes, Unix/TCP transports, monitor proxy)
