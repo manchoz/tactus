@@ -385,14 +385,17 @@ install_system_files() {
       echo "error: TACTUS_AP_PSK cannot contain control characters" >&2
       exit 1
     fi
-    local tmp_conf
-    tmp_conf="$(mktemp)"
-    grep -v '^wpa_passphrase=' "${SYSTEM_DIR}/hostapd/tactus-ap.conf" >"$tmp_conf"
-    printf 'wpa_passphrase=%s\n' "$TACTUS_AP_PSK" >>"$tmp_conf"
-    install -m 0600 "$tmp_conf" /etc/hostapd/tactus-ap.conf
-    rm -f "$tmp_conf"
+    local tmp_conf ap_conf
+    for ap_conf in tactus-ap.conf tactus-ap-2g.conf; do
+      tmp_conf="$(mktemp)"
+      grep -v '^wpa_passphrase=' "${SYSTEM_DIR}/hostapd/${ap_conf}" >"$tmp_conf"
+      printf 'wpa_passphrase=%s\n' "$TACTUS_AP_PSK" >>"$tmp_conf"
+      install -m 0600 "$tmp_conf" "/etc/hostapd/${ap_conf}"
+      rm -f "$tmp_conf"
+    done
   else
     install -m 0600 "${SYSTEM_DIR}/hostapd/tactus-ap.conf" /etc/hostapd/tactus-ap.conf
+    install -m 0600 "${SYSTEM_DIR}/hostapd/tactus-ap-2g.conf" /etc/hostapd/tactus-ap-2g.conf
   fi
 
   install -m 0644 "${SYSTEM_DIR}/dnsmasq/tactus-ap.conf" /etc/dnsmasq.d/tactus-ap.conf

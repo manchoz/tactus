@@ -22,7 +22,8 @@ tactus/
     ├── NetworkManager/
     │   └── 99-tactus-unmanaged.conf
     ├── hostapd/
-    │   └── tactus-ap.conf
+    │   ├── tactus-ap.conf        # 5 GHz ch 36 (default)
+    │   └── tactus-ap-2g.conf     # 2.4 GHz ch 11 fallback
     ├── dnsmasq/
     │   └── tactus-ap.conf
     ├── avahi/
