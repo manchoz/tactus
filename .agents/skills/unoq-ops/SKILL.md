@@ -16,7 +16,10 @@ description: >-
   - `ssh tactus-ap` (`10.42.0.1` when joined to the `Tactus` WiFi AP).
   - Or explicitly: `ssh -4 -i ~/.ssh/id_ed25519 arduino@tactus.local` / `arduino@10.42.0.1`.
 - **Serial Linux console (UART):** `/dev/cu.usbserial-*` at `115200 8N1`. Log in as **`arduino`** (`tactus` is a locked `nologin` daemon user).
-- Provisioned boards have `NOPASSWD` sudo for `arduino` (`/etc/sudoers.d/99-arduino-nopasswd`).
+- **Sudo & host keys:** Only boards provisioned with `provision-factory-unoq.sh --nopasswd-sudo` have passwordless sudo (`/etc/sudoers.d/99-arduino-nopasswd`). Turnkey-provisioned boards (`install.sh`) require `arduino`'s sudo password:
+  - Never pipe a script into `ssh -t ... 'sudo bash -s' < script.sh` (redirected stdin strips the TTY from `sudo`). Instead, `scp` the script to `/tmp/` first, then run `ssh -t arduino@tactus.local 'sudo bash /tmp/... && rm -f /tmp/...'`.
+  - Read-only diagnostics (`systemctl status`, `journalctl -u tactus*`, `ls /run/tactus`) work over non-interactive SSH without `sudo`.
+  - When inspecting a freshly provisioned board with a new host key at `tactus.local`, use `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null` for one-off diagnostics (and suggest `ssh-keygen -R tactus.local` for interactive sessions).
 
 ## 2. Factory Provisioning (USB-C ADB or SSH)
 Use `system/scripts/provision-factory-unoq.sh` (idempotent):
@@ -73,6 +76,7 @@ Use `system/scripts/provision-factory-unoq.sh` (idempotent):
   ```
   Confirm matching binary SHA256, `rt-sync` **alone** on Core `3` (`PSR=3`, `FF 75`, `mlockall=locked`) with `tactus-async` and `asio` confined to `PSR=0..2`, `tactus-dhcp.service` auto-restarting after `SIGKILL`, IPv4 resolution without `-4`, `ui_hash` + `no-store` headers on `/` + versioned icon URLs in `/manifest.webmanifest`, and zero `Device or resource busy` (`EBUSY`) lines in `journalctl`.
   - **Per-service fault LED test:** Because `OnFailure=tactus-led-fault@%n.service` expands `%n` to `<unit>.service`, the instantiated unit name has a doubled `.service` suffix (check via `systemctl show tactus-ap.service -p OnFailure`). Test with `sudo systemctl start tactus-led-fault@tactus-ap.service.service` (not `@tactus-ap.service`, which sets `%i=tactus-ap` and creates a mismatched sentinel): verify `/run/tactus/fault.tactus-ap.service` and `unoq:user-red1/trigger` `[timer]` survive `sudo systemctl restart tactusd.service`, then clear cleanly back to `unoq:user-blue1` after `sudo systemctl restart tactus-ap.service`.
+  - **Fault LED recovery after crash-loop:** If `tactus-led-fault@<unit>.service` fired repeatedly and systemd hit `StartLimitBurst` (`Start request repeated too quickly`), run `sudo systemctl reset-failed <unit> && sudo systemctl start <unit>` after fixing the root cause; plain `restart` will fail until the counter is reset.
 
 ## 5. Compile & Flash MCU Sketch (`tactus-zephyr`)
 Provisioned boards keep `_arduino._tcp` disabled, so `arduino-cli upload -l network` will not auto-discover `tactus.local`. Compile locally on macOS (`arduino-cli compile -e`) and flash over key-based SSH via the board's `linuxgpiod` OpenOCD path:
@@ -88,6 +92,7 @@ Provisioned boards keep `_arduino._tcp` disabled, so `arduino-cli upload -l netw
 Stock WCN3990 reports `NO-IR` on all 5 GHz channels. `system/kernel/tactus-5ghz.config` (`CONFIG_CFG80211_CERTIFICATION_ONUS=y`, `CONFIG_ATH_REG_DYNAMIC_USER_REG_HINTS=y`, `LOCALVERSION=-arduino1-tactus`) is built by the shared `system/kernel/build.sh` (used by both paths below), merged on top of `arduino/arduino-deb-images` `kernel-configs/*.config` by `build-linux-deb.py` against `arduino/linux-qcom` `qcom-v7.2.11-arduino`; the distinct version installs side-by-side with stock `7.2.11-arduino1+` in systemd-boot.
 - **GitHub Actions:** `gh workflow run build-unoq-kernel.yml` → artifact `unoq-kernel-5ghz-deb`.
 - **Local (Apple `container`, native arm64):** `./system/scripts/build-unoq-kernel-local.sh` (defaults `--cpus 8 --memory 16G`; the Apple VM default of 1 GB is far too small). Output in `target/unoq-kernel/`; the kernel tree lives in the `unoq-kernel-src` volume for incremental rebuilds (`--clean` resets it). Run via an unsandboxed shell (container needs `launchctl`).
+- **Full local release bundle:** `./system/scripts/build-release-local.sh` builds `tactusd` (`cargo zigbuild`), MCU firmware (`arduino-cli`), offline Trixie `arm64` `.deb`s (Apple `container`), and the 5 GHz kernel, then packages `target/release-dist/tactus-<ver>-unoq-arm64.{tar.gz,zip}`. Pass `--reuse-cache` (reuses kernel + `.deb`s) or `--reuse-tactusd --reuse-mcu --reuse-kernel` for fast rebuilds. When scripting Apple `container`, always pass absolute paths to `--volume` and feed inline scripts via `container run --rm -i ... bash -euo pipefail <<'EOF'` (avoids nested quote expansion under `set -u`).
 
 ## 5c. Test-Booting a Kernel Safely (UNO Q, systemd-boot over U-Boot)
 - **No one-shot:** EFI variables are read-only, so `bootctl set-oneshot` fails. Use boot counting instead:
@@ -101,6 +106,9 @@ Stock WCN3990 reports `NO-IR` on all 5 GHz channels. `system/kernel/tactus-5ghz.
 ## 6. Service Trimming Guardrails (`provision-debian.sh`)
 - **Masked / disabled:** desktop/USB-probing daemons (`fwupd.service`, `udisks2.service`, `upower.service`, `blueman-mechanism.service`), x86-only `thermald.service` (no ARM64 zones; kernel `step_wise` thermal zones handle QRB2210/WCN3990 throttling), `urm.service` (THP disabled directly via `/etc/tmpfiles.d/99-tactus-thp.conf`), unused boot/legacy units (`remoteproc_audio_fixup.service`, `debos-grow-rootfs.service`, `networking.service`, `NetworkManager-wait-online.service`, `wpa_supplicant.service`, `wtmpdb-update-boot.service`, `cron.service`, `key_events.service`, `e2scrub_reap.service`), and background timers (`fwupd-refresh.timer`, `apt-daily*.timer`, `man-db.timer`, `dpkg-db-backup.timer`, `e2scrub_all.timer`).
 - **Keep intact:** `arduino-burn-bootloader-unoq.service` (flag-guarded no-op after first boot; preserves manual `arduino-cli burn-bootloader`), `arduino-router.service`, `/opt/openocd`, `NetworkManager.service`, and WiFi modem daemons (`rmtfs.service`, `tqftpserv.service` — started early via drop-ins for WCN3990 firmware/NVRAM).
+
+## 6b. Config Mutation Guardrail (`/var/lib/tactus/config.toml`)
+- Never edit TOML sections with lazy regexes; use line-oriented section parsing (as in `system/scripts/flash-mcu-board.sh`), validate the result with Python `tomllib.loads` before atomic write, and assert valid TOML in `system/scripts/test-release-scripts.sh` (substring `grep` misses duplicate keys).
 
 ## 7. UNO Q Hardware Quick Reference
 - **OS / Kernel:** Debian 13 (`trixie`), `7.2.11-arduino1+`, `aarch64` (4 cores, QRB2210), glibc `2.41`.

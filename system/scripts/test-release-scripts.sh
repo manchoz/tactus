@@ -71,8 +71,32 @@ resolved_ver="${resolved_ver%-unoq-arm64.tar.gz}"
 echo "PASS: Test 1 (package-release.sh bundle layout, checksums, and pre-release version)"
 
 # ---------------------------------------------------------------------------
-# Test 2: flash-mcu-board.sh --config-only (atomic update & mode preservation)
+# Test 2: flash-mcu-board.sh --config-only (atomic update, TOML validity & repair)
 # ---------------------------------------------------------------------------
+assert_valid_mcu_toml() {
+  python3 - "$1" <<'PYEOF'
+import pathlib, sys
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+try:
+    import tomllib
+except ImportError:
+    tomllib = None
+if tomllib is not None:
+    data = tomllib.loads(text)
+    assert data["mcu_bridge"]["enabled"] is True, f"expected enabled=True, got {data}"
+    assert data["mcu_bridge"]["socket_path"] == "/var/run/arduino-router.sock", f"unexpected socket_path: {data}"
+in_sec = False
+enabled_lines = []
+for line in text.splitlines():
+    s = line.strip()
+    if s.startswith("[") and s.endswith("]"):
+        in_sec = (s == "[mcu_bridge]")
+    elif in_sec and s.startswith("enabled"):
+        enabled_lines.append(s)
+assert enabled_lines == ["enabled = true"], f"expected single 'enabled = true' in [mcu_bridge], got {enabled_lines}"
+PYEOF
+}
+
 cfg1="${WORK_DIR}/config-existing.toml"
 cat > "$cfg1" <<'EOF'
 [link]
@@ -85,8 +109,8 @@ EOF
 chmod 0640 "$cfg1"
 
 "${SCRIPT_DIR}/flash-mcu-board.sh" --config-only --no-restart --config "$cfg1"
-grep -qx 'enabled = true' "$cfg1" || fail "existing [mcu_bridge] enabled was not updated to true"
-grep -qx 'socket_path = "/var/run/arduino-router.sock"' "$cfg1" || fail "socket_path lost during config update"
+"${SCRIPT_DIR}/flash-mcu-board.sh" --config-only --no-restart --config "$cfg1"
+assert_valid_mcu_toml "$cfg1" || fail "cfg1 failed TOML/[mcu_bridge] validation"
 [[ "$(file_mode_oct "$cfg1")" == "0640" ]] || fail "config mode changed from 0640 to $(file_mode_oct "$cfg1")"
 [[ ! -f "${WORK_DIR}/config-existing.toml.tmp" ]] || fail "leftover .toml.tmp file"
 
@@ -97,9 +121,26 @@ chmod 0640 "$cfg2"
 "${SCRIPT_DIR}/flash-mcu-board.sh" --config-only --no-restart --config "$cfg2"
 "${SCRIPT_DIR}/flash-mcu-board.sh" --config-only --no-restart --config "$cfg2"
 [[ "$(grep -c '^\[mcu_bridge\]$' "$cfg2")" -eq 1 ]] || fail "[mcu_bridge] section duplicated on re-run"
-grep -qx 'enabled = true' "$cfg2" || fail "appended [mcu_bridge] missing enabled = true"
+assert_valid_mcu_toml "$cfg2" || fail "cfg2 failed TOML/[mcu_bridge] validation"
 [[ "$(file_mode_oct "$cfg2")" == "0640" ]] || fail "config2 mode changed from 0640"
-echo "PASS: Test 2 (flash-mcu-board.sh --config-only atomic update and idempotency)"
+
+cfg3="${WORK_DIR}/config-missing-enabled-no-newline.toml"
+printf '[mcu_bridge]\nsocket_path = "/var/run/arduino-router.sock"' > "$cfg3"
+chmod 0640 "$cfg3"
+"${SCRIPT_DIR}/flash-mcu-board.sh" --config-only --no-restart --config "$cfg3"
+assert_valid_mcu_toml "$cfg3" || fail "cfg3 failed TOML/[mcu_bridge] validation"
+
+cfg4="${WORK_DIR}/config-duplicate-enabled.toml"
+cat > "$cfg4" <<'EOF'
+[mcu_bridge]
+enabled = true
+enabled = false
+socket_path = "/var/run/arduino-router.sock"
+EOF
+chmod 0640 "$cfg4"
+"${SCRIPT_DIR}/flash-mcu-board.sh" --config-only --no-restart --config "$cfg4"
+assert_valid_mcu_toml "$cfg4" || fail "cfg4 failed duplicate-key repair validation"
+echo "PASS: Test 2 (flash-mcu-board.sh --config-only atomic update, TOML validation & repair)"
 
 # ---------------------------------------------------------------------------
 # Test 3: install-unoq-board.sh configure_systemd_boot_entry (+2 rollback)
@@ -134,3 +175,46 @@ LC_ALL=C configure_systemd_boot_entry "$loader_dir" "7.2.11-arduino1-tactus+" "a
 [[ ! -f "${entries_dir}/abc123-7.2.11-arduino1-tactus++2-1.conf" ]] || fail "stale +2-1.conf not removed"
 [[ ! -f "${entries_dir}/abc123-7.2.11-arduino1-tactus+.conf" ]] || fail "uncounted .conf survived dirty state cleanup"
 echo "PASS: Test 3 (configure_systemd_boot_entry +2 rollback & duplicate cleanup)"
+
+# ---------------------------------------------------------------------------
+# Test 4: build-release-local.sh --help & --dry-run (CI-safe wiring checks)
+# ---------------------------------------------------------------------------
+"${SCRIPT_DIR}/build-release-local.sh" --help >/dev/null
+
+dry_default="$("${SCRIPT_DIR}/build-release-local.sh" --dry-run)"
+grep -q 'tactusd : BUILD' <<<"$dry_default" || fail "default dry-run did not plan tactusd BUILD"
+grep -q 'mcu     : BUILD' <<<"$dry_default" || fail "default dry-run did not plan mcu BUILD"
+grep -q 'debs    : BUILD' <<<"$dry_default" || fail "default dry-run did not plan debs BUILD"
+grep -q 'kernel  : BUILD' <<<"$dry_default" || fail "default dry-run did not plan kernel BUILD"
+grep -q 'package-release.sh' <<<"$dry_default" || fail "default dry-run did not plan package-release.sh"
+
+cache_dir="${WORK_DIR}/local-cache"
+mkdir -p "${cache_dir}/kernel" "${cache_dir}/debs"
+printf 'dummy-tactusd\n' > "${cache_dir}/tactusd"
+printf 'dummy-mcu-bin\n' > "${cache_dir}/tactus-zephyr.ino.elf-zsk.bin"
+printf 'dummy-loader\n' > "${cache_dir}/zephyr-arduino_uno_q_stm32u585xx.elf"
+printf 'dummy-deb\n' > "${cache_dir}/debs/hostapd_2.10_arm64.deb"
+printf 'dummy-kernel\n' > "${cache_dir}/kernel/linux-image-7.2.11-arduino1-tactus+_1_arm64.deb"
+printf 'dummy-dbg\n' > "${cache_dir}/kernel/linux-image-7.2.11-arduino1-tactus+-dbg_1_arm64.deb"
+
+dry_reuse="$("${SCRIPT_DIR}/build-release-local.sh" \
+  --dry-run \
+  --reuse-cache \
+  --reuse-tactusd \
+  --reuse-mcu \
+  --tactusd "${cache_dir}/tactusd" \
+  --mcu-bin "${cache_dir}/tactus-zephyr.ino.elf-zsk.bin" \
+  --mcu-loader "${cache_dir}/zephyr-arduino_uno_q_stm32u585xx.elf" \
+  --deb-dir "${cache_dir}/debs" \
+  --kernel-dir "${cache_dir}/kernel")"
+grep -q 'tactusd : REUSE' <<<"$dry_reuse" || fail "reuse dry-run did not plan tactusd REUSE"
+grep -q 'mcu     : REUSE' <<<"$dry_reuse" || fail "reuse dry-run did not plan mcu REUSE"
+grep -q 'debs    : REUSE' <<<"$dry_reuse" || fail "reuse dry-run did not plan debs REUSE"
+grep -q 'kernel  : REUSE (.*linux-image-7\.2\.11-arduino1-tactus+_1_arm64\.deb)' <<<"$dry_reuse" || fail "reuse dry-run did not pick non-dbg kernel .deb"
+
+dry_partial="$("${SCRIPT_DIR}/build-release-local.sh" --dry-run --partial)"
+grep -q 'mcu     : SKIP' <<<"$dry_partial" || fail "partial dry-run did not plan mcu SKIP"
+grep -q 'debs    : SKIP' <<<"$dry_partial" || fail "partial dry-run did not plan debs SKIP"
+grep -q 'kernel  : SKIP' <<<"$dry_partial" || fail "partial dry-run did not plan kernel SKIP"
+grep -q -- '--allow-partial' <<<"$dry_partial" || fail "partial dry-run did not pass --allow-partial"
+echo "PASS: Test 4 (build-release-local.sh --help, --dry-run, cache reuse, and --partial)"

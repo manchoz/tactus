@@ -175,7 +175,17 @@ Run `./system/scripts/provision-factory-unoq.sh --help` for offline `--deb-dir`,
 
 ### Release Bundle Packaging
 
-To assemble a local offline release archive (`.tar.gz` / `.zip` with `SHA256SUMS`), use `./system/scripts/package-release.sh`; official release artifacts are built by [`.github/workflows/release-unoq.yml`](.github/workflows/release-unoq.yml). See [system/release/INSTALL.md](system/release/INSTALL.md) for the turnkey bundle layout and installer flags.
+To build all UNO Q offline release artifacts locally (ARM64 `tactusd`, STM32U585 Zephyr firmware, offline `arm64` `.deb`s, and the 5 GHz kernel `.deb`) and assemble `target/release-dist/tactus-<version>-unoq-arm64.{tar.gz,zip}` + `SHA256SUMS` in one command (requires `cargo-zigbuild`, `arduino-cli` with `arduino:zephyr` + `Arduino_RouterBridge`, and Apple `container` via `brew install container` on macOS):
+
+```bash
+# Full local build (uses Apple 'container' VM on macOS for kernel + arm64 .debs)
+./system/scripts/build-release-local.sh
+
+# Fast incremental rebuild after Rust/Web UI/script edits (reuses cached kernel + .debs)
+./system/scripts/build-release-local.sh --reuse-cache
+```
+
+Run `./system/scripts/build-release-local.sh --help` for `--reuse-tactusd`, `--reuse-mcu`, `--partial`, and `--dry-run` options, or use `./system/scripts/package-release.sh` directly when assembling prebuilt artifacts. Official release artifacts are built by [`.github/workflows/release-unoq.yml`](.github/workflows/release-unoq.yml); see [system/release/INSTALL.md](system/release/INSTALL.md) for the turnkey bundle layout and installer flags.
 
 ### Linux `LED1` Sysfs & Fault Unit
 

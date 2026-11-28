@@ -167,21 +167,57 @@ if str(path) == "/var/lib/tactus/config.toml" and (orig_mode & 0o007) != 0:
 else:
     mode = orig_mode
 
-if re.search(r"(?m)^\[mcu_bridge\]\s*$", text):
-    pattern = re.compile(r"(?ms)(^\[mcu_bridge\]\s*\n(?:(?!^\[).*\n)*?)")
-    def replace_section(match: re.Match[str]) -> str:
-        block = match.group(1)
-        if re.search(r"(?m)^enabled\s*=", block):
-            return re.sub(r"(?m)^enabled\s*=.*$", "enabled = true", block, count=1)
-        return block + "enabled = true\n"
-    updated = pattern.sub(replace_section, text, count=1)
-else:
-    suffix = "" if text.endswith("\n") else "\n"
-    updated = (
-        text
-        + suffix
-        + "\n[mcu_bridge]\nenabled = true\nsocket_path = \"/var/run/arduino-router.sock\"\n"
-    )
+lines = text.splitlines(keepends=True)
+out: list[str] = []
+in_section = False
+found_section = False
+wrote_enabled = False
+header_re = re.compile(r"^\s*\[([^\]]+)\]\s*(?:#.*)?$")
+enabled_re = re.compile(r"^\s*enabled\s*=")
+
+for line in lines:
+    header_match = header_re.match(line)
+    if header_match:
+        if in_section and not wrote_enabled:
+            if out and not out[-1].endswith("\n"):
+                out[-1] += "\n"
+            out.append("enabled = true\n")
+            wrote_enabled = True
+        in_section = header_match.group(1).strip() == "mcu_bridge"
+        if in_section:
+            found_section = True
+        out.append(line)
+        continue
+
+    if in_section and enabled_re.match(line):
+        if not wrote_enabled:
+            out.append("enabled = true\n")
+            wrote_enabled = True
+        continue
+
+    out.append(line)
+
+if in_section and not wrote_enabled:
+    if out and not out[-1].endswith("\n"):
+        out[-1] += "\n"
+    out.append("enabled = true\n")
+elif not found_section:
+    if out and not out[-1].endswith("\n"):
+        out[-1] += "\n"
+    if out and out[-1].strip() != "":
+        out.append("\n")
+    out.append('[mcu_bridge]\nenabled = true\nsocket_path = "/var/run/arduino-router.sock"\n')
+
+updated = "".join(out)
+
+try:
+    import tomllib
+except ImportError:
+    tomllib = None
+if tomllib is not None:
+    parsed = tomllib.loads(updated)
+    if parsed.get("mcu_bridge", {}).get("enabled") is not True:
+        raise RuntimeError("validated TOML missing [mcu_bridge].enabled = true")
 
 if updated != text or orig_mode != mode:
     tmp = path.with_suffix(".toml.tmp")
