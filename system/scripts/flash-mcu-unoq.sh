@@ -209,24 +209,29 @@ if [[ "$SKETCH_ONLY" -eq 0 && -n "$LOADER_PATH" ]]; then
 fi
 
 log "Flashing STM32U585 via linuxgpiod OpenOCD..."
-ssh "${SSH_OPTS[@]}" "$SSH_TARGET" bash -s -- "$REMOTE_DIR" "$SKETCH_ONLY" "$HAS_HOST_LOADER" "$ENABLE_BRIDGE" <<'REMOTE_EOF'
-set -euo pipefail
-REMOTE_DIR="$1"
-SKETCH_ONLY="$2"
-HAS_HOST_LOADER="$3"
-ENABLE_BRIDGE="$4"
-
-ARGS=(--sketch "${REMOTE_DIR}/sketch.elf-zsk.bin" --openocd-dir "$REMOTE_DIR")
+REMOTE_ARGS=(--sketch "${REMOTE_DIR}/sketch.elf-zsk.bin" --openocd-dir "$REMOTE_DIR")
 if [[ "$SKETCH_ONLY" -eq 1 ]]; then
-  ARGS+=(--sketch-only)
+  REMOTE_ARGS+=(--sketch-only)
 elif [[ "$HAS_HOST_LOADER" -eq 1 ]]; then
-  ARGS+=(--loader "${REMOTE_DIR}/loader.elf")
+  REMOTE_ARGS+=(--loader "${REMOTE_DIR}/loader.elf")
 fi
 if [[ "$ENABLE_BRIDGE" -eq 1 ]]; then
-  ARGS+=(--enable-bridge)
+  REMOTE_ARGS+=(--enable-bridge)
 fi
 
-bash "${REMOTE_DIR}/flash-mcu-board.sh" "${ARGS[@]}"
-REMOTE_EOF
+REMOTE_CMD="bash $(printf '%q' "${REMOTE_DIR}/flash-mcu-board.sh")"
+for arg in "${REMOTE_ARGS[@]}"; do
+  REMOTE_CMD+=" $(printf '%q' "$arg")"
+done
+
+if ssh "${SSH_OPTS[@]}" "$SSH_TARGET" 'sudo -n true' >/dev/null 2>&1; then
+  REMOTE_SUDO_CMD="sudo -n ${REMOTE_CMD}"
+  # shellcheck disable=SC2029
+  ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "$REMOTE_SUDO_CMD"
+else
+  REMOTE_SUDO_CMD="sudo ${REMOTE_CMD}"
+  # shellcheck disable=SC2029
+  ssh "${SSH_OPTS[@]}" -tt "$SSH_TARGET" "$REMOTE_SUDO_CMD"
+fi
 
 log "MCU firmware flashed cleanly."

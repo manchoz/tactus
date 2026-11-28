@@ -132,35 +132,41 @@ scp "${SSH_OPTS[@]}" "$BINARY_PATH" "${SSH_TARGET}:${REMOTE_TMP}"
 UPLOADED=1
 
 log "Installing /usr/local/bin/tactusd and restarting tactusd.service..."
-ssh "${SSH_OPTS[@]}" "$SSH_TARGET" bash -s -- "$REMOTE_TMP" "$LOCAL_SHA" "$VERIFY" <<'REMOTE_EOF'
-set -euo pipefail
-
-REMOTE_TMP="$1"
-EXPECTED_SHA="$2"
-VERIFY="$3"
-
-sudo install -m 0755 -o root -g root "$REMOTE_TMP" /usr/local/bin/tactusd
-rm -f "$REMOTE_TMP"
-sudo systemctl restart tactusd.service
+INSTALL_CMD="install -m 0755 -o root -g root $(printf '%q' "$REMOTE_TMP") /usr/local/bin/tactusd && rm -f $(printf '%q' "$REMOTE_TMP") && systemctl restart tactusd.service"
+QUOTED_INSTALL_CMD="$(printf '%q' "$INSTALL_CMD")"
+if ssh "${SSH_OPTS[@]}" "$SSH_TARGET" 'sudo -n true' >/dev/null 2>&1; then
+  REMOTE_SUDO_CMD="sudo -n sh -c ${QUOTED_INSTALL_CMD}"
+  # shellcheck disable=SC2029
+  ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "$REMOTE_SUDO_CMD"
+else
+  REMOTE_SUDO_CMD="sudo sh -c ${QUOTED_INSTALL_CMD}"
+  # shellcheck disable=SC2029
+  ssh "${SSH_OPTS[@]}" -tt "$SSH_TARGET" "$REMOTE_SUDO_CMD"
+fi
 
 if [[ "$VERIFY" -eq 1 ]]; then
-  sleep 1
-  ACTIVE_STATE="$(systemctl is-active tactusd.service || true)"
-  if [[ "$ACTIVE_STATE" != "active" ]]; then
-    echo "ERROR: tactusd.service state is '$ACTIVE_STATE'" >&2
-    journalctl -u tactusd.service -n 25 --no-pager >&2 || true
-    exit 1
-  fi
+  ssh "${SSH_OPTS[@]}" "$SSH_TARGET" bash -s -- "$LOCAL_SHA" <<'REMOTE_EOF'
+set -euo pipefail
 
-  ACTUAL_SHA="$(sha256sum /usr/local/bin/tactusd | awk '{print $1}')"
-  if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
-    echo "ERROR: SHA256 mismatch (expected $EXPECTED_SHA, got $ACTUAL_SHA)" >&2
-    exit 1
-  fi
+EXPECTED_SHA="$1"
 
-  echo "[tactus-deploy] tactusd.service active (sha256=${ACTUAL_SHA})"
-  ps -eLo pid,tid,psr,cls,rtprio,comm | grep -E "tactus|rt-sync|asio" || true
+sleep 1
+ACTIVE_STATE="$(systemctl is-active tactusd.service || true)"
+if [[ "$ACTIVE_STATE" != "active" ]]; then
+  echo "ERROR: tactusd.service state is '$ACTIVE_STATE'" >&2
+  journalctl -u tactusd.service -n 25 --no-pager >&2 || true
+  exit 1
 fi
+
+ACTUAL_SHA="$(sha256sum /usr/local/bin/tactusd | awk '{print $1}')"
+if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
+  echo "ERROR: SHA256 mismatch (expected $EXPECTED_SHA, got $ACTUAL_SHA)" >&2
+  exit 1
+fi
+
+echo "[tactus-deploy] tactusd.service active (sha256=${ACTUAL_SHA})"
+ps -eLo pid,tid,psr,cls,rtprio,comm | grep -E "tactus|rt-sync|asio" || true
 REMOTE_EOF
+fi
 
 log "Deploy complete."
