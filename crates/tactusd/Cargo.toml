@@ -3,6 +3,7 @@ name = "tactusd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 arduino-router = "0.1"
