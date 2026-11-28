@@ -227,6 +227,6 @@ jobs:
             gh release upload "$TAG" release-dist/* --clobber
           else
             gh release create "$TAG" release-dist/* \
-              --title "Tactus ${TAG} (Arduino UNO Q)" \
+              --title "tac•tus ${TAG} (Arduino UNO Q)" \
               --generate-notes
           fi
