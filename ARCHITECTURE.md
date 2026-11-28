@@ -1,4 +1,4 @@
-# ARCHITECTURE.md — Tactus System & Software Design
+# ARCHITECTURE.md — tac•tus System & Software Design
 
 ## 1. Monorepo Layout
 ```text

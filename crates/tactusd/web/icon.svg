@@ -1,12 +1,39 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 180">
-  <rect width="180" height="180" rx="36" fill="#0d0f14"/>
-  <rect x="14" y="14" width="152" height="152" rx="26" fill="#151922" stroke="#232a38" stroke-width="4"/>
-  <line x1="42" y1="90" x2="138" y2="90" stroke="#2a3345" stroke-width="8" stroke-linecap="round"/>
-  <circle cx="44" cy="90" r="22" fill="#f59e0b" fill-opacity="0.22"/>
-  <circle cx="44" cy="90" r="13" fill="#f59e0b"/>
-  <circle cx="76" cy="90" r="9" fill="#2dd4bf"/>
-  <circle cx="106" cy="90" r="9" fill="#2dd4bf"/>
-  <circle cx="136" cy="90" r="9" fill="#2dd4bf"/>
-  <path d="M44 50 H136" stroke="#2dd4bf" stroke-width="5" stroke-linecap="round" opacity="0.65"/>
-  <circle cx="44" cy="50" r="5" fill="#f59e0b"/>
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="50%" r="72%">
+      <stop offset="0%" stop-color="#171c27"/>
+      <stop offset="100%" stop-color="#0d0f14"/>
+    </radialGradient>
+    <radialGradient id="amberHalo" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#f59e0b" stop-opacity="0.58"/>
+      <stop offset="50%" stop-color="#f59e0b" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#f59e0b" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="amberCore" cx="50%" cy="50%" r="55%">
+      <stop offset="0%" stop-color="#fbbf24"/>
+      <stop offset="70%" stop-color="#f59e0b"/>
+      <stop offset="100%" stop-color="#e58e08"/>
+    </radialGradient>
+    <linearGradient id="tealArc" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#5eead4"/>
+      <stop offset="100%" stop-color="#14b8a6"/>
+    </linearGradient>
+    <linearGradient id="whiteArc" x1="100%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#cbd5e1"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="180" height="180" rx="36" fill="url(#bg)"/>
+  <circle cx="90" cy="90" r="65" fill="none" stroke="#232a38" stroke-width="1.5" stroke-dasharray="3 7"/>
+  <circle cx="90" cy="90" r="29" fill="none" stroke="#232a38" stroke-width="2"/>
+
+  <path d="M 49.86 61.89 A 49 49 0 0 1 136.05 73.24" fill="none" stroke="url(#tealArc)" stroke-width="13" stroke-linecap="round"/>
+  <circle cx="138.52" cy="96.82" r="6.8" fill="#2dd4bf"/>
+
+  <path d="M 130.14 118.11 A 49 49 0 0 1 43.95 106.76" fill="none" stroke="url(#whiteArc)" stroke-width="13" stroke-linecap="round"/>
+  <circle cx="41.48" cy="83.18" r="6.8" fill="#eef2f7"/>
+
+  <circle cx="90" cy="90" r="36" fill="url(#amberHalo)"/>
+  <circle cx="90" cy="90" r="15.5" fill="url(#amberCore)"/>
 </svg>

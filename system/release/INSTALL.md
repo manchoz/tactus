@@ -1,4 +1,4 @@
-# Tactus — Arduino UNO Q Turnkey Installer
+# tac•tus — Arduino UNO Q Turnkey Installer
 
 This release package contains everything needed to provision a stock Debian **Arduino UNO Q** from scratch—**100% offline**—into a standalone USB-MIDI / BLE-MIDI ↔ Ableton Link bridge:
 
@@ -72,3 +72,7 @@ TACTUS_ARDUINO_PASSWORD="<board-pw>" ./install.sh --adb --psk "<ap-passphrase>" 
 - **AP stays on 2.4 GHz after install:** Reboot the board so the `7.2.11-arduino1-tactus+` kernel boots (`uname -r`).
 - **Kernel boot fallback:** If the custom kernel fails to boot twice, `systemd-boot` automatically reverts to the stock `7.2.11-arduino1+` kernel.
 - **Re-enable WiFi client mode (`wlan0`):** Run `./install.sh --rollback-ap` (macOS/Linux) or `.\install.ps1 -RollbackAp` (Windows) from this release folder.
+
+---
+
+*tac•tus is an independent open-source project and is not affiliated with or endorsed by Ableton AG or Arduino. Ableton® and Link™ are trademarks of Ableton AG. See `THIRD_PARTY_NOTICES.md` for licenses and trademark notices.*

@@ -6,9 +6,9 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="apple-mobile-web-app-title" content="Tactus">
+  <meta name="apple-mobile-web-app-title" content="tac•tus">
   <meta name="theme-color" content="#0d0f14">
-  <title>Tactus</title>
+  <title>tac•tus</title>
   <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
   <link rel="icon" type="image/svg+xml" href="/icon.svg">
   <link rel="manifest" href="/manifest.webmanifest">
@@ -18,8 +18,7 @@
   <main class="app">
     <header class="topbar">
       <div class="brand">
-        <span class="brand-mark" aria-hidden="true"></span>
-        <h1>TACTUS</h1>
+        <h1 aria-label="tac•tus">tac<span id="brand-dot" class="brand-dot" aria-hidden="true"></span>tus</h1>
       </div>
       <div class="status-pills">
         <span id="conn-pill" class="pill pill-offline">OFFLINE</span>
@@ -30,7 +29,7 @@
     <section class="card hero-card" aria-label="Tempo and Phase">
       <div class="hero-badges">
         <span id="transport-badge" class="badge badge-stopped">STOPPED</span>
-        <span id="lock-badge" class="badge badge-neutral">LINK MASTER</span>
+        <span id="lock-badge" class="badge badge-neutral">LINK CLOCK</span>
       </div>
 
       <div class="bpm-block">
@@ -190,9 +189,13 @@
       </div>
 
       <p id="midi-empty-hint" class="empty-hint hidden">
-        No USB-MIDI interface detected. Connect a class-compliant USB-MIDI adapter; Tactus attaches automatically.
+        No USB-MIDI interface detected. Connect a class-compliant USB-MIDI adapter; tac•tus attaches automatically.
       </p>
     </section>
+
+    <footer class="app-footer">
+      tac•tus is an independent open-source project, not affiliated with Ableton AG. Ableton&reg; and Link&trade; are trademarks of Ableton AG.
+    </footer>
   </main>
 
   <script src="/app.js"></script>

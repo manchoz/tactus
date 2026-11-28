@@ -1,8 +1,8 @@
 # Third-Party Notices & Source Availability
 
-This Tactus release bundle combines the following components:
+This tac•tus release bundle combines the following components:
 
-1. **Tactus (`tactusd`, `system/`, installers)**
+1. **tac•tus (`tactusd`, `system/`, installers)**
    - **License:** Mozilla Public License 2.0 (`MPL-2.0`) — see `LICENSE`.
    - **Source:** https://github.com/manchoz/tactus
 
@@ -22,3 +22,9 @@ This Tactus release bundle combines the following components:
 
 5. **Offline Debian Trixie `arm64` Packages (`debs/arm64/`)**
    - Unmodified Debian 13 (`trixie`) `arm64` packages (`hostapd`, `dnsmasq`, `iw`, and runtime dependencies) downloaded from `deb.debian.org` under their respective upstream open-source licenses. Source packages are available via `apt-get source` on Debian Trixie (`https://deb.debian.org/debian`).
+
+## Trademarks & Non-Affiliation Disclaimer
+
+**tac•tus** is an independent open-source project and is not affiliated, associated, authorized, endorsed by, or in any way officially connected with **Ableton AG** (<https://www.ableton.com>), **Arduino**, or any of their subsidiaries or affiliates.
+
+**Ableton®** and **Link™** (*Ableton Link*) are trademarks of Ableton AG. All other product names, logos, and brands—including **Arduino®**, **MIDI®**, **Apple®**, **iPad®**, **iPhone®**, **iOS**, **macOS®**, **Safari®**, **Bonjour®**, **Android™**, and **CME WIDI**—are the property of their respective owners and are used solely to identify technical compatibility.

@@ -15,6 +15,7 @@
     document.querySelector('meta[name="tactus-ui-hash"]')?.getAttribute("content") || "";
 
   const els = {
+    brandDot: document.getElementById("brand-dot"),
     connPill: document.getElementById("conn-pill"),
     peersPill: document.getElementById("peers-pill"),
     transportBadge: document.getElementById("transport-badge"),
@@ -468,6 +469,12 @@
         cell.classList.toggle("active", i === activeIdx);
         cell.classList.toggle("downbeat", i === 0 && activeIdx === 0);
       }
+      if (els.brandDot) {
+        els.brandDot.classList.toggle(
+          "downbeat",
+          activeIdx === 0 && Boolean(latestState?.telemetry?.is_playing)
+        );
+      }
       lastActiveBeatIdx = activeIdx;
     }
     const progress = Math.max(0, Math.min(1, phase / phaseClock.quantum));
@@ -504,6 +511,9 @@
     }
     if (invalidate) {
       phaseClock.valid = false;
+      if (els.brandDot) {
+        els.brandDot.classList.remove("downbeat");
+      }
     }
   }
 
@@ -778,7 +788,7 @@
     const isLinkToMidi = t.direction === "link_to_midi";
 
     if (isLinkToMidi) {
-      els.lockBadge.textContent = "LINK MASTER";
+      els.lockBadge.textContent = "LINK CLOCK";
       els.lockBadge.className = "badge badge-master";
       els.bpmBtn.classList.add("editable");
       els.bpmBtn.classList.remove("readonly");
@@ -825,6 +835,9 @@
     els.playStopBtn.textContent = t.is_playing ? "Stop" : "Play";
     els.playStopBtn.classList.toggle("playing", Boolean(t.is_playing));
     els.playStopBtn.setAttribute("aria-pressed", String(Boolean(t.is_playing)));
+    if (els.brandDot && !t.is_playing) {
+      els.brandDot.classList.remove("downbeat");
+    }
 
     els.startStopToggle.setAttribute("aria-checked", String(Boolean(t.start_stop_sync)));
     els.clockThruBlock.classList.toggle("hidden", isLinkToMidi);

@@ -1,4 +1,4 @@
-# AGENTS.md — Tactus
+# AGENTS.md — tac•tus
 
 ## Project Identity & Stack
 - **Appliance:** `tactusd` (`tactus.local`) — standalone Linux SBC USB/BLE-MIDI ↔ Ableton Link bridge over a dedicated WiFi AP (PoC: Arduino UNO Q, stock Debian 13 `trixie`; future Yocto `meta-tactus`).
@@ -34,12 +34,13 @@ bash -n system/scripts/*.sh && shellcheck system/scripts/*.sh system/kernel/*.sh
 - **Always** assume `/` is read-only: write persistent state ONLY to `/var/lib/tactus/config.toml` (atomic temp + `fsync` + `rename`); put logs/sockets in `tmpfs`.
 - **Never** remove/disable `NetworkManager`; decouple `tactusd.service` from `tactus-ap.service` (`Wants=` only, no `After=`).
 - **Never** route 24 PPQN MIDI Clock over `/var/run/arduino-router.sock`; send only low-rate telemetry (`tactus/downbeat` guarded by `cur_beat == 0`, `tactus/beat`, discrete state) and debounced inputs.
+- **Branding & Trademarks:** Use lowercase **`tac•tus`** (`•` U+2022) in user-facing docs, Web UI, PWA manifest, and banners; keep code, crates, CLI, hostnames (`tactus.local`), WiFi SSID (`Tactus`), and systemd units plain ASCII. Refer to `"Ableton Link"` / `"Ableton Live"` (never standalone `"Ableton"` as a noun), use `LINK CLOCK` (not `LINK MASTER`), phrase compatibility nominatively (`"for Ableton Link"`), and preserve the non-affiliation disclaimer & `Ableton®`/`Link™` notices in `README.md`, `system/release/THIRD_PARTY_NOTICES.md`, `system/release/INSTALL.md`, and the Web UI footer.
 - **Hardware safety (live board):** Never chain disruptive commands (`reboot`, boot/`loader.conf`, AP restarts) after fallible steps with `;` (use `&&` or separate commands); create a rollback and keep SSH/serial access before editing boot/AP config; ask before rebooting a live session.
 
 ## On-Demand Skills & Reference Index
 - **Specs:** `SPEC.md` (algorithms/API/config), `ARCHITECTURE.md` (threading/boot), `MILESTONES.md` (status).
 - Use `/rt-midi-engine` (`.agents/skills/rt-midi-engine/SKILL.md`) when editing RT sync, ALSA RawMIDI, clock bridging, `rtrb`, or Tokio `AsyncFd`.
 - Use `/ap-networking-systemd` (`.agents/skills/ap-networking-systemd/SKILL.md`) when editing WiFi AP, `systemd`, `hostapd`, `dnsmasq`, `avahi`, `NetworkManager`, or `status_led.rs`.
-- Use `/web-ui-pwa` (`.agents/skills/web-ui-pwa/SKILL.md`) when editing `crates/tactusd/web/` or `crates/tactusd/src/web.rs`.
+- Use `/web-ui-pwa` (`.agents/skills/web-ui-pwa/SKILL.md`) when editing `crates/tactusd/web/`, `crates/tactusd/src/web.rs`, or brand/screenshot assets in `docs/images/`.
 - Use `/unoq-ops` (`.agents/skills/unoq-ops/SKILL.md`) for UNO Q SSH/ADB, factory provisioning, deploying `tactusd`, or flashing `mcu/tactus-zephyr`.
 - Use `/crate-release` (`.agents/skills/crate-release/SKILL.md`) when releasing crates to crates.io.

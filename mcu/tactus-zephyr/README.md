@@ -90,7 +90,7 @@ Field encodings:
 
 ### Option A: Automated Host Compile + SSH OpenOCD *(Recommended & Yocto-Aligned)*
 
-Tactus disables stock `/etc/avahi/services/arduino.service` (`_arduino._tcp`) when trimming boards and relies on SSH key auth rather than password auth. The [flash-mcu-unoq.sh](../../system/scripts/flash-mcu-unoq.sh) helper compiles locally on the host with `arduino-cli compile -e`, pushes Tactus's portable OpenOCD configs ([unoq-gpiod.cfg](../../system/openocd/unoq-gpiod.cfg) + [unoq-flash-sketch.cfg](../../system/openocd/unoq-flash-sketch.cfg)) along with the exported `.elf-zsk.bin` (and host Zephyr loader ELF when present) over SSH, and flashes via `openocd` (`linuxgpiod`) — requiring **zero** `arduino-cli` or `.arduino15` installation on the board and mapping 1:1 to future Yocto `meta-tactus` firmware sync:
+tac•tus disables stock `/etc/avahi/services/arduino.service` (`_arduino._tcp`) when trimming boards and relies on SSH key auth rather than password auth. The [flash-mcu-unoq.sh](../../system/scripts/flash-mcu-unoq.sh) helper compiles locally on the host with `arduino-cli compile -e`, pushes tac•tus's portable OpenOCD configs ([unoq-gpiod.cfg](../../system/openocd/unoq-gpiod.cfg) + [unoq-flash-sketch.cfg](../../system/openocd/unoq-flash-sketch.cfg)) along with the exported `.elf-zsk.bin` (and host Zephyr loader ELF when present) over SSH, and flashes via `openocd` (`linuxgpiod`) — requiring **zero** `arduino-cli` or `.arduino15` installation on the board and mapping 1:1 to future Yocto `meta-tactus` firmware sync:
 
 ```bash
 # Compile locally and flash over SSH (uses ~/.ssh/config `tactus` host by default)

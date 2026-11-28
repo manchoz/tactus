@@ -1,7 +1,7 @@
 {
-  "name": "Tactus",
-  "short_name": "Tactus",
-  "description": "Ableton Link and MIDI Clock hardware bridge",
+  "name": "tac•tus",
+  "short_name": "tac•tus",
+  "description": "MIDI Clock hardware bridge for Ableton Link",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#0d0f14",

@@ -1,4 +1,4 @@
-# SPEC.md — Tactus Technical Specification
+# SPEC.md — tac•tus Technical Specification
 
 ## 1. Scope & Roadmap Phases
 - **v1 (PoC — Current Target):** Stock Debian on a Linux SBC (reference board: Arduino UNO Q), class-compliant USB-MIDI / BLE-MIDI (e.g., CME WIDI Uhost) over USB Host, dedicated WiFi AP, Rust `tactusd` bidirectional sync engine, mobile-first Web UI ("Add to Home Screen" on iOS/Android), optional MCU LED matrix heartbeat via `arduino-router`.

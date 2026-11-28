@@ -1,4 +1,4 @@
-# Tactus — Development & Source Provisioning Guide
+# tac•tus — Development & Source Provisioning Guide
 
 For end-user setup, Web UI instructions, and hardware status legends, see the [End-User Manual (README.md)](README.md).
 

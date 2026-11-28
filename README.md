@@ -1,16 +1,18 @@
-# Tactus
+<p align="center">
+  <img src="docs/images/banner.png" alt="tac•tus — MIDI Clock Hardware Bridge for Ableton Link" width="100%">
+</p>
 
-**Tactus** is a standalone hardware sync box that connects **Ableton Link** apps (on iPad, iPhone, Mac, or PC) with **USB-MIDI and BLE-MIDI hardware** (synthesizers, drum machines, sequencers, or USB BLE-MIDI adapters like the CME WIDI Uhost) over its own built-in WiFi Access Point — no computer or external router required.
+**tac•tus** is a standalone hardware sync box that connects **Ableton Link** apps (on iPad, iPhone, Mac, or PC) with **USB-MIDI and BLE-MIDI hardware** (synthesizers, drum machines, sequencers, or USB BLE-MIDI adapters like the CME WIDI Uhost) over its own built-in WiFi Access Point — no computer or external router required.
 
 - **Bidirectional Sync:** Run **Link → MIDI** (Ableton Link sets the tempo and drives your MIDI hardware) or **MIDI → Link** (a hardware drum machine or sequencer drives Ableton Link smoothly without tempo jitter).
-- **Up to 8 MIDI Outputs + Hotplug:** Plug in USB-MIDI hubs or multiple instruments anytime; Tactus remembers your selected ports, attaches them automatically, and can relay incoming MIDI clock (`MIDI Clock Thru`) with built-in loop protection.
+- **Up to 8 MIDI Outputs + Hotplug:** Plug in USB-MIDI hubs or multiple instruments anytime; tac•tus remembers your selected ports, attaches them automatically, and can relay incoming MIDI clock (`MIDI Clock Thru`) with built-in loop protection.
 - **Built-In WiFi Access Point:** Broadcasts the `Tactus` network (5 GHz channel `36` with automatic 2.4 GHz channel `11` fallback) without a captive portal, so your phone or iPad keeps using cellular data. Ethernet is also supported.
 - **Mobile Web App:** Control tempo, direction, latency offset, and MIDI routing from any browser at `http://tactus.local`, or save it to your iOS/Android Home Screen as a fullscreen app.
 - **At-a-Glance Hardware Feedback:** On the Arduino UNO Q, the onboard RGB `LED1` and optional 8×13 LED matrix + `LED3` show connection, sync direction, lock state, and beat/downbeat pulses.
 
 ```mermaid
 flowchart LR
-  Link["Ableton Link Apps (iPad / Mac / PC)"] <-->|"WiFi AP or Ethernet"| Tactus["Tactus Box (UNO Q)"]
+  Link["Ableton Link Apps (iPad / Mac / PC)"] <-->|"WiFi AP or Ethernet"| Tactus["tac•tus Box (UNO Q)"]
   Phone["Phone / Tablet Browser (http://tactus.local)"] -.->|"Web UI & Live Telemetry"| Tactus
   Tactus <-->|"USB-MIDI / BLE-MIDI (Up to 8 Outputs, 1 Input)"| Gear["Hardware Synths & Drum Machines"]
 ```
@@ -29,7 +31,7 @@ flowchart LR
   - **Debian / Ubuntu:** `sudo apt-get install -y adb`
   - **Windows:** `winget install Google.PlatformTools`
 
-### Step 1: Install Tactus (Offline Turnkey Installer)
+### Step 1: Install tac•tus (Offline Turnkey Installer)
 
 Download `tactus-<version>-unoq-arm64.tar.gz` (macOS/Linux) or `tactus-<version>-unoq-arm64.zip` (Windows) from [GitHub Releases](https://github.com/manchoz/tactus/releases), extract it, connect your UNO Q via USB-C, and run the guided installer from the extracted folder:
 
@@ -49,7 +51,7 @@ See [system/release/INSTALL.md](system/release/INSTALL.md) for unattended/advanc
 
 ### Step 2: Connect MIDI Gear & Join the `Tactus` Network
 
-1. Plug your USB-MIDI interface, synth, or BLE-MIDI host adapter into the UNO Q USB host port (Tactus detects class-compliant MIDI devices automatically).
+1. Plug your USB-MIDI interface, synth, or BLE-MIDI host adapter into the UNO Q USB host port (tac•tus detects class-compliant MIDI devices automatically).
 2. On your phone, tablet, or computer, join the **`Tactus`** WiFi network using your passphrase (default: **`tactus-link`**).
    - *Tip:* The `Tactus` network does not intercept internet traffic, so iOS and Android keep cellular data active while connected. You can also connect via Ethernet on your local network.
 
@@ -57,7 +59,7 @@ See [system/release/INSTALL.md](system/release/INSTALL.md) for unattended/advanc
 
 Open **`http://tactus.local`** (or **`http://10.42.0.1`**) in your browser.
 
-- **iOS Home Screen App:** In Safari, tap **Share → Add to Home Screen** to launch Tactus as a fullscreen app with automatic reconnect when you wake your phone.
+- **iOS Home Screen App:** In Safari, tap **Share → Add to Home Screen** to launch tac•tus as a fullscreen app with automatic reconnect when you wake your phone.
 
 ---
 
@@ -65,9 +67,9 @@ Open **`http://tactus.local`** (or **`http://10.42.0.1`**) in your browser.
 
 <table>
   <tr>
-    <td align="center"><img src="docs/images/ui-link-to-midi.png" alt="Tactus Web UI in Link to MIDI mode" width="260"></td>
-    <td align="center"><img src="docs/images/ui-midi-to-link.png" alt="Tactus Web UI in MIDI to Link mode with live estimator diagnostics" width="260"></td>
-    <td align="center"><img src="docs/images/ui-midi-ports.png" alt="Tactus Web UI Sync Parameters and multi-output MIDI Ports" width="260"></td>
+    <td align="center"><img src="docs/images/ui-link-to-midi.png" alt="tac•tus Web UI in Link to MIDI mode" width="260"></td>
+    <td align="center"><img src="docs/images/ui-midi-to-link.png" alt="tac•tus Web UI in MIDI to Link mode with live estimator diagnostics" width="260"></td>
+    <td align="center"><img src="docs/images/ui-midi-ports.png" alt="tac•tus Web UI Sync Parameters and multi-output MIDI Ports" width="260"></td>
   </tr>
   <tr>
     <td align="center"><sub><strong>Link &rarr; MIDI</strong><br>Tempo nudge, beat strip &amp; transport</sub></td>
@@ -84,7 +86,7 @@ Open **`http://tactus.local`** (or **`http://10.42.0.1`**) in your browser.
 ### Tempo, Beat Strip & Transport
 
 - **Status Badges:** Shows `PLAYING` or `STOPPED`, plus the sync state:
-  - In **Link → MIDI:** `LINK MASTER`
+  - In **Link → MIDI:** `LINK CLOCK`
   - In **MIDI → Link:** `UNLOCKED` (waiting for incoming MIDI clock), `ACQUIRING` (measuring incoming tempo), or `LOCKED` (tracking hardware tempo and phase)
 - **BPM & Nudge:**
   - In **Link → MIDI:** Tap the BPM readout to type an exact tempo (`20.0–300.0`, `0.1` BPM steps), or use **`-1`**, **`-0.5`**, **`+0.5`**, and **`+1`** to nudge tempo live.
@@ -95,33 +97,33 @@ Open **`http://tactus.local`** (or **`http://10.42.0.1`**) in your browser.
 
 ### Sync Direction
 
-- **`Link → MIDI`:** Ableton Link apps set the tempo and transport; Tactus generates steady 24 PPQN MIDI Clock (`0xF8`) for your hardware.
-- **`MIDI → Link`:** Incoming MIDI Clock from your selected `MIDI Input` drives Ableton Link. Tactus smooths hardware jitter over a dual-window tracker, detects deliberate tempo changes automatically, nudges phase gently (`≤ 1 ms` per beat), and returns to `UNLOCKED` if clock stops for `500 ms`.
+- **`Link → MIDI`:** Ableton Link apps set the tempo and transport; tac•tus generates steady 24 PPQN MIDI Clock (`0xF8`) for your hardware.
+- **`MIDI → Link`:** Incoming MIDI Clock from your selected `MIDI Input` drives Ableton Link. tac•tus smooths hardware jitter over a dual-window tracker, detects deliberate tempo changes automatically, nudges phase gently (`≤ 1 ms` per beat), and returns to `UNLOCKED` if clock stops for `500 ms`.
 
 ### Sync Parameters
 
 - **`Start / Stop Sync`:** When on, MIDI Start (`0xFA`) and Stop (`0xFC`) follow transport state. Turn off to send/track continuous `0xF8` MIDI Clock only.
-- **`MIDI Clock Thru`** *(shown in `MIDI → Link`)*: Relays incoming MIDI clock and transport directly to your selected MIDI outputs so secondary hardware stays tight with your master clock. Tactus automatically blocks feedback loops back to the active input port.
+- **`MIDI Clock Thru`** *(shown in `MIDI → Link`)*: Relays incoming MIDI clock and transport directly to your selected MIDI outputs so secondary hardware stays tight with your master clock. tac•tus automatically blocks feedback loops back to the active input port.
 - **`Round BPM to Integer`** *(shown in `MIDI → Link`)*: Snaps the tempo committed to Ableton Link to the nearest whole BPM (for example `120.0`) while keeping the unrounded measurement visible in diagnostics.
 - **`MIDI Latency Offset`:** Shifts MIDI timing between **`-50.0 ms`** and **`+50.0 ms`** (`0.5 ms` steps, plus a **`0 ms`** reset button) to compensate for audio interface or synth latency in either direction.
 - **`Bar Quantum`:** Choose **`3`**, **`4`**, **`6`**, or **`8`** beats per bar for downbeat alignment and visual beat strips.
 
 ### MIDI Ports
 
-- **`MIDI Input`:** Select the single hardware port Tactus listens to in `MIDI → Link` mode.
+- **`MIDI Input`:** Select the single hardware port tac•tus listens to in `MIDI → Link` mode.
 - **`MIDI Outputs`:** Toggle up to **8** simultaneous MIDI output ports. Each row shows a live status tag (`Active`, `Relay`, `Idle`, `IN · loop blocked`, `Attaching`, `Max 8`, or `Waiting` when unplugged).
 - **Hotplug & Remembered Rules:** Unplugged devices stay remembered so they re-attach automatically when reconnected, or you can click **`Remove`** to forget an unplugged port.
 
 ### Typical Setups
 
-1. **Hardware Synths Following Ableton / iPad (`Link → MIDI`):**
+1. **Hardware Synths Following Ableton Live / iPad (`Link → MIDI`):**
    - Set Sync Direction to **`Link → MIDI`**.
    - Enable the synths or interfaces you want to clock under **`MIDI Outputs`**.
    - Open your Ableton Link app on the `Tactus` WiFi network — its tempo and Play/Stop state now drive your hardware. Adjust **`MIDI Latency Offset`** if your audio path feels slightly early or late.
-2. **Ableton / iPad + Secondary Gear Following a Hardware Drum Machine (`MIDI → Link`):**
+2. **Ableton Live / iPad + Secondary Gear Following a Hardware Drum Machine (`MIDI → Link`):**
    - Set Sync Direction to **`MIDI → Link`**.
    - Choose your drum machine under **`MIDI Input`**.
-   - Enable **`MIDI Clock Thru`** and select any additional synths under **`MIDI Outputs`** (even if your drum machine appears as both input and output, Tactus blocks the loopback automatically).
+   - Enable **`MIDI Clock Thru`** and select any additional synths under **`MIDI Outputs`** (even if your drum machine appears as both input and output, tac•tus blocks the loopback automatically).
    - Press Play on your drum machine — once the badge reads **`LOCKED`**, your Link apps and secondary synths lock to the groove.
 
 ---
@@ -175,6 +177,12 @@ Installed automatically by the turnkey installer (unless `--skip-mcu` is passed)
 
 ## License
 
-Tactus original source code is licensed under the **Mozilla Public License 2.0 (`MPL-2.0`)** without Exhibit B incompatibility — see [LICENSE](LICENSE) and [Cargo.toml](Cargo.toml).
+tac•tus original source code is licensed under the **Mozilla Public License 2.0 (`MPL-2.0`)** without Exhibit B incompatibility — see [LICENSE](LICENSE) and [Cargo.toml](Cargo.toml).
 
-Tactus links against official [`Ableton/link`](vendor/ableton-link/LICENSE.md), which is licensed under **`GPL-2.0-or-later`** (with a commercial licensing option from Ableton AG). Under MPL-2.0 §3.3 (*Larger Work*), compiled `tactusd` binaries and appliance images incorporating open-source `Ableton/link` are distributed under **`GPL-2.0-or-later`**, while Tactus's own source files remain available under `MPL-2.0`.
+tac•tus links against official [`Ableton/link`](vendor/ableton-link/LICENSE.md), which is licensed under **`GPL-2.0-or-later`** (with a commercial licensing option from Ableton AG). Under MPL-2.0 §3.3 (*Larger Work*), compiled `tactusd` binaries and appliance images incorporating open-source `Ableton/link` are distributed under **`GPL-2.0-or-later`**, while tac•tus's own source files remain available under `MPL-2.0`.
+
+## Trademarks & Disclaimer
+
+**tac•tus** is an independent open-source project and is not affiliated, associated, authorized, endorsed by, or in any way officially connected with **Ableton AG** (<https://www.ableton.com>) or any of its subsidiaries or affiliates.
+
+**Ableton®** and **Link™** (*Ableton Link*) are trademarks of Ableton AG. All other product names, logos, and brands mentioned in this repository—including **Arduino®**, **MIDI®**, **Apple®**, **iPad®**, **iPhone®**, **iOS**, **macOS®**, **Safari®**, **Bonjour®**, **Android™**, and **CME WIDI**—are the property of their respective owners and are used solely to identify technical compatibility.

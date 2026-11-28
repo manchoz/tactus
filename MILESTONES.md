@@ -1,4 +1,4 @@
-# MILESTONES.md — Tactus PoC Execution Plan
+# MILESTONES.md — tac•tus PoC Execution Plan
 
 ## M0 — Workspace & Offline-Safe `abl_link` Build
 - **Deliverables:**
