@@ -6,3 +6,6 @@ license.workspace = true
 
 [dependencies]
 tactus-protocol = { path = "../tactus-protocol" }
+
+[lints]
+workspace = true

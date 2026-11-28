@@ -1,37 +1,45 @@
 # AGENTS.md — Tactus
 
-## Project Identity
-**Tactus** is a standalone embedded appliance (running on a Linux SBC; PoC reference board: Arduino UNO Q) that bridges USB-MIDI / BLE-MIDI and Ableton Link over a dedicated WiFi Access Point.
+## Project Identity & Stack
+- **Appliance:** `tactusd` (`tactus.local`) — standalone Linux SBC USB/BLE-MIDI ↔ Ableton Link bridge over a dedicated WiFi AP (PoC: Arduino UNO Q, stock Debian 13 `trixie`; future Yocto `meta-tactus`).
+- **Stack:** Rust 2021 workspace + C++17 `abl_link` FFI (`vendor/ableton-link`), `tokio` async control plane (`axum`, `arduino-router`), lock-free `rtrb` SPSC rings to a userspace RT thread.
+- **Paths:** Config `/var/lib/tactus/config.toml` (`--config` / `TACTUS_CONFIG`), volatile runtime `/run/tactus/` (`tmpfs`).
 
-- **Daemon:** `tactusd`
-- **Hostname mDNS:** `tactus.local`
-- **Config path:** `/var/lib/tactus/config.toml` (override via `--config` or `TACTUS_CONFIG`)
-- **Runtime path:** `/run/tactus/` (`tmpfs`)
-- **Future Yocto layer:** `meta-tactus`
+## Build, Test & Lint Commands
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo zigbuild --workspace --release --target aarch64-unknown-linux-gnu.2.36
+# When editing Web UI or system scripts:
+node --check crates/tactusd/web/app.js
+bash -n system/scripts/*.sh && shellcheck system/scripts/*.sh system/kernel/*.sh
+```
+*(Zero warnings required; `cargo zigbuild` is mandatory for Linux-gated changes because macOS `clippy` skips `#[cfg(target_os = "linux")]`.)*
 
-## Non-Negotiable Architectural Invariants
-1. **No `PREEMPT_RT`, no PipeWire:** Target stock Debian Linux (and future Yocto QLI). Achieve MIDI timing determinism strictly in userspace (`SCHED_FIFO`, `mlockall`, `CLOCK_MONOTONIC` absolute timers, core affinity).
-   - **MIDI I/O:** Stock Linux SBC kernels (such as UNO Q `7.2.11-arduino1+`) may lack `CONFIG_SND_SEQUENCER` (no `/dev/snd/seq`); talk directly to **ALSA RawMIDI (`/dev/snd/midiC*D*`)** on stock Debian PoC (keeping `/dev/snd/seq` optional for Yocto `meta-tactus`). RawMIDI subdevice opens are exclusive (`EBUSY`), so before reopening/switching ports the async control plane MUST detach and close prior FDs (`AttachMidi(EMPTY)` → await `FdReturn::Replaced` → `close_fd_set`) before calling `open_ports()`, and publish `selected_midi_input`/`selected_midi_outputs` strictly from actually opened FDs. Multi-output fan-out (`MAX_MIDI_OUTPUTS = 8`) must stay strictly `Copy`/zero-alloc in RT with per-output fault isolation, and `MidiToLink` RT Clock Thru MUST skip `out_fd == in_fd` to prevent clock feedback loops.
-   - **Clock domains:** Official `abl_link` on Linux uses `CLOCK_MONOTONIC_RAW`, whereas `clock_nanosleep(TIMER_ABSTIME)` uses `CLOCK_MONOTONIC`; bridge the two domains explicitly in `tactusd`.
-2. **Strict RT vs. Async Separation:**
-   - Pin non-RT threads (`main`, `tokio`, `abl_link` Asio) off `RT_PREFERRED_CORE` via `pin_non_rt_threads()` *before* spawning `rt-sync` or `tokio`; harden `rt-sync` onto Core `3` (`SCHED_FIFO` 75, `mlockall`) only *after* `AblLinkDriver::new()`. **ZERO** heap allocations, **ZERO** mutexes, **ZERO** blocking I/O, and **ZERO** `tokio` calls inside the RT loop.
-   - Control-plane (`axum` HTTP/WebSocket, config persistence, `arduino-router` RPC) runs on a `tokio` runtime on the remaining cores.
-   - Communication between RT and Async MUST use lock-free SPSC ring buffers (`rtrb`, strictly `Copy` items) or atomics. Never drop `FdReturn` (keep `256`-slot ring + stack `pending_fd_return` retry slot, and drain `fd_ret_rx` before `Shutdown` without spin-waiting). On Linux `tokio 1.54+`, register raw descriptors inside the Tokio runtime via `unsafe { AsyncFd::register_with_interest(...) }` (never deprecated `with_interest`) and call `guard.clear_ready()` after draining `eventfd` to `WouldBlock`.
-3. **Official Ableton Link C API (`abl_link`) Only:** Never implement a pure-Rust Ableton Link protocol. Wrap `Ableton/link`'s `extensions/abl_link` C99 API in `crates/tactus-link-sys`.
-4. **Yocto-Ready & Read-Only Rootfs Ready:**
-   - Never download code or run `git` inside `build.rs`. Support both vendored C++ sources (dev/PoC) and `pkg-config` / `ABL_LINK_LIB_DIR` (Yocto offline BitBake build).
-   - Assume `/` is mounted read-only. Write state ONLY to `/var/lib/tactus/config.toml` via atomic temp-file + `fsync` + `rename`. Logs and sockets go exclusively to `tmpfs` (`/run/tactus/` or `journald` volatile).
-   - Keep `Cargo.toml` dependencies lean to simplify BitBake `cargo vendor` packaging.
-5. **NetworkManager Coexistence, Boot Decoupling & Discovery:** Never remove or disable `NetworkManager`. Exclude `wlan0` and `p2p-dev-wlan0` via `/etc/NetworkManager/conf.d/99-tactus-unmanaged.conf` and manage the dedicated WiFi AP with `hostapd` (`tactus-ap.service`, default 5 GHz non-DFS ch `36` (`20 MHz` VHT, needs the custom UNO Q kernel from `system/kernel/tactus-5ghz.config` so `NO-IR` is cleared) with automatic fallback to `tactus-ap-2g.conf` (2.4 GHz ch `11`, `20 MHz`, clear of BLE advertising channels) via the `tactus-ap.service` `ExecStartPre` selector whenever 5 GHz ch `36` still reports `no IR`; bound to `sys-subsystem-net-devices-wlan0.device`, ordered after `systemd-rfkill.service`, and using `Upholds=tactus-dhcp.service` — never `Wants=` alongside `BindsTo=`, which causes a restart storm) + independently supervised foreground `dnsmasq` (`tactus-dhcp.service`, `BindsTo=tactus-ap.service`, omitting DHCP options 3 & 6) + IPv4-only `avahi-daemon` (`use-ipv6=no` in `/etc/avahi/avahi-daemon.conf`, announcing `tactus.local`, `_tactus._tcp`, and `_http._tcp`; stock `arduino.service` disabled when trimmed). Keep `tactusd.service` decoupled from `tactus-ap.service` (`Wants=` only, no `After=`) so MIDI/Link sync starts immediately at boot.
-6. **MCU Bridge Boundary (`Arduino_RouterBridge`) & Linux `LED1` Status:** Never route 24 PPQN MIDI Clock over `/var/run/arduino-router.sock`. Use `Bridge.notify()` (MessagePack-RPC) strictly for low-rate telemetry (bar-downbeat `tactus/downbeat` guarded by `cur_beat == 0`, integer beat `tactus/beat`, discrete BPM/state changes) and debounced physical input events. Drive Linux `LED1` (`/sys/class/leds/unoq:user-{red,green,blue}1`) exclusively on the async `tokio` control plane (`status_led.rs`), yielding whenever any per-service `/run/tactus/fault.<unit>.service` sentinel exists (written by `OnFailure=tactus-led-fault@%n.service`) and clearing stale `[timer]` triggers after transient faults.
-7. **Embedded Web UI Cache-Busting & Low-Latency Metronome (iOS Home Screen):** Standalone iOS Home Screen web apps keep an isolated WebKit cache and stay suspended across daemon upgrades. Always serve `/`, `/style.css`, `/app.js`, and `/manifest.webmanifest` with `Cache-Control: no-store, no-cache, must-revalidate`, `Pragma: no-cache`, and `Expires: 0`, hash **all** embedded assets (including `icon.svg` and `apple-touch-icon.png`) in `ui_asset_hash()`, version `/style.css`, `/app.js`, `/manifest.webmanifest`, and icon URLs (in both `index.html` and rendered `/manifest.webmanifest`) with `?v=<ui_hash>`, and preserve the `sessionStorage`-guarded `/healthz` `ui_hash` auto-reload in `app.js`. To keep all beats (not only Beat 1) tightly synced, wake `rt_notify_tx` on every integer beat crossing (`beat_index`), discrete state change, and `10 Hz` heartbeat (never 24 PPQN), keep `TCP_NODELAY` enabled on `axum` (`ListenerExt::tap_io`), and drive the UI phase bar via `requestAnimationFrame` + GPU `transform: scaleX(...)` with `0 ms` attack on `.beat-cell.active`.
+## Directory Map
+- `crates/tactus-sync-core/` — Pure-Rust, zero-alloc, OS-independent sync engine & deterministic simulations.
+- `crates/tactus-protocol/` — Shared `EngineCommand`, `Copy` RT messages, `AppState`, `TactusConfig`.
+- `crates/tactus-link-sys/` — Offline-safe `build.rs` + C99 FFI wrappers for `vendor/ableton-link`.
+- `crates/tactusd/` — Daemon binary (`src/` RT/MIDI/control/web/MCU/LED, `web/` embedded mobile PWA).
+- `mcu/tactus-zephyr/` — Optional STM32U585 Zephyr sketch (`Arduino_RouterBridge` LED matrix).
+- `system/` — `systemd/`, `hostapd/`, `dnsmasq/`, `avahi/`, `NetworkManager/`, `kernel/`, `scripts/`.
+- `vendor/ableton-link/` — Pinned `Ableton/link` submodule (`Link-4.1.1`).
 
-## Hardware Safety Rules (UNO Q / any live board)
-- Never chain a disruptive command (`reboot`, `systemctl reboot`, kernel/boot/`loader.conf` changes, AP/WiFi restarts) after a fallible step with `;` — gate it with `&&`, or run it as its own command after checking the previous result.
-- Before touching boot config or the AP, create a rollback first (backup file, systemd-boot boot counting, or a timed `systemd-run` restore) and keep a way in (Ethernet SSH or serial console).
-- Ask the user before rebooting or power-cycling a board that is serving a live session.
+## Non-Negotiable Invariants
+- **Never** require `PREEMPT_RT` or PipeWire; achieve timing determinism strictly in userspace (`SCHED_FIFO`, `mlockall`, `CLOCK_MONOTONIC`, core affinity).
+- **Never** allocate, lock a mutex, block on I/O, or call `tokio` inside the RT sync thread (`rt-sync`).
+- **Never** implement a pure-Rust Ableton Link protocol; wrap official `abl_link` C99 API in `crates/tactus-link-sys`.
+- **Never** download code or run `git` in `build.rs`; support both vendored C++ and `pkg-config`/`ABL_LINK_LIB_DIR` for Yocto offline builds, and keep `Cargo.toml` deps lean.
+- **Always** assume `/` is read-only: write persistent state ONLY to `/var/lib/tactus/config.toml` (atomic temp + `fsync` + `rename`); put logs/sockets in `tmpfs`.
+- **Never** remove/disable `NetworkManager`; decouple `tactusd.service` from `tactus-ap.service` (`Wants=` only, no `After=`).
+- **Never** route 24 PPQN MIDI Clock over `/var/run/arduino-router.sock`; send only low-rate telemetry (`tactus/downbeat` guarded by `cur_beat == 0`, `tactus/beat`, discrete state) and debounced inputs.
+- **Hardware safety (live board):** Never chain disruptive commands (`reboot`, boot/`loader.conf`, AP restarts) after fallible steps with `;` (use `&&` or separate commands); create a rollback and keep SSH/serial access before editing boot/AP config; ask before rebooting a live session.
 
-## Build & Verification Rules
-- Pure sync logic (`tactus-sync-core`) MUST compile and pass deterministic unit/simulation tests on the host (`macOS` / `x86_64` / `aarch64`) without ALSA or Link hardware attached.
-- Cross-compile target: `aarch64-unknown-linux-gnu` (reference Debian 13 `trixie` Linux SBC, glibc `2.41`; on macOS build via `cargo zigbuild --workspace --target aarch64-unknown-linux-gnu.2.36`).
-- Before closing any milestone or Linux-gated change, run `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `cargo zigbuild --workspace --release --target aarch64-unknown-linux-gnu.2.36` with **zero warnings** (host macOS clippy does not compile `#[cfg(target_os = "linux")]` blocks), plus `node --check crates/tactusd/web/app.js` and `bash -n system/scripts/*.sh` when editing Web UI or system scripts.
+## On-Demand Skills & Reference Index
+- **Specs:** `SPEC.md` (algorithms/API/config), `ARCHITECTURE.md` (threading/boot), `MILESTONES.md` (status).
+- Use `/rt-midi-engine` (`.agents/skills/rt-midi-engine/SKILL.md`) when editing RT sync, ALSA RawMIDI, clock bridging, `rtrb`, or Tokio `AsyncFd`.
+- Use `/ap-networking-systemd` (`.agents/skills/ap-networking-systemd/SKILL.md`) when editing WiFi AP, `systemd`, `hostapd`, `dnsmasq`, `avahi`, `NetworkManager`, or `status_led.rs`.
+- Use `/web-ui-pwa` (`.agents/skills/web-ui-pwa/SKILL.md`) when editing `crates/tactusd/web/` or `crates/tactusd/src/web.rs`.
+- Use `/unoq-ops` (`.agents/skills/unoq-ops/SKILL.md`) for UNO Q SSH/ADB, factory provisioning, deploying `tactusd`, or flashing `mcu/tactus-zephyr`.
+- Use `/crate-release` (`.agents/skills/crate-release/SKILL.md`) when releasing crates to crates.io.

@@ -654,6 +654,8 @@ mod tests {
             assert!(h_lower.contains(ctype_sub), "{path} type: {h}");
             if expect_no_store {
                 assert!(h_lower.contains("no-store"), "{path} cache: {h}");
+                assert!(h_lower.contains("pragma: no-cache"), "{path} pragma: {h}");
+                assert!(h_lower.contains("expires: 0"), "{path} expires: {h}");
             }
             assert!(!b.is_empty(), "{path} empty");
             if path == manifest_versioned {
@@ -764,5 +766,36 @@ mod tests {
         drop(ws);
         let _ = srv.shutdown_tx.send(true);
         srv.handle.await.expect("server shutdown join");
+    }
+
+    #[test]
+    fn ui_asset_hash_covers_every_file_in_web_dir() {
+        let web_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&web_dir)
+            .expect("read crates/tactusd/web")
+            .map(|entry| {
+                entry
+                    .expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        on_disk.sort();
+
+        // Every file in `crates/tactusd/web/` MUST be embedded and hashed in `ui_asset_hash()`.
+        let mut expected = vec![
+            "app.js".to_string(),
+            "apple-touch-icon.png".to_string(),
+            "icon.svg".to_string(),
+            "index.html".to_string(),
+            "manifest.webmanifest".to_string(),
+            "style.css".to_string(),
+        ];
+        expected.sort();
+        assert_eq!(
+            on_disk, expected,
+            "new asset added to crates/tactusd/web/ must be embedded and hashed in ui_asset_hash()"
+        );
     }
 }

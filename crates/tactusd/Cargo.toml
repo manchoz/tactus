@@ -15,3 +15,6 @@ tactus-protocol = { path = "../tactus-protocol" }
 tactus-sync-core = { path = "../tactus-sync-core" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
 toml.workspace = true
+
+[lints]
+workspace = true

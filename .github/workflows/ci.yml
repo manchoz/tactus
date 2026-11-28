@@ -35,12 +35,20 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace
 
+      - name: Check architectural invariants
+        run: ./system/scripts/check-invariants.sh
+
+      - name: Check dependencies and licenses (cargo-deny)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
       - name: Check embedded Web UI JavaScript syntax
         run: node --check crates/tactusd/web/app.js
 
       - name: Check provisioning script syntax and lint
         run: |
-          bash -n system/scripts/provision-debian.sh system/scripts/provision-factory-unoq.sh system/scripts/flash-mcu-unoq.sh system/scripts/deploy-tactusd.sh system/scripts/build-unoq-kernel-local.sh system/kernel/build.sh
+          bash -n system/scripts/provision-debian.sh system/scripts/provision-factory-unoq.sh system/scripts/flash-mcu-unoq.sh system/scripts/deploy-tactusd.sh system/scripts/build-unoq-kernel-local.sh system/scripts/check-invariants.sh system/kernel/build.sh
           shellcheck system/scripts/*.sh system/kernel/*.sh
 
   cross-aarch64:
