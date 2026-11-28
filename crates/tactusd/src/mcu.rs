@@ -1,6 +1,6 @@
 //! Optional `Arduino_RouterBridge` MessagePack-RPC Unix-socket client (`MILESTONES.md` M5).
 //!
-//! Enforces `AGENTS.md` Invariant #6: ZERO 24 PPQN MIDI Clock traffic crosses `/var/run/arduino-router.sock`.
+//! Enforces the MCU bridge rate invariant (`AGENTS.md`): ZERO 24 PPQN MIDI Clock traffic crosses `/var/run/arduino-router.sock`.
 //! Emits `tactus/state` only on connect and discrete state/`>= 0.1 BPM` changes, emits `tactus/downbeat`
 //! on bar downbeat wraps while playing, emits `tactus/beat` on non-downbeat integer beat crossings
 //! while playing, and forwards debounced MCU input commands to `ControlHandle`.

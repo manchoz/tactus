@@ -2,7 +2,7 @@
 
 Optional Milestone M5 microcontroller firmware for the Arduino UNO Q STM32U585 (Zephyr OS). It connects to `tactusd` on the Linux MPU via `Arduino_RouterBridge` (`/var/run/arduino-router.sock`) and drives both the onboard 8×13 LED matrix (`0..7`) and the onboard hardware-PWM RGB LED (`LED3_R/G/B`).
 
-> **Rate Boundary (`AGENTS.md` Invariant #6):** Only discrete state changes, integer beat pulses (`tactus/beat`), and bar-downbeat pulses (`tactus/downbeat`) are sent over the router bridge—never 24 PPQN (`0xF8`) MIDI Clock ticks.
+> **Rate Boundary (`AGENTS.md`):** Only discrete state changes, integer beat pulses (`tactus/beat`), and bar-downbeat pulses (`tactus/downbeat`) are sent over the router bridge—never 24 PPQN (`0xF8`) MIDI Clock ticks.
 
 ---
 
@@ -90,7 +90,7 @@ Field encodings:
 
 ### Option A: Automated Host Compile + SSH OpenOCD *(Recommended & Yocto-Aligned)*
 
-Tactus disables stock `/etc/avahi/services/arduino.service` (`_arduino._tcp`) per `AGENTS.md` Invariant #5 and relies on SSH key auth rather than password auth. The [flash-mcu-unoq.sh](../../system/scripts/flash-mcu-unoq.sh) helper compiles locally on the host with `arduino-cli compile -e`, pushes Tactus's portable OpenOCD configs ([unoq-gpiod.cfg](../../system/openocd/unoq-gpiod.cfg) + [unoq-flash-sketch.cfg](../../system/openocd/unoq-flash-sketch.cfg)) along with the exported `.elf-zsk.bin` (and host Zephyr loader ELF when present) over SSH, and flashes via `openocd` (`linuxgpiod`) — requiring **zero** `arduino-cli` or `.arduino15` installation on the board and mapping 1:1 to future Yocto `meta-tactus` firmware sync:
+Tactus disables stock `/etc/avahi/services/arduino.service` (`_arduino._tcp`) when trimming boards and relies on SSH key auth rather than password auth. The [flash-mcu-unoq.sh](../../system/scripts/flash-mcu-unoq.sh) helper compiles locally on the host with `arduino-cli compile -e`, pushes Tactus's portable OpenOCD configs ([unoq-gpiod.cfg](../../system/openocd/unoq-gpiod.cfg) + [unoq-flash-sketch.cfg](../../system/openocd/unoq-flash-sketch.cfg)) along with the exported `.elf-zsk.bin` (and host Zephyr loader ELF when present) over SSH, and flashes via `openocd` (`linuxgpiod`) — requiring **zero** `arduino-cli` or `.arduino15` installation on the board and mapping 1:1 to future Yocto `meta-tactus` firmware sync:
 
 ```bash
 # Compile locally and flash over SSH (uses ~/.ssh/config `tactus` host by default)

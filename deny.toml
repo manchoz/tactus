@@ -14,18 +14,16 @@ allow = [
     "MPL-2.0",
     "MIT",
     "Apache-2.0",
-    "ISC",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "Unicode-3.0",
-    "Zlib",
-    "CC0-1.0",
 ]
 confidence-threshold = 0.8
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

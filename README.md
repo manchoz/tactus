@@ -72,7 +72,7 @@ git submodule update --init --recursive
 
 ### 3. Host Build, Lint, and Test
 
-`tactus-sync-core`, `tactus-protocol`, and `tactus-link-sys` build and pass deterministic tests on the development host (macOS or Linux) without ALSA or Link hardware attached:
+The entire workspace (`tactus-sync-core`, `tactus-protocol`, `tactus-link-sys`, and `tactusd`) builds and passes deterministic tests on the development host (macOS or Linux) without ALSA or Link hardware attached:
 
 ```bash
 # Format check
@@ -83,6 +83,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 # Run all workspace unit, protocol, FFI, and deterministic simulation tests
 cargo test --workspace
+
+# Architectural invariant, Web UI JS, and shell script checks (same as CI)
+./system/scripts/check-invariants.sh
+node --check crates/tactusd/web/app.js
+bash -n system/scripts/*.sh && shellcheck system/scripts/*.sh system/kernel/*.sh
 ```
 
 Run `tactusd` locally on the host (uses defaults if `/var/lib/tactus/config.toml` is missing, or pass `--config <PATH>`):
@@ -169,6 +174,11 @@ A fresh UNO Q image boots with SSH masked and only USB-C `adb` active (Arduino A
 ```
 
 Run `./system/scripts/provision-factory-unoq.sh --help` for offline `--deb-dir`, custom `--psk`, `--stage-only`, and `--rollback-ap` options.
+
+### 5 GHz AP Kernel (Optional, UNO Q) & Hardware Status LED
+
+- **5 GHz WiFi AP:** `tactus-ap.service` defaults to 5 GHz channel `36` (`20 MHz` VHT) and automatically falls back to 2.4 GHz channel `11` if the board's kernel marks channel `36` `NO-IR` (true on the stock UNO Q kernel). To build a custom Debian kernel `.deb` enabling 5 GHz AP mode (`system/kernel/tactus-5ghz.config`), run `./system/scripts/build-unoq-kernel-local.sh` (or trigger the `Build UNO Q 5GHz Kernel` GitHub Actions workflow).
+- **Linux `LED1` Status & Faults:** `tactusd` drives the onboard RGB `LED1` (`/sys/class/leds/unoq:user-{red,green,blue}1`) for boot, AP/client connectivity, and sync status, yielding to a red blink if any systemd unit triggers `tactus-led-fault@.service`.
 
 ### Network Discovery (Bonjour / Zeroconf)
 
