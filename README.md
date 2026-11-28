@@ -2,23 +2,69 @@
 
 **Tactus** is a standalone embedded Rust appliance (running on a Linux SBC) that bidirectionally bridges USB-MIDI / BLE-MIDI (e.g., CME WIDI Uhost) and **Ableton Link** over a dedicated WiFi Access Point.
 
+## Provisioning a Debian Linux SBC (Reference Board: Arduino UNO Q)
+
+### Option 1: Prebuilt Turnkey Release Package (macOS / Linux / Windows)
+
+Download `tactus-<version>-unoq-arm64.tar.gz` (macOS/Linux) or `.zip` (Windows) from [GitHub Releases](https://github.com/manchoz/tactus/releases). It bundles `tactusd` (`arm64`), offline Debian `.deb`s (`hostapd`, `dnsmasq`, `iw`), the STM32U585 MCU LED matrix firmware, and the optional 5 GHz kernel `.deb` (with automatic `systemd-boot` `+2` rollback):
+
+```bash
+# macOS / Linux (guided interactive installer — auto-detects USB-C ADB or prompts for SSH)
+./install.sh
+```
+
+```powershell
+# Windows PowerShell
+.\install.ps1
+```
+
+See [system/release/INSTALL.md](system/release/INSTALL.md) for non-interactive flags (`--yes`, `--psk`, `--country`, `--skip-kernel`, `--skip-mcu`).
+
+### Option 2: From Source Repository (Development)
+
+A fresh UNO Q image boots with SSH masked and only USB-C `adb` active (Arduino App Lab is **not** required). From the host:
+
+```bash
+# Factory board over USB-C ADB (temporarily connects WiFi to fetch hostapd/dnsmasq/iw,
+# then deletes the temporary WiFi profile, enables SSH + key auth, configures Tactus AP,
+# trims GUI/PipeWire/extra Arduino services, sets volatile journald, and verifies):
+./system/scripts/provision-factory-unoq.sh --adb \
+  --pubkey ~/.ssh/id_ed25519.pub \
+  --wifi-ssid "<YourWiFi>" --wifi-psk "<WiFiPassword>" \
+  --nopasswd-sudo
+
+# Existing / Ethernet-connected UNO Q over SSH (idempotent):
+./system/scripts/provision-factory-unoq.sh --ssh arduino@tactus.local --nopasswd-sudo
+```
+
+Run `./system/scripts/provision-factory-unoq.sh --help` for offline `--deb-dir`, custom `--psk`, `--stage-only`, and `--rollback-ap` options.
+
+### 5 GHz AP Kernel (Optional, UNO Q) & Hardware Status LED
+
+- **5 GHz WiFi AP:** `tactus-ap.service` defaults to 5 GHz channel `36` (`20 MHz` VHT) and automatically falls back to 2.4 GHz channel `11` if the board's kernel marks channel `36` `NO-IR` (true on the stock UNO Q kernel). To build a custom Debian kernel `.deb` enabling 5 GHz AP mode (`system/kernel/tactus-5ghz.config`), run `./system/scripts/build-unoq-kernel-local.sh` (or trigger the `Build UNO Q 5GHz Kernel` GitHub Actions workflow).
+- **Linux `LED1` Status & Faults:** `tactusd` drives the onboard RGB `LED1` (`/sys/class/leds/unoq:user-{red,green,blue}1`) for boot, AP/client connectivity, and sync status, yielding to a red blink if any systemd unit triggers `tactus-led-fault@.service`.
+
+### Network Discovery (Bonjour / Zeroconf)
+
+Provisioned boards announce `_tactus._tcp` (with `app`, `version`, `board`, `serial_number`, `path`, `ws`, `ap_ssid`, and `ssh` TXT records) and `_http._tcp` on port `80` across all active interfaces (`wlan0` AP and Ethernet LAN):
+
+```bash
+# macOS (when connected to the 'Tactus' WiFi AP or same Ethernet LAN)
+dns-sd -B _tactus._tcp local.
+dns-sd -L tactus _tactus._tcp local.
+
+# Linux (Avahi)
+avahi-browse -rt _tactus._tcp
+```
+
+---
+
 ## Architectural Highlights
 
 - **Userspace Real-Time Determinism:** Targets stock Debian Linux (and future Yocto QLI `meta-tactus`) without `PREEMPT_RT` or PipeWire — uses a dedicated `SCHED_FIFO` thread, `mlockall`, `CLOCK_MONOTONIC` absolute timers (`TIMER_ABSTIME`), CPU core affinity, and direct ALSA RawMIDI (`/dev/snd/midiC*D*`) I/O (keeping `/dev/snd/seq` optional for Yocto `meta-tactus`).
 - **Strict RT vs. Async Separation:** The RT sync thread performs zero heap allocations, zero mutexes, zero blocking I/O, and zero `tokio` calls; the `tokio` control plane (`axum` HTTP/WebSocket, config persistence, MCU RPC) communicates exclusively through lock-free SPSC ring buffers (`rtrb`) with strictly `Copy` `TelemetrySnapshot` and `RtCommand` messages.
 - **Official Ableton Link C API:** Wraps `Ableton/link`'s `extensions/abl_link` C99 API (`tactus-link-sys`), avoiding custom Link protocol reimplementations.
 - **Yocto & Read-Only Rootfs Ready:** Offline builds with zero network/`git` activity in `build.rs`, dual prebuilt/vendored `abl_link` resolution, atomic state writes restricted to `/var/lib/tactus/config.toml`, and runtime state on `tmpfs` (`/run/tactus/`).
-
-## Project Status
-
-| Milestone | Scope | Status |
-| :--- | :--- | :--- |
-| **M0** | Cargo workspace & offline-safe `abl_link` FFI build | Complete |
-| **M1** | Pure-Rust `tactus-sync-core` & deterministic simulations | Complete |
-| **M2** | WiFi AP (`hostapd`/`dnsmasq`/`avahi`), Zeroconf & Debian SBC provisioning | Complete |
-| **M3** | Headless `tactusd` RT engine, ALSA RawMIDI hotplug & atomic `config.toml` | Complete |
-| **M4** | Embedded mobile Web UI (`axum` + WebSocket + Home Screen PWA) | Complete |
-| **M5** | Optional MCU LED matrix bridge (`Arduino_RouterBridge`, e.g., UNO Q STM32U585) | Complete |
 
 ## Documentation & Workspace Layout
 
@@ -153,45 +199,6 @@ cargo build --workspace --target aarch64-unknown-linux-gnu
    - `ABL_LINK_LINK_KIND` (`static` or `dylib`; auto-detects `lib<name>.a`)
 2. **`pkg-config`:** Probes `abl-link`, then `abl_link`.
 3. **Vendored fallback:** Compiles `vendor/ableton-link/extensions/abl_link/src/abl_link.cpp` offline (override directory via `ABL_LINK_VENDOR_DIR`).
-
----
-
-## Provisioning a Debian Linux SBC (Reference Board: Arduino UNO Q)
-
-A fresh UNO Q image boots with SSH masked and only USB-C `adb` active (Arduino App Lab is **not** required). From the host:
-
-```bash
-# Factory board over USB-C ADB (temporarily connects WiFi to fetch hostapd/dnsmasq/iw,
-# then deletes the temporary WiFi profile, enables SSH + key auth, configures Tactus AP,
-# trims GUI/PipeWire/extra Arduino services, sets volatile journald, and verifies):
-./system/scripts/provision-factory-unoq.sh --adb \
-  --pubkey ~/.ssh/id_ed25519.pub \
-  --wifi-ssid "<YourWiFi>" --wifi-psk "<WiFiPassword>" \
-  --nopasswd-sudo
-
-# Existing / Ethernet-connected UNO Q over SSH (idempotent):
-./system/scripts/provision-factory-unoq.sh --ssh arduino@tactus.local --nopasswd-sudo
-```
-
-Run `./system/scripts/provision-factory-unoq.sh --help` for offline `--deb-dir`, custom `--psk`, `--stage-only`, and `--rollback-ap` options.
-
-### 5 GHz AP Kernel (Optional, UNO Q) & Hardware Status LED
-
-- **5 GHz WiFi AP:** `tactus-ap.service` defaults to 5 GHz channel `36` (`20 MHz` VHT) and automatically falls back to 2.4 GHz channel `11` if the board's kernel marks channel `36` `NO-IR` (true on the stock UNO Q kernel). To build a custom Debian kernel `.deb` enabling 5 GHz AP mode (`system/kernel/tactus-5ghz.config`), run `./system/scripts/build-unoq-kernel-local.sh` (or trigger the `Build UNO Q 5GHz Kernel` GitHub Actions workflow).
-- **Linux `LED1` Status & Faults:** `tactusd` drives the onboard RGB `LED1` (`/sys/class/leds/unoq:user-{red,green,blue}1`) for boot, AP/client connectivity, and sync status, yielding to a red blink if any systemd unit triggers `tactus-led-fault@.service`.
-
-### Network Discovery (Bonjour / Zeroconf)
-
-Provisioned boards announce `_tactus._tcp` (with `app`, `version`, `board`, `serial_number`, `path`, `ws`, `ap_ssid`, and `ssh` TXT records) and `_http._tcp` on port `80` across all active interfaces (`wlan0` AP and Ethernet LAN):
-
-```bash
-# macOS (when connected to the 'Tactus' WiFi AP or same Ethernet LAN)
-dns-sd -B _tactus._tcp local.
-dns-sd -L tactus _tactus._tcp local.
-
-# Linux (Avahi)
-avahi-browse -rt _tactus._tcp
-```
 
 ---
 

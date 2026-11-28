@@ -48,8 +48,15 @@ jobs:
 
       - name: Check provisioning script syntax and lint
         run: |
-          bash -n system/scripts/provision-debian.sh system/scripts/provision-factory-unoq.sh system/scripts/flash-mcu-unoq.sh system/scripts/deploy-tactusd.sh system/scripts/build-unoq-kernel-local.sh system/scripts/check-invariants.sh system/kernel/build.sh
-          shellcheck system/scripts/*.sh system/kernel/*.sh
+          bash -n system/scripts/*.sh system/release/install.sh system/kernel/*.sh
+          shellcheck system/scripts/*.sh system/release/install.sh system/kernel/*.sh
+
+      - name: Check PowerShell installer syntax
+        run: |
+          pwsh -NoProfile -Command '$errors = $null; [System.Management.Automation.Language.Parser]::ParseFile("system/release/install.ps1", [ref]$null, [ref]$errors) | Out-Null; if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }'
+
+      - name: Test release packaging and board helper scripts
+        run: ./system/scripts/test-release-scripts.sh
 
   cross-aarch64:
     name: Cross-Compile aarch64-unknown-linux-gnu Release

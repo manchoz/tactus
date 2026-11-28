@@ -1,0 +1,230 @@
+name: Release UNO Q Bundle
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version (defaults to Cargo.toml workspace version)
+        required: false
+        default: ''
+        type: string
+      kernel_ref:
+        description: Linux kernel git branch or tag
+        required: true
+        default: qcom-v7.2.11-arduino
+        type: string
+      deb_images_ref:
+        description: Arduino Debian images git branch or tag
+        required: true
+        default: arduino
+        type: string
+      publish_release:
+        description: Create/update GitHub Release on manual dispatch
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-tactusd:
+    name: Build tactusd (aarch64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain with aarch64 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install ARM64 cross-compilation toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      - name: Build tactusd release binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+        run: cargo build -p tactusd --release --target aarch64-unknown-linux-gnu
+
+      - name: Upload tactusd artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tactusd-arm64
+          path: target/aarch64-unknown-linux-gnu/release/tactusd
+          if-no-files-found: error
+
+  build-mcu:
+    name: Build STM32U585 Zephyr Sketch & Loader
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install arduino-cli and Zephyr UNO Q core
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR="$HOME/.local/bin" sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          arduino-cli core update-index
+          arduino-cli core install arduino:zephyr
+          arduino-cli lib install Arduino_RouterBridge
+
+      - name: Compile tactus-zephyr sketch
+        run: |
+          set -euo pipefail
+          arduino-cli compile -e --fqbn arduino:zephyr:unoq mcu/tactus-zephyr
+          mkdir -p dist-mcu
+          cp mcu/tactus-zephyr/build/arduino.zephyr.unoq/tactus-zephyr.ino.elf-zsk.bin dist-mcu/
+          loader="$(find "${HOME}/.arduino15/packages/arduino/hardware/zephyr" -maxdepth 3 -type f -name 'zephyr-arduino_uno_q_stm32u585xx.elf' | sort -V | tail -n 1)"
+          test -f "$loader"
+          cp "$loader" dist-mcu/zephyr-arduino_uno_q_stm32u585xx.elf
+
+      - name: Upload MCU firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcu-zephyr
+          path: dist-mcu/*
+          if-no-files-found: error
+
+  fetch-debs:
+    name: Fetch Offline Debian Trixie arm64 .debs
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Download hostapd, dnsmasq, iw and runtime dependencies (arm64)
+        run: |
+          set -euo pipefail
+          dpkg-query -W -f='${Package}\n' > /tmp/base-pkgs.txt
+          printf '%s\n' systemd systemd-sysv init-system-helpers adduser netbase iproute2 avahi-daemon >> /tmp/base-pkgs.txt
+
+          dpkg --add-architecture arm64
+          printf 'APT::Architecture "arm64";\nAPT::Architectures { "arm64"; };\n' > /etc/apt/apt.conf.d/99-arm64.conf
+          apt-get update
+
+          : > /tmp/empty-status
+          mapfile -t resolved < <(
+            apt-get -s -o Dir::State::status=/tmp/empty-status install --no-install-recommends hostapd dnsmasq iw \
+            | awk '$1 == "Inst" { print $2 }' \
+            | grep -Fxv -f /tmp/base-pkgs.txt \
+            | sort -u
+          )
+
+          echo "Resolved offline arm64/all packages: ${resolved[*]}"
+          mkdir -p debs/arm64
+          (cd debs/arm64 && apt-get download "${resolved[@]}")
+
+          ls -lh debs/arm64/*.deb
+          ls debs/arm64/hostapd_*_arm64.deb debs/arm64/dnsmasq_*_all.deb debs/arm64/dnsmasq-base_*_arm64.deb debs/arm64/iw_*_arm64.deb >/dev/null
+          ! compgen -G 'debs/arm64/*_amd64.deb' >/dev/null
+          ! compgen -G 'debs/arm64/dnsmasq-base-lua_*.deb' >/dev/null
+
+      - name: Upload offline arm64 .deb artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: unoq-debs-arm64
+          path: debs/arm64/*.deb
+          if-no-files-found: error
+
+  build-kernel:
+    name: Build UNO Q 5 GHz Kernel (.deb)
+    uses: ./.github/workflows/build-unoq-kernel.yml
+    with:
+      kernel_ref: ${{ inputs.kernel_ref || 'qcom-v7.2.11-arduino' }}
+      deb_images_ref: ${{ inputs.deb_images_ref || 'arduino' }}
+
+  package-release:
+    name: Package & Publish UNO Q Release Bundle
+    needs: [build-tactusd, build-mcu, fetch-debs, build-kernel]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package .tar.gz, .zip, and SHA256SUMS
+        id: pkg
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          VER="${INPUT_VERSION}"
+          if [[ -z "$VER" && "$REF_TYPE" == "tag" ]]; then
+            VER="${GITHUB_REF_NAME#v}"
+          fi
+          kernel_debs=(artifacts/unoq-kernel-5ghz-deb/linux-image-*.deb)
+          KERNEL_DEB="${kernel_debs[0]}"
+          ARGS=(
+            --tactusd artifacts/tactusd-arm64/tactusd
+            --mcu-bin artifacts/mcu-zephyr/tactus-zephyr.ino.elf-zsk.bin
+            --mcu-loader artifacts/mcu-zephyr/zephyr-arduino_uno_q_stm32u585xx.elf
+            --deb-dir artifacts/unoq-debs-arm64
+            --kernel-deb "$KERNEL_DEB"
+            --out-dir release-dist
+          )
+          if [[ -n "$VER" ]]; then
+            ARGS+=(--version "$VER")
+          fi
+          chmod +x system/scripts/package-release.sh
+          ./system/scripts/package-release.sh "${ARGS[@]}"
+
+          # Verify extracted bundle checksums
+          VERIFY_DIR="$(mktemp -d)"
+          tar -xzf release-dist/tactus-*-unoq-arm64.tar.gz -C "$VERIFY_DIR"
+          (cd "$VERIFY_DIR"/tactus-*-unoq-arm64 && sha256sum -c SHA256SUMS)
+          (cd release-dist && sha256sum -c SHA256SUMS)
+          rm -rf "$VERIFY_DIR"
+
+          tarballs=(release-dist/tactus-*-unoq-arm64.tar.gz)
+          tarball="$(basename "${tarballs[0]}")"
+          RESOLVED_VER="${tarball#tactus-}"
+          RESOLVED_VER="${RESOLVED_VER%-unoq-arm64.tar.gz}"
+          echo "version=${RESOLVED_VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release bundle workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tactus-unoq-release-dist
+          path: release-dist/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_TYPE: ${{ github.ref_type }}
+          PKG_VERSION: ${{ steps.pkg.outputs.version }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "$REF_TYPE" != "tag" ]]; then
+            TAG="v${PKG_VERSION}"
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-dist/* --clobber
+          else
+            gh release create "$TAG" release-dist/* \
+              --title "Tactus ${TAG} (Arduino UNO Q)" \
+              --generate-notes
+          fi

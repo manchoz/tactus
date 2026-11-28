@@ -23,6 +23,28 @@ on:
         required: true
         default: arduino
         type: string
+  workflow_call:
+    inputs:
+      kernel_repo:
+        description: Linux kernel git repository
+        required: false
+        default: https://github.com/arduino/linux-qcom
+        type: string
+      kernel_ref:
+        description: Linux kernel git branch or tag
+        required: false
+        default: qcom-v7.2.11-arduino
+        type: string
+      deb_images_repo:
+        description: Arduino Debian images repository
+        required: false
+        default: https://github.com/arduino/arduino-deb-images
+        type: string
+      deb_images_ref:
+        description: Arduino Debian images git branch or tag
+        required: false
+        default: arduino
+        type: string
 
 permissions:
   contents: read
@@ -68,10 +90,10 @@ jobs:
 
       - name: Build UNO Q 5 GHz kernel .deb
         env:
-          KERNEL_REPO: ${{ inputs.kernel_repo }}
-          KERNEL_REF: ${{ inputs.kernel_ref }}
-          DEB_IMAGES_REPO: ${{ inputs.deb_images_repo }}
-          DEB_IMAGES_REF: ${{ inputs.deb_images_ref }}
+          KERNEL_REPO: ${{ inputs.kernel_repo || 'https://github.com/arduino/linux-qcom' }}
+          KERNEL_REF: ${{ inputs.kernel_ref || 'qcom-v7.2.11-arduino' }}
+          DEB_IMAGES_REPO: ${{ inputs.deb_images_repo || 'https://github.com/arduino/arduino-deb-images' }}
+          DEB_IMAGES_REF: ${{ inputs.deb_images_ref || 'arduino' }}
         run: |
           bash system/kernel/build.sh
           ls -lh ./*.deb ./*.changes

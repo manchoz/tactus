@@ -46,6 +46,7 @@ Options:
 
 Environment variables:
   TACTUS_AP_PSK       Optional WPA2 passphrase (8..63 chars) to override default in tactus-ap.conf
+  TACTUS_WIFI_COUNTRY Optional 2-letter ISO WiFi country code (e.g. US, DE, JP; default: IT)
 EOF
 }
 
@@ -245,7 +246,7 @@ install_packages() {
     shopt -u nullglob
     if [[ ${#debs[@]} -gt 0 ]]; then
       log "Installing offline .deb packages from ${DEB_DIR}..."
-      dpkg -i "${debs[@]}" || apt-get install -f -y --no-install-recommends
+      dpkg -i -E -G "${debs[@]}" || apt-get install -f -y --no-install-recommends
       missing=()
       while IFS= read -r pkg; do
         [[ -n "$pkg" ]] && missing+=("$pkg")
@@ -375,28 +376,47 @@ install_system_files() {
   log "Installing hostapd, dnsmasq, avahi, config, and systemd unit files..."
   install -d -m 0755 /etc/hostapd /etc/dnsmasq.d /etc/avahi/services /etc/systemd/system
 
-  if [[ -n "${TACTUS_AP_PSK:-}" ]]; then
-    local psk_len=${#TACTUS_AP_PSK}
+  local ap_psk="${TACTUS_AP_PSK:-}"
+  if [[ -z "$ap_psk" && -f /etc/hostapd/tactus-ap.conf ]]; then
+    ap_psk="$(sed -n 's/^wpa_passphrase=//p' /etc/hostapd/tactus-ap.conf | head -n 1 || true)"
+  fi
+  if [[ -n "$ap_psk" ]]; then
+    local psk_len=${#ap_psk}
     if (( psk_len < 8 || psk_len > 63 )); then
       echo "error: TACTUS_AP_PSK must be 8..63 characters" >&2
       exit 1
     fi
-    if [[ "$TACTUS_AP_PSK" =~ [[:cntrl:]] ]]; then
+    if [[ "$ap_psk" =~ [[:cntrl:]] ]]; then
       echo "error: TACTUS_AP_PSK cannot contain control characters" >&2
       exit 1
     fi
-    local tmp_conf ap_conf
-    for ap_conf in tactus-ap.conf tactus-ap-2g.conf; do
-      tmp_conf="$(mktemp)"
-      grep -v '^wpa_passphrase=' "${SYSTEM_DIR}/hostapd/${ap_conf}" >"$tmp_conf"
-      printf 'wpa_passphrase=%s\n' "$TACTUS_AP_PSK" >>"$tmp_conf"
-      install -m 0600 "$tmp_conf" "/etc/hostapd/${ap_conf}"
-      rm -f "$tmp_conf"
-    done
-  else
-    install -m 0600 "${SYSTEM_DIR}/hostapd/tactus-ap.conf" /etc/hostapd/tactus-ap.conf
-    install -m 0600 "${SYSTEM_DIR}/hostapd/tactus-ap-2g.conf" /etc/hostapd/tactus-ap-2g.conf
   fi
+
+  local ap_country="${TACTUS_WIFI_COUNTRY:-}"
+  if [[ -z "$ap_country" && -f /etc/hostapd/tactus-ap.conf ]]; then
+    ap_country="$(sed -n 's/^country_code=//p' /etc/hostapd/tactus-ap.conf | head -n 1 || true)"
+  fi
+  ap_country="${ap_country:-IT}"
+  if [[ ! "$ap_country" =~ ^[A-Z]{2}$ ]]; then
+    echo "error: TACTUS_WIFI_COUNTRY must be a 2-letter uppercase ISO country code (got '${ap_country}')" >&2
+    exit 1
+  fi
+
+  local tmp_conf ap_conf
+  for ap_conf in tactus-ap.conf tactus-ap-2g.conf; do
+    tmp_conf="$(mktemp)"
+    cp "${SYSTEM_DIR}/hostapd/${ap_conf}" "$tmp_conf"
+    if [[ -n "$ap_psk" ]]; then
+      grep -v '^wpa_passphrase=' "$tmp_conf" >"${tmp_conf}.next"
+      printf 'wpa_passphrase=%s\n' "$ap_psk" >>"${tmp_conf}.next"
+      mv "${tmp_conf}.next" "$tmp_conf"
+    fi
+    if [[ "$ap_country" != "IT" ]]; then
+      sed -i "s/^country_code=.*/country_code=${ap_country}/" "$tmp_conf"
+    fi
+    install -m 0600 "$tmp_conf" "/etc/hostapd/${ap_conf}"
+    rm -f "$tmp_conf"
+  done
 
   install -m 0644 "${SYSTEM_DIR}/dnsmasq/tactus-ap.conf" /etc/dnsmasq.d/tactus-ap.conf
 
@@ -431,7 +451,15 @@ install_system_files() {
     tactusd_unit_changed=1
   fi
 
-  install -m 0644 "${SYSTEM_DIR}/systemd/tactus-ap.service" /etc/systemd/system/tactus-ap.service
+  if [[ "$ap_country" != "IT" ]]; then
+    local tmp_ap_unit
+    tmp_ap_unit="$(mktemp)"
+    sed "s|iw reg set IT|iw reg set ${ap_country}|g" "${SYSTEM_DIR}/systemd/tactus-ap.service" >"$tmp_ap_unit"
+    install -m 0644 "$tmp_ap_unit" /etc/systemd/system/tactus-ap.service
+    rm -f "$tmp_ap_unit"
+  else
+    install -m 0644 "${SYSTEM_DIR}/systemd/tactus-ap.service" /etc/systemd/system/tactus-ap.service
+  fi
   install -m 0644 "${SYSTEM_DIR}/systemd/tactus-dhcp.service" /etc/systemd/system/tactus-dhcp.service
   install -m 0644 "${SYSTEM_DIR}/systemd/tactusd.service" /etc/systemd/system/tactusd.service
   rm -f /etc/systemd/system/tactus-led-fault.service

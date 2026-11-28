@@ -11,6 +11,7 @@ REPO_ROOT="$(cd "${SYSTEM_DIR}/.." && pwd)"
 
 OPENOCD_ADAPTER_CFG="${SYSTEM_DIR}/openocd/unoq-gpiod.cfg"
 OPENOCD_FLASH_CFG="${SYSTEM_DIR}/openocd/unoq-flash-sketch.cfg"
+BOARD_FLASH_SCRIPT="${SCRIPT_DIR}/flash-mcu-board.sh"
 
 SSH_TARGET="tactus"
 SSH_IDENTITY=""
@@ -141,6 +142,7 @@ SKETCH_NAME="$(basename "$SKETCH_DIR")"
 
 [[ -f "$OPENOCD_ADAPTER_CFG" ]] || die "OpenOCD adapter config missing: $OPENOCD_ADAPTER_CFG"
 [[ -f "$OPENOCD_FLASH_CFG" ]] || die "OpenOCD flash config missing: $OPENOCD_FLASH_CFG"
+[[ -f "$BOARD_FLASH_SCRIPT" ]] || die "Board flash helper missing: $BOARD_FLASH_SCRIPT"
 
 if [[ -n "$SSH_IDENTITY" && ! -f "$SSH_IDENTITY" ]]; then
   die "SSH identity file not found: $SSH_IDENTITY"
@@ -194,7 +196,7 @@ trap cleanup EXIT
 ssh "${SSH_OPTS[@]}" "$SSH_TARGET" mkdir -p -- "$REMOTE_DIR"
 REMOTE_CREATED=1
 
-STAGED_FILES=("$OPENOCD_ADAPTER_CFG" "$OPENOCD_FLASH_CFG")
+STAGED_FILES=("$OPENOCD_ADAPTER_CFG" "$OPENOCD_FLASH_CFG" "$BOARD_FLASH_SCRIPT")
 log "Copying OpenOCD configs and $(basename "$BINARY_PATH") to ${SSH_TARGET}:${REMOTE_DIR}/..."
 scp "${SSH_OPTS[@]}" "${STAGED_FILES[@]}" "${SSH_TARGET}:${REMOTE_DIR}/"
 scp "${SSH_OPTS[@]}" "$BINARY_PATH" "${SSH_TARGET}:${REMOTE_DIR}/sketch.elf-zsk.bin"
@@ -209,102 +211,22 @@ fi
 log "Flashing STM32U585 via linuxgpiod OpenOCD..."
 ssh "${SSH_OPTS[@]}" "$SSH_TARGET" bash -s -- "$REMOTE_DIR" "$SKETCH_ONLY" "$HAS_HOST_LOADER" "$ENABLE_BRIDGE" <<'REMOTE_EOF'
 set -euo pipefail
-
 REMOTE_DIR="$1"
 SKETCH_ONLY="$2"
 HAS_HOST_LOADER="$3"
 ENABLE_BRIDGE="$4"
 
-OPENOCD_BIN=""
-if [[ -x /opt/openocd/bin/openocd ]]; then
-  OPENOCD_BIN="/opt/openocd/bin/openocd"
-elif command -v openocd >/dev/null 2>&1; then
-  OPENOCD_BIN="$(command -v openocd)"
-else
-  echo "ERROR: neither /opt/openocd/bin/openocd nor openocd in PATH found on board" >&2
-  exit 1
+ARGS=(--sketch "${REMOTE_DIR}/sketch.elf-zsk.bin" --openocd-dir "$REMOTE_DIR")
+if [[ "$SKETCH_ONLY" -eq 1 ]]; then
+  ARGS+=(--sketch-only)
+elif [[ "$HAS_HOST_LOADER" -eq 1 ]]; then
+  ARGS+=(--loader "${REMOTE_DIR}/loader.elf")
 fi
-
-OPENOCD_ARGS=()
-for script_dir in /opt/openocd/share/openocd/scripts /usr/share/openocd/scripts; do
-  if [[ -d "$script_dir" ]]; then
-    OPENOCD_ARGS+=(-s "$script_dir")
-  fi
-done
-
-LOADER_ELF=""
-if [[ "$SKETCH_ONLY" -eq 0 ]]; then
-  if [[ "$HAS_HOST_LOADER" -eq 1 ]]; then
-    LOADER_ELF="${REMOTE_DIR}/loader.elf"
-  else
-    for candidate in "${HOME}/.arduino15/packages/arduino/hardware/zephyr" /home/arduino/.arduino15/packages/arduino/hardware/zephyr; do
-      if [[ -d "$candidate" ]]; then
-        found="$(find "$candidate" -maxdepth 3 -type f -name 'zephyr-arduino_uno_q_stm32u585xx.elf' 2>/dev/null | sort -V | tail -n 1 || true)"
-        if [[ -n "$found" && -f "$found" ]]; then
-          LOADER_ELF="$found"
-          break
-        fi
-      fi
-    done
-    if [[ -z "$LOADER_ELF" ]]; then
-      echo "[tactus-flash-mcu] WARNING: Zephyr loader ELF not found on host or board; flashing sketch only at 0x08100000" >&2
-    fi
-  fi
-fi
-
-OPENOCD_ARGS+=(-f "${REMOTE_DIR}/unoq-gpiod.cfg")
-if [[ -n "$LOADER_ELF" ]]; then
-  OPENOCD_ARGS+=(-c "set filename0 ${LOADER_ELF}")
-fi
-OPENOCD_ARGS+=(
-  -c "set filename1 ${REMOTE_DIR}/sketch.elf-zsk.bin"
-  -f "${REMOTE_DIR}/unoq-flash-sketch.cfg"
-)
-
-"$OPENOCD_BIN" "${OPENOCD_ARGS[@]}"
-
 if [[ "$ENABLE_BRIDGE" -eq 1 ]]; then
-  CONFIG_PATH="/var/lib/tactus/config.toml"
-  sudo test -f "$CONFIG_PATH" || {
-    echo "ERROR: $CONFIG_PATH not found on board" >&2
-    exit 1
-  }
-  sudo python3 - "$CONFIG_PATH" <<'PYEOF'
-import pathlib
-import re
-import sys
-
-path = pathlib.Path(sys.argv[1])
-text = path.read_text(encoding="utf-8")
-
-if re.search(r"(?m)^\[mcu_bridge\]\s*$", text):
-    pattern = re.compile(r"(?ms)(^\[mcu_bridge\]\s*\n(?:(?!^\[).*\n)*?)")
-    def replace_section(match: re.Match[str]) -> str:
-        block = match.group(1)
-        if re.search(r"(?m)^enabled\s*=", block):
-            return re.sub(r"(?m)^enabled\s*=.*$", "enabled = true", block, count=1)
-        return block + "enabled = true\n"
-    updated = pattern.sub(replace_section, text, count=1)
-else:
-    suffix = "" if text.endswith("\n") else "\n"
-    updated = (
-        text
-        + suffix
-        + "\n[mcu_bridge]\nenabled = true\nsocket_path = \"/var/run/arduino-router.sock\"\n"
-    )
-
-if updated != text:
-    tmp = path.with_suffix(".toml.tmp")
-    tmp.write_text(updated, encoding="utf-8")
-    tmp.replace(path)
-PYEOF
-  if id -u tactus >/dev/null 2>&1; then
-    sudo chown tactus:tactus "$CONFIG_PATH"
-  fi
-  if systemctl is-active --quiet tactusd.service || systemctl is-enabled --quiet tactusd.service; then
-    sudo systemctl restart tactusd.service
-  fi
+  ARGS+=(--enable-bridge)
 fi
+
+bash "${REMOTE_DIR}/flash-mcu-board.sh" "${ARGS[@]}"
 REMOTE_EOF
 
 log "MCU firmware flashed cleanly."
