@@ -26,13 +26,12 @@
 - [ARCHITECTURE.md](ARCHITECTURE.md) — Monorepo layout, threading model, protocol contract, and boot sequence
 - [MILESTONES.md](MILESTONES.md) — Phased execution and verification plan
 - [AGENTS.md](AGENTS.md) — Non-negotiable architectural invariants and verification gates
-- `arduino-router` crate — [crates.io](https://crates.io/crates/arduino-router) · [docs.rs](https://docs.rs/arduino-router)
+- `arduino-router` crate — [GitHub (`manchoz/arduino-router-rs`)](https://github.com/manchoz/arduino-router-rs) · [crates.io](https://crates.io/crates/arduino-router) · [docs.rs](https://docs.rs/arduino-router)
 
 ```text
 tactus/
 ├── Cargo.toml                  # Workspace root (edition 2021, resolver 2)
 ├── crates/
-│   ├── arduino-router/         # Standalone crates.io client, streaming MessagePack-RPC codec & monitor for arduino-router
 │   ├── tactus-protocol/        # Shared EngineCommand, Copy RtCommand/TelemetrySnapshot, AppState, TactusConfig
 │   ├── tactus-link-sys/        # Offline-safe build.rs + C99 FFI + safe RAII AblLink/SessionState wrappers
 │   ├── tactus-sync-core/       # Pure-Rust, OS-independent, zero-alloc bidirectional sync engine

@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-arduino-router = { path = "../arduino-router" }
+arduino-router = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "json"] }
 libc = "0.2"
 rtrb = "0.3"
